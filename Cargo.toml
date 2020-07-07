@@ -11,5 +11,7 @@ license = "MIT"
 async-task = "3"
 bytes = "0.5"
 futures = "0.3"
+log = "0.4"
 parking_lot = { version = "0.11", features = ["nightly"] }
+pin-utils = "0.1"
 redox_syscall = { git = "https://gitlab.redox-os.org/4lDO2/syscall.git", branch = "io_uring" }
