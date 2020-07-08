@@ -10,6 +10,7 @@ license = "MIT"
 [dependencies]
 async-task = "3"
 bytes = "0.5"
+crossbeam-queue = "0.2"
 futures = "0.3"
 log = "0.4"
 parking_lot = { version = "0.11", features = ["nightly"] }

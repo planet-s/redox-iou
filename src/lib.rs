@@ -1,27 +1,39 @@
+use std::collections::BTreeMap;
 use std::convert::{TryFrom, TryInto};
 use std::future::Future;
 use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
 use std::pin::Pin;
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize}};
 use std::{slice, task};
 
 use syscall::{
-    EOVERFLOW, ESHUTDOWN,
+    EOVERFLOW, ESHUTDOWN, ECANCELED,
     Error, Event, IoVec, Result,
 };
-
-use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
-
 pub use syscall::io_uring::*;
+
+use crossbeam_queue::ArrayQueue;
 pub use futures::io::AsyncBufRead;
 use futures::Stream;
+use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard};
+
 
 /// A minimal executor, that does not use any thread pool.
 pub struct Executor {
-    instance: Arc<RwLock<v1::ConsumerInstance>>,
+    trusted_instance: bool,
+    instance: Arc<InstanceWrapper>,
     standard_waker: task::Waker,
 
     // TODO: ConcurrentBTreeMap
+    tag_map: Arc<RwLock<BTreeMap<usize, Mutex<State>>>>,
+    next_tag: AtomicUsize,
+    reusable_tags: ArrayQueue<(usize, State)>,
+}
+
+struct InstanceWrapper {
+    consumer_instance: RwLock<v1::ConsumerInstance>,
+    dropped: AtomicBool,
 }
 
 /// A builder that creates an `Executor`.
@@ -46,37 +58,47 @@ impl ExecutorBuilder {
     /// This is unsafe because when enabled, it will optimize the executor to use the `user_data`
     /// field as a pointer to the status. A rouge producer would be able to change the user data
     /// pointer, to an arbitrary address, and cause program corruption. While the addresses can be
-    /// checked at runtime, this is too expensive to check if performance is a concern. When the
-    /// kernel is a producer though, this will not make anything more unsafe (since the kernel has
-    /// full access to the address space anyways).
+    /// checked at runtime, this is too expensive to check if performance is a concern (and
+    /// probably even more expensive than simply storing the user_data as a tag, which is the
+    /// default). When the kernel is a producer though, this will not make anything more unsafe
+    /// (since the kernel has full access to the address space anyways).
     ///
-    pub unsafe fn assume_trusted_instance() -> Self {
+    pub unsafe fn assume_trusted_instance(self) -> Self {
         Self {
             trusted_instance: true,
+            .. self
         }
     }
 
-    pub fn build(instance: v1::ConsumerInstance) -> Executor {
-        Executor::new(instance)
+    pub fn build(self, instance: v1::ConsumerInstance) -> Executor {
+        Executor::new(instance, self.trusted_instance)
     }
 }
 
 impl Executor {
-    fn new(instance: v1::ConsumerInstance) -> Self {
-        let instance_arc = Arc::new(RwLock::new(instance));
+    fn new(instance: v1::ConsumerInstance, trusted_instance: bool) -> Self {
+        let instance_arc = Arc::new(InstanceWrapper {
+            consumer_instance: RwLock::new(instance),
+            dropped: AtomicBool::new(false),
+        });
         Self {
             standard_waker: Self::waker(&instance_arc),
             instance: instance_arc,
+            trusted_instance,
+
+            tag_map: Arc::new(RwLock::new(BTreeMap::new())),
+            next_tag: AtomicUsize::new(1),
+            reusable_tags: ArrayQueue::new(512),
         }
     }
-    fn waker(instance: &Arc<RwLock<v1::ConsumerInstance>>) -> task::Waker {
+    fn waker(instance: &Arc<InstanceWrapper>) -> task::Waker {
         let instance = Arc::downgrade(instance);
         async_task::waker_fn(move || {
             let instance = match instance.upgrade() {
                 Some(i) => i,
                 None => return,
             };
-            let instance_guard = instance.read();
+            let instance_guard = instance.consumer_instance.read();
 
             match instance_guard.sender() {
                 &ConsumerGenericSender::Bits32(ref sender32) => sender32.notify(),
@@ -89,27 +111,85 @@ impl Executor {
     where
         F: Future<Output = O>,
     {
-        pin_utils::pin_mut!(future);
+        let mut future = future;
 
-        let waker = self.waker();
-        let cx = task::Context::from_waker(&waker);
+        let waker = &self.standard_waker;
+        let mut cx = task::Context::from_waker(&waker);
 
         loop {
-            match future.poll(cx) {
+            let pinned_future = unsafe { Pin::new_unchecked(&mut future) };
+            match pinned_future.poll(&mut cx) {
                 task::Poll::Ready(o) => return o,
                 task::Poll::Pending => {
-                    let read_guard = self.instance.read();
-                    read_guard.wait(0, IoUringEnterFlags::empty()).expect("redox_iou: failed to enter io_uring");
+                    let a = {
+                        let read_guard = self.instance.consumer_instance.read();
+                        let flags = if unsafe { read_guard.sender().as_64().expect("expected 64-bit SQEs").ring_header() }.available_entry_count() > 0 {
+                            IoUringEnterFlags::empty()
+                        } else {
+                            IoUringEnterFlags::WAKEUP_ON_SQ_AVAIL
+                        };
+                        read_guard.wait(0, flags).expect("redox_iou: failed to enter io_uring")
+                    };
+
+                    let mut write_guard = self.instance.consumer_instance.write();
+
+                    let available_completions = unsafe { write_guard.receiver().as_64().unwrap().ring_header() }.available_entry_count();
+
+                    if a > available_completions {
+                        log::warn!("The kernel/other process gave us a higher number of available completions than present on the ring.");
+                    }
+
+                    for _ in 0..available_completions {
+                        let result = write_guard.receiver_mut().as_64_mut().expect("expected 64-bit CQEs").try_recv();
+
+                        match result {
+                            Ok(cqe) => { let _ = Self::handle_cqe(self.trusted_instance, self.tag_map.read(), &self.standard_waker, cqe); }
+                            Err(RingPopError::Empty { .. }) => panic!("the kernel gave us a higher number of available completions than actually available"),
+                            Err(RingPopError::Shutdown) => self.instance.dropped.store(true, std::sync::atomic::Ordering::Release),
+                        }
+                    }
                 }
             }
         }
     }
+
+    fn handle_cqe(trusted_instance: bool, tags: RwLockReadGuard<'_, BTreeMap<usize, Mutex<State>>>, standard_waker: &task::Waker, cqe: CqEntry64) -> Option<()> {
+        let cancelled = cqe.status == (-(ECANCELED as i64)) as u64;
+
+        let state_lock = if trusted_instance {
+            let pointer = usize::try_from(cqe.user_data).ok()? as *mut Mutex<State>;
+            let state_box = unsafe { Box::from_raw(pointer) };
+            todo!()
+        } else {
+            tags.get(&cqe.user_data.try_into().ok()?)?
+        };
+
+        let mut state = state_lock.lock();
+        match &*state {
+            // invalid state after having received a completion
+            State::Initial | State::Submitting(_, _) | State::Completed(_) | State::Cancelled => return None,
+            State::Completing(waker) => {
+                if !waker.will_wake(standard_waker) {
+                    waker.wake_by_ref();
+                }
+                *state = if cancelled {
+                    State::Cancelled
+                } else {
+                    State::Completed(cqe)
+                };
+            }
+        }
+        Some(())
+    }
+
+
     ///
     /// Get a future which represents submitting a command, and then waiting for it to complete. If
     /// this executor was built with `assume_trusted_instance`, the user data field of the sqe will
     /// be overridden, so that it can store the pointer to the state.
     ///
     /// # Safety
+    ///
     /// Unsafe because there is no guarantee that the buffers used by `sqe` will be used properly.
     /// If a future is dropped, and its memory is used again (possibly on the stack where it is
     /// even worse), there will be a data race between the kernel and the process.
@@ -119,14 +199,33 @@ impl Executor {
     ///
     pub unsafe fn send(&self, sqe: SqEntry64) -> CommandFuture {
         CommandFuture {
-            state: Some(CommandFutureState {
-                kind: CommandFutureStateKind::PendingSubmission(sqe),
-                instance: Arc::clone(&self.instance),
-                standard_waker: self.standard_waker.clone(),
-            }),
+            instance: Arc::clone(&self.instance),
+            repr: if self.trusted_instance {
+                CommandFutureRepr::Direct(todo!())
+            } else {
+                let tag_num = match self.reusable_tags.pop() {
+                    // try getting a reusable tag to minimize unnecessary allocations
+                    Ok((n, tag)) => {
+                        assert!(matches!(tag, State::Initial), "reusable tag was not in the reclaimed state");
+                        self.tag_map.write().insert(n, Mutex::new(tag)).expect("reusable tag was already within the active tag map");
+                        n
+                    }
+                    // if no reusable tag was present, create a new tag
+                    Err(crossbeam_queue::PopError) => {
+                        let n = self.next_tag.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.tag_map.write().insert(n, Mutex::new(State::Initial));
+                        n
+                    }
+                };
+                CommandFutureRepr::Tagged {
+                    tag: tag_num,
+                    tags: Arc::clone(&self.tag_map),
+                    initial_sqe: Some(sqe),
+                }
+            },
         }
     }
-    pub unsafe fn subscribe_to_fd_updates(&self, fd: usize) -> impl Stream<Item = (Event, u64)> {
+    pub unsafe fn subscribe_to_fd_updates(&self, fd: usize) -> FdUpdates {
         todo!()
     }
 
@@ -162,6 +261,13 @@ impl Executor {
         Self::completion_as_rw_io_result(cqe)
     }
 
+    pub async unsafe fn open(&self, path: &[u8], flags: u64) -> Result<usize> {
+        todo!()
+    }
+    pub async unsafe fn close(&self, fd: usize) -> Result<usize> {
+        todo!()
+    }
+
     pub async unsafe fn read(&self, fd: usize, buf: &mut [u8]) -> Result<usize> {
         self.rw_io(fd, |sqe, fd| sqe.read(fd, buf)).await
     }
@@ -189,92 +295,96 @@ impl Executor {
     }
 }
 
-enum CommandFutureRepr {
-    Direct,
-    Tagged,
-}
-
 pub struct CommandFuture {
-    state: Option<CommandFutureState>,
+    repr: CommandFutureRepr,
+    instance: Arc<InstanceWrapper>,
 }
 
-struct CommandFutureState {
-    kind: CommandFutureStateKind,
-    instance: Arc<RwLock<v1::ConsumerInstance>>,
-    standard_waker: task::Waker,
-    other_wakers: Option<Arc<Mutex<Vec<task::Waker>>>>,
+// the internal state of the pending command.
+#[derive(Debug)]
+enum State {
+    // the future has been initiated, but nothing has happened to it yet
+    Initial,
+
+    // the future is currently trying to submit the future, to a ring that was full
+    Submitting(SqEntry64, task::Waker),
+
+    // the future has submitted the SQE, but is waiting for the command to complete with the
+    // corresponding CQE.
+    Completing(task::Waker),
+
+    // the future has received the CQE, and the command is now complete. this state can now be
+    // reused for another future.
+    Completed(CqEntry64),
+
+    // the command was cancelled, while in the Completing state.
+    Cancelled,
 }
 
-enum CommandFutureStateKind {
-    // The future cannot send the command due to the SQ being full. Thus, it will have to wait for
-    // the producer to pop at least one item.
-    PendingSubmission(SqEntry64),
-
-    // The future is waiting for the command to complete.
-    PendingCompletion,
+enum CommandFutureState {
+    Initial(SqEntry64),
+    Submitting(SqEntry64),
+    Completing,
+    Finished,
 }
 
-pub enum CommandFutureError<S> {
-    ShutdownDuringSend(S),
-    ShutdownDuringRecv,
+enum CommandFutureRepr {
+    Direct(ManuallyDrop<Box<Mutex<State>>>),
+
+    Tagged {
+        tag: usize,
+        tags: Arc<RwLock<BTreeMap<usize, Mutex<State>>>>,
+        initial_sqe: Option<SqEntry64>,
+    },
 }
-impl<S> From<CommandFutureError<S>> for Error {
-    fn from(error: CommandFutureError<S>) -> Self {
-        match error {
-            CommandFutureError::ShutdownDuringRecv => Self::new(ESHUTDOWN),
-            CommandFutureError::ShutdownDuringSend(_) => Self::new(ESHUTDOWN),
+
+impl Future for CommandFuture {
+    type Output = Result<CqEntry64>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<Self::Output> {
+        let this = self.get_mut();
+
+        fn try_submit(instance: &mut v1::ConsumerInstance, state: &mut State, cx: &mut task::Context<'_>, sqe: SqEntry64) -> task::Poll<Result<CqEntry64>> {
+            match instance.sender_mut().as_64_mut().expect("expected instance with 64-bit SQEs").try_send(sqe) {
+                Ok(()) => {
+                    *state = State::Completing(cx.waker().clone());
+                    return task::Poll::Pending;
+                }
+                Err(RingPushError::Full(sqe)) => {
+                    *state = State::Submitting(sqe, cx.waker().clone());
+                    return task::Poll::Pending;
+                }
+                Err(RingPushError::Shutdown(_)) => return task::Poll::Ready(Err(Error::new(ESHUTDOWN))),
+            }
+        }
+
+        match this.repr {
+            CommandFutureRepr::Tagged { tag, ref tags, ref mut initial_sqe } => {
+                let tags = tags.read();
+                let tag_lock = tags.get(&tag).expect("CommandFuture error: tag used by future has been removed");
+                let mut tag = tag_lock.lock();
+
+                match &*tag {
+                    &State::Initial => return try_submit(&mut *this.instance.consumer_instance.write(), &mut *tag, cx, initial_sqe.take().expect("expected an initial SQE when in the initial state")),
+                    &State::Submitting(sqe, _) => return try_submit(&mut *this.instance.consumer_instance.write(), &mut *tag, cx, sqe),
+                    &State::Completing(_) => return task::Poll::Pending,
+
+                    &State::Completed(cqe) => return task::Poll::Ready(Ok(cqe)),
+                    &State::Cancelled => return task::Poll::Ready(Err(Error::new(ECANCELED))),
+                }
+            }
+            CommandFutureRepr::Direct(ref state) => todo!(),
         }
     }
 }
 
-impl Future for CommandFuture {
-    type Output = Result<CqEntry64, CommandFutureError<SqEntry64>>;
+pub struct FdUpdates;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<Self::Output> {
-        let this = self.get_mut();
-        let state = this.state.as_mut().expect("cannot poll CommandFuture after it has finished");
+impl Stream for FdUpdates {
+    type Item = Result<Event>;
 
-        fn change_state_and_block(state: &mut CommandFutureState, new_kind: CommandFutureStateKind) {
-            state.kind = new_kind;
-
-        }
-        fn mark_pending(state: &CommandFutureState, cx: &mut task::Context<'_>) {
-            if ! state.standard_waker.will_wake(cx.waker()) {
-                state.other_wakers.as_ref().expect("pushing other waker when external wakers weren't supported").lock().push(cx.waker().clone());
-            }
-        }
-
-        match this.state.kind {
-            CommandFutureStateKind::PendingSubmission(entry) => {
-                let mut write_guard = state.instance.write();
-                match write_guard.sender_mut() {
-                    &mut ConsumerGenericSender::Bits32(ref mut sender32) => todo!(),
-                    &mut ConsumerGenericSender::Bits64(ref mut sender64) => match sender64.try_send(entry) {
-                        Ok(()) => {
-                            state.kind = CommandFutureStateKind::PendingCompletion;
-                            self.poll(cx)
-                        }
-                        Err(RingPushError::Full(entry)) => {
-                            mark_pending(&*state, cx);
-                            return task::Poll::Pending;
-                        }
-                        Err(RingPushError::Shutdown(entry)) => return task::Poll::Ready(Err(CommandFutureError::ShutdownDuringSend(entry))),
-                    }
-                }
-            }
-            CommandFutureStateKind::PendingCompletion => {
-                let mut write_guard = state.instance.write();
-
-                match write_guard.receiver_mut() {
-                    &mut ConsumerGenericReceiver::Bits32(ref mut receiver32) => todo!(),
-                    &mut ConsumerGenericReceiver::Bits64(ref mut receiver64) => match receiver64.try_recv() {
-                        Ok(cqe) => task::Poll::Ready(Ok(cqe)),
-                        Err(RingPopError::Empty { .. }) => mark_pending(&*state),
-                        Err(RingPopError::Shutdown) => return task::Poll::Ready(Err(CommandFutureError::ShutdownDuringRecv)),
-                    }
-                }
-            }
-        }
+    fn poll_next(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<Option<Self::Item>> {
+        todo!()
     }
 }
 
