@@ -8,7 +8,7 @@ use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize}};
 use std::{slice, task};
 
 use syscall::{
-    EOVERFLOW, ESHUTDOWN, ECANCELED,
+    EINVAL, EOVERFLOW, ESHUTDOWN, ECANCELED,
     Error, Event, IoVec, Result,
 };
 pub use syscall::io_uring::*;
@@ -255,17 +255,57 @@ impl Executor {
         let base_sqe = SqEntry64::new(IoUringSqeFlags::empty(), 0, (-1i64) as u64);
         let sqe = f(base_sqe, fd);
 
-        let cqe = unsafe { self.send(
+        let cqe = self.send(
             sqe
-        ).await? };
+        ).await?;
         Self::completion_as_rw_io_result(cqe)
     }
 
-    pub async unsafe fn open(&self, path: &[u8], flags: u64) -> Result<usize> {
-        todo!()
+    pub async unsafe fn open_raw<B: AsRef<[u8]> + ?Sized>(&self, path: &B, flags: u64) -> Result<usize> {
+        let sqe = SqEntry64::new(IoUringSqeFlags::empty(), 0, (-1i64) as u64)
+            .open(path.as_ref(), flags);
+        let cqe = self.send(sqe).await?;
+        Self::completion_as_rw_io_result(cqe)
     }
-    pub async unsafe fn close(&self, fd: usize) -> Result<usize> {
-        todo!()
+    pub async fn open_raw_static<B: AsRef<[u8]> + ?Sized + 'static>(&self, path: &'static B, flags: u64) -> Result<usize> {
+        unsafe { self.open_raw(path, flags) }.await
+    }
+    pub async fn open_raw_move_buf(&self, path: Vec<u8>, flags: u64) -> Result<(usize, Vec<u8>)> {
+        let fd = unsafe { self.open_raw(&*path, flags) }.await?;
+        Ok((fd, path))
+    }
+    pub async unsafe fn open<S: AsRef<str> + ?Sized>(&self, path: &S, flags: u64) -> Result<usize> {
+        self.open_raw(path.as_ref().as_bytes(), flags).await
+    }
+    pub async fn open_static<S: AsRef<str> + ?Sized + 'static>(&self, path: &'static S, flags: u64) -> Result<usize> {
+        unsafe { self.open_raw(path.as_ref().as_bytes(), flags) }.await
+    }
+    pub async fn open_move_buf(&self, path: String, flags: u64) -> Result<(usize, String)> {
+        let fd = unsafe { self.open_raw(path.as_str().as_bytes(), flags) }.await?;
+        Ok((fd, path))
+    }
+
+    pub async unsafe fn close(&self, fd: usize, flush: bool) -> Result<()> {
+        let sqe = SqEntry64::new(IoUringSqeFlags::empty(), 0, (-1i64) as u64)
+            .close(fd.try_into().or(Err(Error::new(EOVERFLOW)))?, flush);
+        let cqe = self.send(sqe).await?;
+
+        Self::completion_as_rw_io_result(cqe)?;
+
+        Ok(())
+    }
+    pub async unsafe fn close_range(&self, range: std::ops::Range<usize>, flush: bool) -> Result<()> {
+        let start: u64 = range.start.try_into().or(Err(Error::new(EOVERFLOW)))?;
+        let end: u64 = range.end.try_into().or(Err(Error::new(EOVERFLOW)))?;
+        let count = end.checked_sub(start).ok_or(Error::new(EINVAL))?;
+
+        let sqe = SqEntry64::new(IoUringSqeFlags::empty(), 0, (-1i64) as u64)
+            .close_many(start, count, flush);
+        let cqe = self.send(sqe).await?;
+
+        Self::completion_as_rw_io_result(cqe)?;
+
+        Ok(())
     }
 
     pub async unsafe fn read(&self, fd: usize, buf: &mut [u8]) -> Result<usize> {
