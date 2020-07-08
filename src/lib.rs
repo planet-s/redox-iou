@@ -4,7 +4,8 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::pin::Pin;
-use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize}};
+use std::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::{slice, task};
 
 use syscall::{
@@ -27,13 +28,14 @@ pub struct Executor {
 
     // TODO: ConcurrentBTreeMap
     tag_map: Arc<RwLock<BTreeMap<usize, Mutex<State>>>>,
-    next_tag: AtomicUsize,
-    reusable_tags: ArrayQueue<(usize, State)>,
+    next_tag: Arc<AtomicUsize>,
+    reusable_tags: Arc<ArrayQueue<(usize, State)>>,
 }
 
 struct InstanceWrapper {
     consumer_instance: RwLock<v1::ConsumerInstance>,
     dropped: AtomicBool,
+    // store more of the arcs here instead
 }
 
 /// A builder that creates an `Executor`.
@@ -87,8 +89,8 @@ impl Executor {
             trusted_instance,
 
             tag_map: Arc::new(RwLock::new(BTreeMap::new())),
-            next_tag: AtomicUsize::new(1),
-            reusable_tags: ArrayQueue::new(512),
+            next_tag: Arc::new(AtomicUsize::new(1)),
+            reusable_tags: Arc::new(ArrayQueue::new(512)),
         }
     }
     fn waker(instance: &Arc<InstanceWrapper>) -> task::Waker {
@@ -181,8 +183,27 @@ impl Executor {
         }
         Some(())
     }
+    pub fn handle(&self) -> Handle {
+        Handle {
+            instance: Arc::downgrade(&self.instance),
+            next_tag: Arc::downgrade(&self.next_tag),
+            reusable_tags: Arc::downgrade(&self.reusable_tags),
+            tag_map: Arc::downgrade(&self.tag_map),
+            trusted_instance: self.trusted_instance,
+        }
+    }
+}
+pub struct Handle {
+    instance: Weak<InstanceWrapper>,
+    trusted_instance: bool,
 
+    // TODO: reusable_tags is completely useless
+    reusable_tags: Weak<ArrayQueue<(usize, State)>>,
+    tag_map: Weak<RwLock<BTreeMap<usize, Mutex<State>>>>,
+    next_tag: Weak<AtomicUsize>,
+}
 
+impl Handle {
     ///
     /// Get a future which represents submitting a command, and then waiting for it to complete. If
     /// this executor was built with `assume_trusted_instance`, the user data field of the sqe will
@@ -199,27 +220,27 @@ impl Executor {
     ///
     pub unsafe fn send(&self, sqe: SqEntry64) -> CommandFuture {
         CommandFuture {
-            instance: Arc::clone(&self.instance),
+            instance: self.instance.upgrade().expect("cannot send command: executor dead"),
             repr: if self.trusted_instance {
                 CommandFutureRepr::Direct(todo!())
             } else {
-                let tag_num = match self.reusable_tags.pop() {
+                let tag_num = match self.reusable_tags.upgrade().expect("cannot reclaim tag: executor dead").pop() {
                     // try getting a reusable tag to minimize unnecessary allocations
                     Ok((n, tag)) => {
                         assert!(matches!(tag, State::Initial), "reusable tag was not in the reclaimed state");
-                        self.tag_map.write().insert(n, Mutex::new(tag)).expect("reusable tag was already within the active tag map");
+                        self.tag_map.upgrade().expect("cannot insert tag: executor dead").write().insert(n, Mutex::new(tag)).expect("reusable tag was already within the active tag map");
                         n
                     }
                     // if no reusable tag was present, create a new tag
                     Err(crossbeam_queue::PopError) => {
-                        let n = self.next_tag.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        self.tag_map.write().insert(n, Mutex::new(State::Initial));
+                        let n = self.next_tag.upgrade().expect("cannot get new tag number: executor dead").fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.tag_map.upgrade().expect("cannot insert new tag: executor dead").write().insert(n, Mutex::new(State::Initial));
                         n
                     }
                 };
                 CommandFutureRepr::Tagged {
                     tag: tag_num,
-                    tags: Arc::clone(&self.tag_map),
+                    tags: self.tag_map.upgrade().expect("cannot get tag: executor dead"),
                     initial_sqe: Some(sqe),
                 }
             },
