@@ -221,7 +221,7 @@ impl Reactor {
             log::warn!("The kernel/other process gave us a higher number of available completions than present on the ring.");
         }
 
-        for _ in 0..available_completions {
+        for i in 0..available_completions {
             let result = write_guard
                 .receiver_mut()
                 .as_64_mut()
@@ -230,7 +230,7 @@ impl Reactor {
 
             match result {
                 Ok(cqe) => { let _ = Self::handle_cqe(self.trusted_instance, self.tag_map.read(), waker, cqe); }
-                Err(RingPopError::Empty { .. }) => panic!("the kernel gave us a higher number of available completions than actually available"),
+                Err(RingPopError::Empty { .. }) => panic!("the kernel gave us a higher number of available completions than actually available (at {}/{})", i, available_completions),
                 Err(RingPopError::Shutdown) => self.instance.dropped.store(true, std::sync::atomic::Ordering::Release),
             }
         }
