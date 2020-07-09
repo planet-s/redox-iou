@@ -199,7 +199,7 @@ impl Reactor {
                     .expect("expected 64-bit SQEs")
                     .ring_header()
             }
-            .available_entry_count()
+            .available_entry_count_spsc()
                 > 0
             {
                 IoUringEnterFlags::empty()
@@ -215,7 +215,7 @@ impl Reactor {
 
         let available_completions =
             unsafe { write_guard.receiver().as_64().unwrap().ring_header() }
-                .available_entry_count();
+                .available_entry_count_spsc();
 
         if a > available_completions {
             log::warn!("The kernel/other process gave us a higher number of available completions than present on the ring.");
