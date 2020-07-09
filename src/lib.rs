@@ -10,7 +10,6 @@ pub use syscall::io_uring::*;
 use syscall::{Error, Event, IoVec, Result, ECANCELED, EFAULT, EINVAL, EOVERFLOW, ESHUTDOWN};
 
 use crossbeam_queue::ArrayQueue;
-use either::Either;
 pub use futures::io::AsyncBufRead;
 use futures::Stream;
 use once_cell::sync::OnceCell;
@@ -213,8 +212,9 @@ impl Reactor {
 
         let mut write_guard = self.instance.consumer_instance.write();
 
-        let available_completions =
-            unsafe { write_guard.receiver().as_64().unwrap().ring_header() }
+        let ring_header =
+            unsafe { write_guard.receiver().as_64().unwrap().ring_header() };
+        let available_completions = ring_header
                 .available_entry_count_spsc();
 
         if a > available_completions {
@@ -247,17 +247,18 @@ impl Reactor {
 
         let state_lock = if trusted_instance {
             let pointer = usize::try_from(cqe.user_data).ok()? as *mut Mutex<State>;
-            state_arc = unsafe { Arc::from_raw(pointer) };
+            let state_weak = unsafe { Weak::from_raw(pointer) };
             assert_eq!(
-                Arc::strong_count(&state_arc),
+                Weak::strong_count(&state_weak),
                 1,
                 "expected strong count to be one when receiving a direct future"
             );
             assert_eq!(
-                Arc::weak_count(&state_arc),
+                Weak::weak_count(&state_weak),
                 1,
                 "expected weak count to be one when receiving a direct future"
             );
+            state_arc = state_weak.upgrade()?;
             &state_arc
         } else {
             tags.get(&cqe.user_data.try_into().ok()?)?
@@ -361,7 +362,7 @@ impl Handle {
             reactor: Weak::clone(&self.reactor),
             repr: if reactor.trusted_instance {
                 CommandFutureRepr::Direct {
-                    state: Either::Left(state_opt.unwrap()),
+                    state: state_opt.unwrap(),
                     initial_sqe: sqe,
                 }
             } else {
@@ -570,7 +571,7 @@ enum State {
 
 enum CommandFutureRepr {
     Direct {
-        state: Either<Arc<Mutex<State>>, Weak<Mutex<State>>>,
+        state: Arc<Mutex<State>>,
         initial_sqe: SqEntry64,
     },
 
@@ -597,12 +598,12 @@ impl Future for CommandFuture {
             state: &mut State,
             cx: &mut task::Context<'_>,
             sqe: SqEntry64,
-            state_arc: Option<Arc<Mutex<State>>>,
-        ) -> (task::Poll<Result<CqEntry64>>, bool) {
-            let sqe = if let Some(state_arc) = state_arc {
-                match (Arc::into_raw(state_arc) as usize).try_into() {
+            state_weak: Option<Weak<Mutex<State>>>,
+        ) -> task::Poll<Result<CqEntry64>> {
+            let sqe = if let Some(state_weak) = state_weak {
+                match (Weak::into_raw(state_weak) as usize).try_into() {
                     Ok(ptr64) => sqe.with_user_data(ptr64),
-                    Err(_) => return (task::Poll::Ready(Err(Error::new(EFAULT))), false),
+                    Err(_) => return task::Poll::Ready(Err(Error::new(EFAULT))),
                 }
             } else {
                 sqe
@@ -616,14 +617,14 @@ impl Future for CommandFuture {
             {
                 Ok(()) => {
                     *state = State::Completing(cx.waker().clone());
-                    return (task::Poll::Pending, true);
+                    return task::Poll::Pending;
                 }
                 Err(RingPushError::Full(sqe)) => {
                     *state = State::Submitting(sqe, cx.waker().clone());
-                    return (task::Poll::Pending, false);
+                    return task::Poll::Pending;
                 }
                 Err(RingPushError::Shutdown(_)) => {
-                    return (task::Poll::Ready(Err(Error::new(ESHUTDOWN))), false);
+                    return task::Poll::Ready(Err(Error::new(ESHUTDOWN)));
                 }
             }
         }
@@ -641,25 +642,18 @@ impl Future for CommandFuture {
                     .get(&tag)
                     .expect("CommandFuture::poll error: tag used by future has been removed");
 
-                (Either::Left(state_lock), initial_sqe, false)
+                (state_lock, initial_sqe, false)
             }
             CommandFutureRepr::Direct {
                 ref state,
                 initial_sqe: sqe,
             } => {
                 initial_sqe = Some(sqe);
-                (state.as_ref(), &mut initial_sqe, true)
+                (state, &mut initial_sqe, true)
             }
         };
-        let state_arc = state_lock.either(
-            |arc| Arc::clone(arc),
-            |weak| {
-                weak.upgrade()
-                    .expect("CommandFuture::poll error: state has been dropped")
-            },
-        );
 
-        let mut state_guard = state_arc.lock();
+        let mut state_guard = state_lock.lock();
 
         let mut in_state_sqe;
 
@@ -669,31 +663,17 @@ impl Future for CommandFuture {
         }
         match &*state_guard {
             &State::Initial | &State::Submitting(_, _) => {
-                let (result, downgrade) = try_submit(
+                try_submit(
                     &mut *reactor.instance.consumer_instance.write(),
                     &mut *state_guard,
                     cx,
                     init_sqe.expect("expected an initial SQE when submitting command"),
                     if is_direct {
-                        Some(Arc::clone(&state_arc))
+                        Some(Arc::downgrade(&state_lock))
                     } else {
                         None
                     },
-                );
-
-                if downgrade {
-                    if let CommandFutureRepr::Direct { state, .. } = &mut this.repr {
-                        if let Either::Left(arc) = state {
-                            *state = Either::Right(Arc::downgrade(&arc));
-                        } else {
-                            unreachable!("try_submit downgraded twice")
-                        }
-                    } else {
-                        unreachable!("try_submit returned downgrade when the repr was not Direct");
-                    }
-                }
-
-                return result;
+                )
             }
             &State::Completing(_) => return task::Poll::Pending,
 
