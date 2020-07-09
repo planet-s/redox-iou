@@ -430,8 +430,14 @@ impl Future for CommandFuture {
                     &State::Submitting(sqe, _) => return try_submit(&mut *this.instance.consumer_instance.write(), &mut *tag, cx, sqe),
                     &State::Completing(_) => return task::Poll::Pending,
 
-                    &State::Completed(cqe) => return task::Poll::Ready(Ok(cqe)),
-                    &State::Cancelled => return task::Poll::Ready(Err(Error::new(ECANCELED))),
+                    &State::Completed(cqe) => {
+                        *tag = State::Initial;
+                        return task::Poll::Ready(Ok(cqe));
+                    }
+                    &State::Cancelled => {
+                        *tag = State::Initial;
+                        return task::Poll::Ready(Err(Error::new(ECANCELED)));
+                    }
                 }
             }
             CommandFutureRepr::Direct(ref state) => todo!(),
