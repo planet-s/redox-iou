@@ -1,4 +1,4 @@
-use std::mem;
+use std::{fmt, mem};
 use std::sync::atomic::Ordering;
 
 use syscall::error::ESHUTDOWN;
@@ -94,6 +94,15 @@ impl<T> Drop for SpscSender<T> {
         }
     }
 }
+impl<T> fmt::Debug for SpscSender<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // TODO: More useful information
+        f.debug_struct("SpscSender")
+            .field("ring_header", &self.ring)
+            .field("entries_base", &self.entries_base)
+            .finish()
+    }
+}
 
 /// A safe wrapper over the raw [`Ring`] interface, that takes care of the mmap offset, as well
 /// as the global [`Ring`] structure. Only allows receiving items.
@@ -166,6 +175,15 @@ impl<T> Drop for SpscReceiver<T> {
             let _ = syscall::funmap(self.ring as *const _ as usize);
             let _ = syscall::funmap(self.entries_base as usize);
         }
+    }
+}
+impl<T> fmt::Debug for SpscReceiver<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // TODO: More useful information
+        f.debug_struct("SpscReceiver")
+            .field("ring_header", &self.ring)
+            .field("entries_base", &self.entries_base)
+            .finish()
     }
 }
 

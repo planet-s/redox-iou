@@ -400,6 +400,7 @@ mod consumer_instance {
             })
         }
     }
+    #[derive(Debug)]
     pub enum GenericSender {
         Bits32(SpscSender<SqEntry32>),
         Bits64(SpscSender<SqEntry64>),
@@ -445,6 +446,7 @@ mod consumer_instance {
         }
     }
 
+    #[derive(Debug)]
     pub enum GenericReceiver {
         Bits32(SpscReceiver<CqEntry32>),
         Bits64(SpscReceiver<CqEntry64>),
@@ -490,6 +492,7 @@ mod consumer_instance {
         }
     }
 
+    #[derive(Debug)]
     pub struct Instance {
         ringfd: usize,
         // TODO: Add finer-grained locks here, when lock_api can be used in the kernel.
@@ -551,15 +554,18 @@ mod producer_instance {
 
     use crate::ring::{SpscReceiver, SpscSender};
 
+    #[derive(Debug)]
     pub enum GenericSender {
         Bits32(SpscSender<CqEntry32>),
         Bits64(SpscSender<CqEntry64>),
     }
+    #[derive(Debug)]
     pub enum GenericReceiver {
         Bits32(SpscReceiver<SqEntry32>),
         Bits64(SpscReceiver<SqEntry64>),
     }
 
+    #[derive(Debug)]
     pub struct Instance {
         sender: GenericSender,
         receiver: GenericReceiver,
