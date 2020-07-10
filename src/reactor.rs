@@ -7,15 +7,14 @@ use std::task;
 use syscall::data::IoVec;
 use syscall::error::{Error, Result};
 use syscall::error::{ECANCELED, EINVAL, EOVERFLOW};
-use syscall::io_uring::{
-    v1, CqEntry64, IoUringEnterFlags, IoUringSqeFlags, RingPopError, SqEntry64,
-};
+use syscall::io_uring::{CqEntry64, IoUringEnterFlags, IoUringSqeFlags, RingPopError, SqEntry64};
 
 use crossbeam_queue::ArrayQueue;
 use once_cell::sync::OnceCell;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 
 use crate::future::{AtomicTag, CommandFuture, CommandFutureRepr, FdUpdates, State, Tag};
+use crate::instance::ConsumerInstance;
 
 /// A reactor driven by one primary `io_uring` and zero or more secondary `io_uring`s. May or may
 /// not be integrated into `Executor`
@@ -66,7 +65,7 @@ pub struct Reactor {
 
 pub(crate) struct InstanceWrapper {
     // a convenient safe wrapper over the raw underlying interface.
-    pub(crate) consumer_instance: RwLock<v1::ConsumerInstance>,
+    pub(crate) consumer_instance: RwLock<ConsumerInstance>,
 
     // stored when the ring encounters a shutdown error either when submitting an SQ, or receiving
     // a CQ.
@@ -77,7 +76,7 @@ pub(crate) struct InstanceWrapper {
 pub struct ReactorBuilder {
     trusted_instance: bool,
     secondary_instances: Vec<InstanceWrapper>,
-    primary_instance: Option<v1::ConsumerInstance>,
+    primary_instance: Option<ConsumerInstance>,
 }
 
 impl ReactorBuilder {
@@ -117,7 +116,7 @@ impl ReactorBuilder {
     /// This function will panic if the primary instance has already been specified, or if this
     /// instance is one of the secondary instances.
     ///
-    pub fn with_primary_instance(self, primary_instance: v1::ConsumerInstance) -> Self {
+    pub fn with_primary_instance(self, primary_instance: ConsumerInstance) -> Self {
         // TODO: ConsumerInstance Debug impl
         if self.primary_instance.is_some() {
             panic!("Cannot specify the primary instance twice!");
@@ -132,7 +131,7 @@ impl ReactorBuilder {
     ///
     /// Add a secondary instance, typically a userspace-to-userspace ring.
     ///
-    pub fn add_secondary_instance(mut self, secondary_instance: v1::ConsumerInstance) -> Self {
+    pub fn add_secondary_instance(mut self, secondary_instance: ConsumerInstance) -> Self {
         self.secondary_instances.push(InstanceWrapper {
             consumer_instance: RwLock::new(secondary_instance),
             dropped: AtomicBool::new(false),
@@ -157,7 +156,7 @@ impl ReactorBuilder {
 }
 impl Reactor {
     fn new(
-        main_instance: v1::ConsumerInstance,
+        main_instance: ConsumerInstance,
         trusted_main_instance: bool,
         secondary_instances: Vec<InstanceWrapper>,
     ) -> Arc<Self> {
@@ -187,7 +186,7 @@ impl Reactor {
             reactor: Weak::clone(self.weak_ref.get().unwrap()),
         }
     }
-    pub fn add_secondary_instance(&self, instance: v1::ConsumerInstance) {
+    pub fn add_secondary_instance(&self, instance: ConsumerInstance) {
         self.secondary_instances.write().push(InstanceWrapper {
             consumer_instance: RwLock::new(instance),
             dropped: AtomicBool::new(false),

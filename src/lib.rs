@@ -6,6 +6,7 @@ pub mod executor;
 pub mod future;
 pub mod instance;
 pub mod reactor;
+pub mod ring;
 
 /*
 pub struct Buffer<'a> {

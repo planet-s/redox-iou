@@ -8,11 +8,12 @@ use std::task;
 use syscall::data::Event;
 use syscall::error::{Error, Result};
 use syscall::error::{ECANCELED, EFAULT, ESHUTDOWN};
-use syscall::io_uring::{v1, CqEntry64, RingPushError, SqEntry64};
+use syscall::io_uring::{CqEntry64, RingPushError, SqEntry64};
 
 use futures::Stream;
 use parking_lot::Mutex;
 
+use crate::instance::ConsumerInstance;
 use crate::reactor::Reactor;
 
 pub(crate) type Tag = u64;
@@ -69,7 +70,7 @@ impl Future for CommandFuture {
             .expect("failed to poll CommandFuture: reactor is dead");
 
         fn try_submit(
-            instance: &mut v1::ConsumerInstance,
+            instance: &mut ConsumerInstance,
             state: &mut State,
             cx: &mut task::Context<'_>,
             sqe: SqEntry64,
