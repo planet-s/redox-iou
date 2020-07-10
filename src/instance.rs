@@ -539,6 +539,12 @@ mod consumer_instance {
             let _ = self.deinit();
         }
     }
+    impl PartialEq for Instance {
+        fn eq(&self, other: &Self) -> bool {
+            self.ringfd == other.ringfd
+        }
+    }
+    impl Eq for Instance {}
 }
 pub use consumer_instance::{
     GenericReceiver as ConsumerGenericReceiver, GenericSender as ConsumerGenericSender,
