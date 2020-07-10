@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::convert::{TryFrom, TryInto};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Weak};
 use std::{task, thread};
 
@@ -14,6 +14,9 @@ pub use futures::io::AsyncBufRead;
 use futures::Stream;
 use once_cell::sync::OnceCell;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
+
+type Tag = u64;
+type AtomicTag = AtomicU64;
 
 /// A minimal executor, that does not use any thread pool.
 pub struct Executor {
@@ -67,7 +70,7 @@ pub struct Reactor {
 
     // a map between integer tags and internal future state. this map is only used for untrusted
     // secondary instances, and for the main instance if `trusted_main_instance` is false.
-    tag_map: RwLock<BTreeMap<usize, Arc<Mutex<State>>>>,
+    tag_map: RwLock<BTreeMap<Tag, Arc<Mutex<State>>>>,
 
     // the next tag to use, retrieved with fetch_add(1, Ordering::Relaxed). if the value has
     // overflown, `tag_has_overflown` will be set, and further tags must be checked so that no tag
@@ -75,11 +78,10 @@ pub struct Reactor {
     // system, but on a 32-bit system it might happen.
     //
     // TODO: 64-bit tags?
-    next_tag: AtomicUsize,
-    tag_has_overflown: AtomicBool,
+    next_tag: AtomicTag,
 
     // an atomic queue that is used for Arc reclamation of `State`s.
-    reusable_tags: ArrayQueue<(usize, Arc<Mutex<State>>)>,
+    reusable_tags: ArrayQueue<(Tag, Arc<Mutex<State>>)>,
 
     // this is lazily initialized to make things work at initialization, but one should always
     // assume that the reactor holds a weak reference to itself, to make it easier to obtain a
@@ -99,7 +101,7 @@ struct InstanceWrapper {
 /// A builder that configures the reactor.
 pub struct ReactorBuilder {
     trusted_instance: bool,
-    secondary_instances: Vec<v1::ConsumerInstance>,
+    secondary_instances: Vec<InstanceWrapper>,
     primary_instance: Option<v1::ConsumerInstance>,
 }
 
@@ -127,10 +129,10 @@ impl ReactorBuilder {
     /// default). When the kernel is a producer though, this will not make anything more unsafe
     /// (since the kernel has full access to the address space anyways).
     ///
-    pub const unsafe fn assume_trusted_instance(self) -> Self {
+    pub unsafe fn assume_trusted_instance(self) -> Self {
         Self {
             trusted_instance: true,
-            ..self
+            .. self
         }
     }
     ///
@@ -140,7 +142,7 @@ impl ReactorBuilder {
     /// This function will panic if the primary instance has already been specified, or if this
     /// instance is one of the secondary instances.
     ///
-    pub const fn primary_instance(self, primary_instance: v1::ConsumerInstance) -> Self {
+    pub fn with_primary_instance(self, primary_instance: v1::ConsumerInstance) -> Self {
         // TODO: ConsumerInstance Debug impl
         if self.primary_instance.is_some() {
             panic!("Cannot specify the primary instance twice!");
@@ -155,8 +157,11 @@ impl ReactorBuilder {
     ///
     /// Add a secondary instance, typically a userspace-to-userspace ring.
     ///
-    pub fn secondary_instance(mut self, instance: v1::ConsumerInstance) -> Self {
-        self.secondary_instances.push(instance);
+    pub fn add_secondary_instance(mut self, secondary_instance: v1::ConsumerInstance) -> Self {
+        self.secondary_instances.push(InstanceWrapper {
+            consumer_instance: RwLock::new(secondary_instance),
+            dropped: AtomicBool::new(false),
+        });
         self
     }
 
@@ -177,8 +182,10 @@ impl ReactorBuilder {
 }
 
 impl Executor {
+    ///
     /// Create an executor that does not use include the reactor. This can be slower than having
     /// the reactor built-in, since another thread will have to drive the `io_uring` instead.
+    ///
     pub fn without_reactor() -> Self {
         let standard_waker_thread = Arc::new(RwLock::new(thread::current()));
 
@@ -189,6 +196,14 @@ impl Executor {
         }
     }
 
+    ///
+    /// Create an executor that includes an integrated reactor. This is generally more efficient
+    /// than offloading the reactor to another thread, provided that the futures can drive the
+    /// ring themselves when polled, since the kernel can immediately wake up the futures once new
+    /// completion entries are attainable. The executor can also be woken up by other threads
+    /// directly, by incrementing the pop epoch of the main ring, which will trick the kernel into
+    /// thinking that new entries are available.
+    ///
     pub fn with_reactor(reactor_arc: Arc<Reactor>) -> Self {
         let standard_waker_thread = Arc::new(RwLock::new(thread::current()));
 
@@ -202,6 +217,7 @@ impl Executor {
             }),
         }
     }
+
     fn driving_waker(reactor: &Arc<Reactor>) -> task::Waker {
         let reactor = Arc::downgrade(reactor);
 
@@ -237,7 +253,7 @@ impl Executor {
     {
         let mut future = future;
 
-        let waker = if let Some(reactor) = self.reactor {
+        let waker = if let Some(ref reactor) = self.reactor {
             reactor.driving_waker.clone()
         } else {
             *self.standard_waker_thread.write() = thread::current();
@@ -272,7 +288,7 @@ impl Executor {
     }
 }
 impl Reactor {
-    fn new(main_instance: v1::ConsumerInstance, trusted_main_instance: bool, secondary_instances: Vec<v1::ConsumerInstance>) -> Arc<Self> {
+    fn new(main_instance: v1::ConsumerInstance, trusted_main_instance: bool, secondary_instances: Vec<InstanceWrapper>) -> Arc<Self> {
         let main_instance = InstanceWrapper {
             consumer_instance: RwLock::new(main_instance),
             dropped: AtomicBool::new(false),
@@ -281,11 +297,10 @@ impl Reactor {
         let reactor_arc = Arc::new(Reactor {
             main_instance,
             trusted_main_instance,
-            secondary_instances: RwLock::new(Vec::new()),
+            secondary_instances: RwLock::new(secondary_instances),
 
             tag_map: RwLock::new(BTreeMap::new()),
-            next_tag: AtomicUsize::new(1),
-            tag_has_overflown: AtomicBool::new(false),
+            next_tag: AtomicTag::new(1),
             reusable_tags: ArrayQueue::new(512),
             weak_ref: OnceCell::new(),
         });
@@ -353,7 +368,7 @@ impl Reactor {
     }
     fn handle_cqe(
         trusted_instance: bool,
-        tags: RwLockReadGuard<'_, BTreeMap<usize, Arc<Mutex<State>>>>,
+        tags: RwLockReadGuard<'_, BTreeMap<Tag, Arc<Mutex<State>>>>,
         driving_waker: &task::Waker,
         cqe: CqEntry64,
     ) -> Option<()> {
@@ -692,7 +707,7 @@ enum CommandFutureRepr {
     },
 
     Tagged {
-        tag: usize,
+        tag: Tag,
         initial_sqe: Option<SqEntry64>,
     },
 }
