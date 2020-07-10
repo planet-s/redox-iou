@@ -17,51 +17,99 @@ use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 
 /// A minimal executor, that does not use any thread pool.
 pub struct Executor {
-    // a waker type that is more efficient to use if this executor drives the reactor itself (which
-    // isn't the case when integrating with e.g. async-std or tokio and using their executors).
-    driving_waker: task::Waker,
-
     // a regular waker that will wait for the reactor or whatever completes the future, to wake the
     // executor up.
     standard_waker: task::Waker,
+
+    // the current thread (yes, only one at the moment), that is currently waiting for the standard
+    // waker to wake it up.
     standard_waker_thread: Arc<RwLock<thread::Thread>>,
 
     // the reactor that this executor is driving, or alternatively None if the driver is running in
     // another thread. the latter is less performant.
-    reactor: Option<Arc<Reactor>>,
+    reactor: Option<ReactorWrapper>,
 }
 
-struct Reactor {
-    instance: InstanceWrapper,
-    trusted_instance: bool,
+struct ReactorWrapper {
+    // a reference counted reactor, which handles can be obtained from
+    reactor: Arc<Reactor>,
 
-    // TODO: ConcurrentBTreeMap
+    // a waker type that is more efficient to use if this executor drives the reactor itself (which
+    // isn't the case when integrating with e.g. async-std or tokio and using their executors).
+    driving_waker: task::Waker,
+}
+
+/// A reactor driven by one primary `io_uring` and zero or more secondary `io_uring`s. May or may
+/// not be integrated into `Executor`
+pub struct Reactor {
+    // the primary instance - when using secondary instances, this should be a kernel-attached
+    // instance, that can monitor secondary instances (typically userspace-to-userspace rings).
+    // when only a single instance is used, then this instance is free to also be a
+    // userspace-to-userspace ring.
+    main_instance: InstanceWrapper,
+
+    // distinguishes "trusted instances" from "non-trusted" instances. the major difference between
+    // these two, is that a non-trusted instance will use a map to associate integer tags with the
+    // future states. meanwhile, a trusted instance will put the a Weak::into_raw pointer in the
+    // user_data field, and then call Weak::from_raw to wake up the executor (which hopefully is
+    // this one). this is because we most likely don't want a user process modifying out own
+    // pointers!
+    trusted_main_instance: bool,
+
+    // the secondary instances, which are typically userspace-to-userspace, for schemes I/O or IPC.
+    // these are not blocked on using the `SYS_ENTER_IORING` syscall; instead, they use FilesUpdate
+    // on the main instance (which __must__ be attached to the kernel for secondary instances to
+    // exist whatsoever), and then pops the entries of that ring separately, precisely like with
+    // the primary ring.
+    secondary_instances: RwLock<Vec<InstanceWrapper>>,
+
+    // TODO: ConcurrentBTreeMap - I (4lDO2) am currently writing this.
+
+    // a map between integer tags and internal future state. this map is only used for untrusted
+    // secondary instances, and for the main instance if `trusted_main_instance` is false.
     tag_map: RwLock<BTreeMap<usize, Arc<Mutex<State>>>>,
 
+    // the next tag to use, retrieved with fetch_add(1, Ordering::Relaxed). if the value has
+    // overflown, `tag_has_overflown` will be set, and further tags must be checked so that no tag
+    // is accidentally replaced. this limit will probably _never_ be encountered on a 64-bit
+    // system, but on a 32-bit system it might happen.
+    //
+    // TODO: 64-bit tags?
     next_tag: AtomicUsize,
+    tag_has_overflown: AtomicBool,
+
+    // an atomic queue that is used for Arc reclamation of `State`s.
     reusable_tags: ArrayQueue<(usize, Arc<Mutex<State>>)>,
 
-    // this is Option to make things work at initialization, but one should always assume that the
-    // reactor holds a weak reference to itself, to make it easier to obtain a handle.
+    // this is lazily initialized to make things work at initialization, but one should always
+    // assume that the reactor holds a weak reference to itself, to make it easier to obtain a
+    // handle.
     weak_ref: OnceCell<Weak<Reactor>>,
 }
 
 struct InstanceWrapper {
+    // a convenient safe wrapper over the raw underlying interface.
     consumer_instance: RwLock<v1::ConsumerInstance>,
+
+    // stored when the ring encounters a shutdown error either when submitting an SQ, or receiving
+    // a CQ.
     dropped: AtomicBool,
-    // store more of the arcs here instead
 }
 
-/// A builder that creates an `Executor`.
-pub struct ExecutorBuilder {
+/// A builder that configures the reactor.
+pub struct ReactorBuilder {
     trusted_instance: bool,
+    secondary_instances: Vec<v1::ConsumerInstance>,
+    primary_instance: Option<v1::ConsumerInstance>,
 }
 
-impl ExecutorBuilder {
+impl ReactorBuilder {
     /// Create an executor builder with the default options.
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             trusted_instance: false,
+            primary_instance: None,
+            secondary_instances: Vec::new(),
         }
     }
     ///
@@ -79,46 +127,79 @@ impl ExecutorBuilder {
     /// default). When the kernel is a producer though, this will not make anything more unsafe
     /// (since the kernel has full access to the address space anyways).
     ///
-    pub unsafe fn assume_trusted_instance(self) -> Self {
+    pub const unsafe fn assume_trusted_instance(self) -> Self {
         Self {
             trusted_instance: true,
             ..self
         }
     }
+    ///
+    /// Set the primary instance that will be used by the executor.
+    ///
+    /// # Panics
+    /// This function will panic if the primary instance has already been specified, or if this
+    /// instance is one of the secondary instances.
+    ///
+    pub const fn primary_instance(self, primary_instance: v1::ConsumerInstance) -> Self {
+        // TODO: ConsumerInstance Debug impl
+        if self.primary_instance.is_some() {
+            panic!("Cannot specify the primary instance twice!");
+        }
+        // TODO: Check for conflict with secondary instances
+        Self {
+            primary_instance: Some(primary_instance),
+            ..self
+        }
+    }
 
-    pub fn build(self, instance: v1::ConsumerInstance) -> Executor {
-        Executor::new(instance, self.trusted_instance)
+    ///
+    /// Add a secondary instance, typically a userspace-to-userspace ring.
+    ///
+    pub fn secondary_instance(mut self, instance: v1::ConsumerInstance) -> Self {
+        self.secondary_instances.push(instance);
+        self
+    }
+
+    ///
+    /// Finalize the reactor, using the options that have been specified here.
+    ///
+    /// # Panics
+    /// This function will panic if the primary instance has not been set.
+    ///
+    pub fn build(self) -> Arc<Reactor> {
+        let primary_instance = self.primary_instance.expect("expected");
+        Reactor::new(
+            primary_instance,
+            self.trusted_instance,
+            self.secondary_instances,
+        )
     }
 }
 
 impl Executor {
-    fn new(instance: v1::ConsumerInstance, trusted_instance: bool) -> Self {
-        let instance = InstanceWrapper {
-            consumer_instance: RwLock::new(instance),
-            dropped: AtomicBool::new(false),
-        };
-
-        let reactor_arc = Arc::new(Reactor {
-            instance,
-            trusted_instance,
-
-            tag_map: RwLock::new(BTreeMap::new()),
-            next_tag: AtomicUsize::new(1),
-            reusable_tags: ArrayQueue::new(512),
-            weak_ref: OnceCell::new(),
-        });
-        let res = reactor_arc.weak_ref.set(Arc::downgrade(&reactor_arc));
-        if res.is_err() {
-            unreachable!();
-        }
-
+    /// Create an executor that does not use include the reactor. This can be slower than having
+    /// the reactor built-in, since another thread will have to drive the `io_uring` instead.
+    pub fn without_reactor() -> Self {
         let standard_waker_thread = Arc::new(RwLock::new(thread::current()));
 
         Self {
-            driving_waker: Self::driving_waker(&reactor_arc),
+            reactor: None,
             standard_waker: Self::standard_waker(&standard_waker_thread),
             standard_waker_thread,
-            reactor: Some(reactor_arc),
+        }
+    }
+
+    pub fn with_reactor(reactor_arc: Arc<Reactor>) -> Self {
+        let standard_waker_thread = Arc::new(RwLock::new(thread::current()));
+
+        Self {
+            standard_waker: Self::standard_waker(&standard_waker_thread),
+            standard_waker_thread,
+
+            reactor: Some(ReactorWrapper {
+                driving_waker: Self::driving_waker(&reactor_arc),
+                reactor: reactor_arc,
+            }),
         }
     }
     fn driving_waker(reactor: &Arc<Reactor>) -> task::Waker {
@@ -129,7 +210,7 @@ impl Executor {
                 .upgrade()
                 .expect("failed to wake up executor: integrated reactor dead");
 
-            let instance_guard = reactor.instance.consumer_instance.read();
+            let instance_guard = reactor.main_instance.consumer_instance.read();
 
             match instance_guard.sender() {
                 &ConsumerGenericSender::Bits32(ref sender32) => sender32.notify(),
@@ -156,8 +237,8 @@ impl Executor {
     {
         let mut future = future;
 
-        let waker = if self.reactor.is_some() {
-            self.driving_waker.clone()
+        let waker = if let Some(reactor) = self.reactor {
+            reactor.driving_waker.clone()
         } else {
             *self.standard_waker_thread.write() = thread::current();
             self.standard_waker.clone()
@@ -170,27 +251,64 @@ impl Executor {
             match pinned_future.poll(&mut cx) {
                 task::Poll::Ready(o) => return o,
 
-                task::Poll::Pending => {
-                    if let Some(reactor) = self.reactor.as_ref() {
-                        reactor.drive(&waker);
-                    } else {
-                        thread::park();
-                    }
+                task::Poll::Pending => if let Some(reactor_wrapper) = self.reactor.as_ref() {
+                    reactor_wrapper.reactor.drive(&waker);
+                } else {
+                    thread::park();
                 }
             }
         }
     }
 
+    /// Get a handle to the integrated reactor, if present. This is a convenience wrapper over
+    /// `self.integrated_reactor().map(|r| r.handle())`.
     pub fn reactor_handle(&self) -> Option<Handle> {
-        self.reactor.as_ref().map(|reactor_arc| Handle {
-            reactor: Arc::downgrade(&reactor_arc),
-        })
+        self.integrated_reactor().map(|reactor| reactor.handle())
+    }
+
+    /// Get the integrated reactor used by this executor, if present.
+    pub fn integrated_reactor(&self) -> Option<&Arc<Reactor>> {
+        self.reactor.as_ref().map(|wrapper| &wrapper.reactor)
     }
 }
 impl Reactor {
+    fn new(main_instance: v1::ConsumerInstance, trusted_main_instance: bool, secondary_instances: Vec<v1::ConsumerInstance>) -> Arc<Self> {
+        let main_instance = InstanceWrapper {
+            consumer_instance: RwLock::new(main_instance),
+            dropped: AtomicBool::new(false),
+        };
+
+        let reactor_arc = Arc::new(Reactor {
+            main_instance,
+            trusted_main_instance,
+            secondary_instances: RwLock::new(Vec::new()),
+
+            tag_map: RwLock::new(BTreeMap::new()),
+            next_tag: AtomicUsize::new(1),
+            tag_has_overflown: AtomicBool::new(false),
+            reusable_tags: ArrayQueue::new(512),
+            weak_ref: OnceCell::new(),
+        });
+        let res = reactor_arc.weak_ref.set(Arc::downgrade(&reactor_arc));
+        if res.is_err() {
+            unreachable!();
+        }
+        reactor_arc
+    }
+    pub fn handle(&self) -> Handle {
+        Handle {
+            reactor: Weak::clone(self.weak_ref.get().unwrap()),
+        }
+    }
+    pub fn add_secondary_instance(&self, instance: v1::ConsumerInstance) {
+        self.secondary_instances.write().push(InstanceWrapper {
+            consumer_instance: RwLock::new(instance),
+            dropped: AtomicBool::new(false),
+        });
+    }
     fn drive(&self, waker: &task::Waker) {
         let a = {
-            let read_guard = self.instance.consumer_instance.read();
+            let read_guard = self.main_instance.consumer_instance.read();
             let flags = if unsafe {
                 read_guard
                     .sender()
@@ -210,12 +328,10 @@ impl Reactor {
                 .expect("redox_iou: failed to enter io_uring")
         };
 
-        let mut write_guard = self.instance.consumer_instance.write();
+        let mut write_guard = self.main_instance.consumer_instance.write();
 
-        let ring_header =
-            unsafe { write_guard.receiver().as_64().unwrap().ring_header() };
-        let available_completions = ring_header
-                .available_entry_count_spsc();
+        let ring_header = unsafe { write_guard.receiver().as_64().unwrap().ring_header() };
+        let available_completions = ring_header.available_entry_count_spsc();
 
         if a > available_completions {
             log::warn!("The kernel/other process gave us a higher number of available completions than present on the ring.");
@@ -229,9 +345,9 @@ impl Reactor {
                 .try_recv();
 
             match result {
-                Ok(cqe) => { let _ = Self::handle_cqe(self.trusted_instance, self.tag_map.read(), waker, cqe); }
+                Ok(cqe) => { let _ = Self::handle_cqe(self.trusted_main_instance, self.tag_map.read(), waker, cqe); }
                 Err(RingPopError::Empty { .. }) => panic!("the kernel gave us a higher number of available completions than actually available (at {}/{})", i, available_completions),
-                Err(RingPopError::Shutdown) => self.instance.dropped.store(true, std::sync::atomic::Ordering::Release),
+                Err(RingPopError::Shutdown) => self.main_instance.dropped.store(true, std::sync::atomic::Ordering::Release),
             }
         }
     }
@@ -329,7 +445,7 @@ impl Handle {
                     "weird leakage of weak refs to CommandFuture state"
                 );
 
-                if reactor.trusted_instance {
+                if reactor.trusted_main_instance {
                     (None, Some(state))
                 } else {
                     reactor
@@ -349,7 +465,7 @@ impl Handle {
                     .next_tag
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                if reactor.trusted_instance {
+                if reactor.trusted_main_instance {
                     (None, Some(state_arc))
                 } else {
                     reactor.tag_map.write().insert(n, state_arc);
@@ -360,7 +476,7 @@ impl Handle {
 
         CommandFuture {
             reactor: Weak::clone(&self.reactor),
-            repr: if reactor.trusted_instance {
+            repr: if reactor.trusted_main_instance {
                 CommandFutureRepr::Direct {
                     state: state_opt.unwrap(),
                     initial_sqe: sqe,
@@ -662,19 +778,17 @@ impl Future for CommandFuture {
             init_sqe = &mut in_state_sqe;
         }
         match &*state_guard {
-            &State::Initial | &State::Submitting(_, _) => {
-                try_submit(
-                    &mut *reactor.instance.consumer_instance.write(),
-                    &mut *state_guard,
-                    cx,
-                    init_sqe.expect("expected an initial SQE when submitting command"),
-                    if is_direct {
-                        Some(Arc::downgrade(&state_lock))
-                    } else {
-                        None
-                    },
-                )
-            }
+            &State::Initial | &State::Submitting(_, _) => try_submit(
+                &mut *reactor.main_instance.consumer_instance.write(),
+                &mut *state_guard,
+                cx,
+                init_sqe.expect("expected an initial SQE when submitting command"),
+                if is_direct {
+                    Some(Arc::downgrade(&state_lock))
+                } else {
+                    None
+                },
+            ),
             &State::Completing(_) => return task::Poll::Pending,
 
             &State::Completed(cqe) => {
