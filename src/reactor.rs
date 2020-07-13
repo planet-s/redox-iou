@@ -305,6 +305,10 @@ pub struct Handle {
 }
 
 impl Handle {
+    pub fn reactor(&self) -> Arc<Reactor> {
+        self.reactor.upgrade().expect("couldn't retrieve reactor from Handle: reactor is dead")
+    }
+
     ///
     /// Get a future which represents submitting a command, and then waiting for it to complete. If
     /// this executor was built with `assume_trusted_instance`, the user data field of the sqe will
