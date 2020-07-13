@@ -5,15 +5,17 @@ use std::sync::{Arc, Weak};
 use std::task;
 
 use syscall::data::IoVec;
+use syscall::flag::EventFlags;
 use syscall::error::{Error, Result};
 use syscall::error::{ECANCELED, EINVAL, EOVERFLOW};
 use syscall::io_uring::{CqEntry64, IoUringEnterFlags, IoUringSqeFlags, RingPopError, SqEntry64};
 
 use crossbeam_queue::ArrayQueue;
+use either::*;
 use once_cell::sync::OnceCell;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 
-use crate::future::{AtomicTag, CommandFuture, CommandFutureRepr, FdUpdates, State, Tag};
+use crate::future::{AtomicTag, CommandFuture, CommandFutureInner, CommandFutureRepr, FdUpdates, State, Tag};
 use crate::instance::ConsumerInstance;
 
 /// A reactor driven by one primary `io_uring` and zero or more secondary `io_uring`s. May or may
@@ -96,7 +98,7 @@ impl ReactorBuilder {
     ///
     /// # Safety
     /// This is unsafe because when enabled, it will optimize the executor to use the `user_data`
-    /// field as a pointer to the status. A rouge producer would be able to change the user data
+    /// field as a pointer to the status. A rogue producer would be able to change the user data
     /// pointer, to an arbitrary address, and cause program corruption. While the addresses can be
     /// checked at runtime, this is too expensive to check if performance is a concern (and
     /// probably even more expensive than simply storing the user_data as a tag, which is the
@@ -181,11 +183,14 @@ impl Reactor {
         }
         reactor_arc
     }
+    /// Obtain a handle to this reactor, capable of creating futures that use it.
     pub fn handle(&self) -> Handle {
         Handle {
             reactor: Weak::clone(self.weak_ref.get().unwrap()),
         }
     }
+    /// Add an additional secondary instance to the reactor, waking up the executor to include it
+    /// if necessary.
     pub fn add_secondary_instance(&self, instance: ConsumerInstance) {
         self.secondary_instances.write().push(InstanceWrapper {
             consumer_instance: RwLock::new(instance),
@@ -267,11 +272,10 @@ impl Reactor {
         };
 
         let mut state = state_lock.lock();
-        match &*state {
+        match &mut *state {
             // invalid state after having received a completion
-            State::Initial | State::Submitting(_, _) | State::Completed(_) | State::Cancelled => {
-                return None
-            }
+            State::Initial | State::Submitting(_, _) | State::Completed(_) | State::Cancelled => return None,
+
             State::Completing(waker) => {
                 // Wake other executors which have futures using this reactor.
                 if !waker.will_wake(driving_waker) {
@@ -284,10 +288,18 @@ impl Reactor {
                     State::Completed(cqe)
                 };
             }
+            State::ReceivingMulti(ref mut pending_cqes, waker) => {
+                if !waker.will_wake(driving_waker) {
+                    waker.wake_by_ref();
+                }
+                pending_cqes.push_back(cqe);
+            }
         }
         Some(())
     }
 }
+
+/// A handle to the reactor, used for creating futures.
 pub struct Handle {
     reactor: Weak<Reactor>,
 }
@@ -308,6 +320,9 @@ impl Handle {
     /// is UB.
     ///
     pub unsafe fn send(&self, sqe: SqEntry64) -> CommandFuture {
+        self.send_inner(sqe, false).left().expect("send_inner() must return CommandFuture if is_stream is set to false")
+    }
+    unsafe fn send_inner(&self, sqe: SqEntry64, is_stream: bool) -> Either<CommandFuture, FdUpdates> {
         let reactor = self
             .reactor
             .upgrade()
@@ -360,7 +375,7 @@ impl Handle {
             }
         };
 
-        CommandFuture {
+        let inner = CommandFutureInner {
             reactor: Weak::clone(&self.reactor),
             repr: if reactor.trusted_main_instance {
                 CommandFutureRepr::Direct {
@@ -373,10 +388,22 @@ impl Handle {
                     initial_sqe: Some(sqe),
                 }
             },
+        };
+
+        if is_stream {
+            Right(inner.into())
+        } else {
+            Left(inner.into())
         }
     }
-    pub unsafe fn subscribe_to_fd_updates(&self, _fd: usize) -> FdUpdates {
-        todo!()
+
+    /// Create an asynchronous stream that represents the events coming from one of more file
+    /// descriptors that are triggered when e.g. the file has changed, or is capable of reading new
+    /// data, etc.
+    pub unsafe fn subscribe_to_fd_updates(&self, fd: usize, event_flags: EventFlags, oneshot: bool) -> FdUpdates {
+        let sqe = SqEntry64::new(IoUringSqeFlags::SUBSCRIBE, 0, 0)
+            .file_update(fd.try_into().unwrap(), event_flags, oneshot);
+        self.send_inner(sqe, true).right().expect("send_inner must return Right if is_stream is set to true")
     }
 
     fn completion_as_rw_io_result(cqe: CqEntry64) -> Result<usize> {
