@@ -59,14 +59,14 @@ mod consumer_instance {
         }
 
         fn as_create_stage(&mut self) -> Option<&mut InstanceBuilderCreateStageInfo> {
-            if let &mut InstanceBuilderStage::Create(ref mut stage_info) = &mut self.stage {
+            if let InstanceBuilderStage::Create(ref mut stage_info) = self.stage {
                 Some(stage_info)
             } else {
                 None
             }
         }
         fn as_mmap_stage(&mut self) -> Option<&mut InstanceBuilderMmapStageInfo> {
-            if let &mut InstanceBuilderStage::Mmap(ref mut stage_info) = &mut self.stage {
+            if let InstanceBuilderStage::Mmap(ref mut stage_info) = self.stage {
                 Some(stage_info)
             } else {
                 None
@@ -192,8 +192,8 @@ mod consumer_instance {
             (self.submission_entry_count() * self.submission_entry_size() + 4095) / 4096 * 4096
         }
         pub fn create_info(&self) -> IoUringCreateInfo {
-            match &self.stage {
-                &InstanceBuilderStage::Create(_) => IoUringCreateInfo {
+            match self.stage {
+                InstanceBuilderStage::Create(_) => IoUringCreateInfo {
                     version: self.version(),
                     _rsvd: 0,
                     flags: self.flags().bits(),
@@ -201,8 +201,8 @@ mod consumer_instance {
                     sq_entry_count: self.submission_entry_count(),
                     cq_entry_count: self.completion_entry_count(),
                 },
-                &InstanceBuilderStage::Mmap(ref info) => info.create_info,
-                &InstanceBuilderStage::Attach(ref info) => info.create_info,
+                InstanceBuilderStage::Mmap(ref info) => info.create_info,
+                InstanceBuilderStage::Attach(ref info) => info.create_info,
             }
         }
         pub fn create_instance(mut self) -> Result<Self> {
@@ -400,6 +400,11 @@ mod consumer_instance {
             })
         }
     }
+    impl Default for InstanceBuilder {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
     #[derive(Debug)]
     pub enum GenericSender {
         Bits32(SpscSender<SqEntry32>),
@@ -422,13 +427,13 @@ mod consumer_instance {
         }
         pub fn as_32(&self) -> Option<&SpscSender<SqEntry32>> {
             match self {
-                &Self::Bits32(ref s) => Some(s),
+                Self::Bits32(ref s) => Some(s),
                 _ => None,
             }
         }
         pub fn as_64(&self) -> Option<&SpscSender<SqEntry64>> {
             match self {
-                &Self::Bits64(ref s) => Some(s),
+                Self::Bits64(ref s) => Some(s),
                 _ => None,
             }
         }
@@ -468,25 +473,25 @@ mod consumer_instance {
         }
         pub fn as_32(&self) -> Option<&SpscReceiver<CqEntry32>> {
             match self {
-                &Self::Bits32(ref s) => Some(s),
+                Self::Bits32(ref s) => Some(s),
                 _ => None,
             }
         }
         pub fn as_64(&self) -> Option<&SpscReceiver<CqEntry64>> {
             match self {
-                &Self::Bits64(ref s) => Some(s),
+                Self::Bits64(ref s) => Some(s),
                 _ => None,
             }
         }
         pub fn as_32_mut(&mut self) -> Option<&mut SpscReceiver<CqEntry32>> {
             match self {
-                &mut Self::Bits32(ref mut s) => Some(s),
+                Self::Bits32(ref mut s) => Some(s),
                 _ => None,
             }
         }
         pub fn as_64_mut(&mut self) -> Option<&mut SpscReceiver<CqEntry64>> {
             match self {
-                &mut Self::Bits64(ref mut s) => Some(s),
+                Self::Bits64(ref mut s) => Some(s),
                 _ => None,
             }
         }

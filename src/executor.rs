@@ -80,8 +80,8 @@ impl Executor {
             let instance_guard = reactor.main_instance.consumer_instance.read();
 
             match instance_guard.sender() {
-                &ConsumerGenericSender::Bits32(ref sender32) => sender32.notify(),
-                &ConsumerGenericSender::Bits64(ref sender64) => sender64.notify(),
+                ConsumerGenericSender::Bits32(ref sender32) => sender32.notify(),
+                ConsumerGenericSender::Bits64(ref sender64) => sender64.notify(),
             }
         })
     }

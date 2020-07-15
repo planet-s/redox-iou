@@ -421,7 +421,7 @@ impl BufferPool {
         }
         Ok(())
     }
-    pub unsafe fn new_from_raw(fd: usize, handle: Option<Handle>) -> Self {
+    unsafe fn new_from_raw(fd: usize, handle: Option<Handle>) -> Self {
         Self {
             occ_map: RwLock::new(OccMap {
                 forest: MapForest::new(),

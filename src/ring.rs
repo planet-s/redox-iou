@@ -26,6 +26,14 @@ unsafe impl<T: Send> Send for SpscSender<T> {}
 unsafe impl<T: Send> Sync for SpscSender<T> {}
 
 impl<T> SpscSender<T> {
+    /// Construct this high-level sender wrapper, from raw pointers to the ring header and entries.
+    ///
+    /// # Safety
+    ///
+    /// This method is unsafe, since it allows creating a wrapper that implicitly dereferences
+    /// these pointers, without any validations whatsoever. While there is no practial necessity
+    /// for the ring header and entries to come directly from an mmap for the `io_uring:` scheme,
+    /// they still have to safely dereferencable.
     pub unsafe fn from_raw(ring: *const Ring<T>, entries_base: *mut T) -> Self {
         Self { ring, entries_base }
     }
@@ -120,6 +128,11 @@ unsafe impl<T: Send> Send for SpscReceiver<T> {}
 unsafe impl<T: Send> Sync for SpscReceiver<T> {}
 
 impl<T> SpscReceiver<T> {
+    /// Construct this high-level receiver wrapper, from raw points of the ring header and entries.
+    ///
+    /// # Safety
+    ///
+    /// The same exact same invariants as with [`SpscSender::from_raw`] apply here as well.
     pub unsafe fn from_raw(ring: *const Ring<T>, entries_base: *const T) -> Self {
         Self { ring, entries_base }
     }

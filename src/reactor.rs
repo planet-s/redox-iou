@@ -273,7 +273,7 @@ impl Reactor {
             state_arc = state_weak.upgrade()?;
             &state_arc
         } else {
-            tags.get(&cqe.user_data.try_into().ok()?)?
+            tags.get(&cqe.user_data)?
         };
 
         let mut state = state_lock.lock();
@@ -425,7 +425,7 @@ impl Handle {
     /// Create an asynchronous stream that represents the events coming from one of more file
     /// descriptors that are triggered when e.g. the file has changed, or is capable of reading new
     /// data, etc.
-    pub unsafe fn subscribe_to_fd_updates(
+    pub fn subscribe_to_fd_updates(
         &self,
         fd: usize,
         event_flags: EventFlags,
@@ -436,9 +436,11 @@ impl Handle {
             event_flags,
             oneshot,
         );
-        self.send_inner(sqe, true)
-            .right()
-            .expect("send_inner must return Right if is_stream is set to true")
+        unsafe {
+            self.send_inner(sqe, true)
+                .right()
+                .expect("send_inner must return Right if is_stream is set to true")
+        }
     }
 
     fn completion_as_rw_io_result(cqe: CqEntry64) -> Result<usize> {
@@ -472,6 +474,14 @@ impl Handle {
         Self::completion_as_rw_io_result(cqe)
     }
 
+    /// Open a path represented by a UTF-8 byte slice, returning a new file descriptor for the file
+    /// specified by that path.
+    ///
+    /// # Safety
+    ///
+    /// Refer to [`open`] for invariants that must be upheld.
+    ///
+    /// [`open`]: #variant.open
     pub async unsafe fn open_raw<B: AsRef<[u8]> + ?Sized>(
         &self,
         path: &B,
@@ -493,6 +503,12 @@ impl Handle {
         let fd = unsafe { self.open_raw(&*path, flags) }.await?;
         Ok((fd, path))
     }
+    /// Open a path, returning a new file descriptor for the file specified by that path.
+    ///
+    /// # Safety
+    ///
+    /// For this to be safe, the path buffer that is used by the path, _must_ outlive the execution
+    /// of this future, and the buffer must not be reclaimed until completion or cancellation.
     pub async unsafe fn open<S: AsRef<str> + ?Sized>(&self, path: &S, flags: u64) -> Result<usize> {
         self.open_raw(path.as_ref().as_bytes(), flags).await
     }
@@ -508,6 +524,21 @@ impl Handle {
         Ok((fd, path))
     }
 
+    /// Close a file descriptor, optionally flushing it if necessary. This will only complete when
+    /// the file descriptor has been removed from the file table, the underlying scheme has
+    /// been handled the close, and optionally, pending data has been flushed to secondary storage.
+    ///
+    /// # Safety
+    ///
+    /// The file descriptor in use must not in any way reference memory that can be reclaimed by
+    /// this process while the other process, kernel, or hardware, keeps using it. Generally, this
+    /// is safe for things like files, pipes and scheme sockets, but not for mmapped files,
+    /// O_DIRECT files, or file descriptors that use io_uring.
+    ///
+    /// Additionally, even though the completion entry to this syscall may be delayed, the file
+    /// descriptor _must_ not be used after this command has been submitted, since the kernel is
+    /// free to assign the same file descriptor for new handles, even though this may not happen
+    /// immediately after submission.
     pub async unsafe fn close(&self, fd: usize, flush: bool) -> Result<()> {
         let sqe = SqEntry64::new(IoUringSqeFlags::empty(), 0, (-1i64) as u64)
             .close(fd.try_into().or(Err(Error::new(EOVERFLOW)))?, flush);
@@ -517,6 +548,16 @@ impl Handle {
 
         Ok(())
     }
+
+    /// Close a range of file descriptors, optionally flushing them if necessary. This functions
+    /// exactly like multiple invocations of the [`close`] call, with the difference of only taking
+    /// up one SQE and thus being more efficient when closing many adjacent file descriptors.
+    ///
+    /// # Safety
+    ///
+    /// Refer to the invariants documented in the [`close`] call.
+    ///
+    /// [`close`]: #variant.close
     pub async unsafe fn close_range(
         &self,
         range: std::ops::Range<usize>,
@@ -632,6 +673,15 @@ impl Handle {
         Ok(res_fd)
     }
 
+    /// Create a memory map from an offset+len pair inside a file descriptor, with an optional hint
+    /// to where the mmap will be created. If [`MAP_FIXED`] or [`MAP_FIXED_NOREPLACE`] (which
+    /// implies [`MAP_FIXED`] is set), the address hint is not taken as a hint, but rather as the
+    /// actual offset to map to.
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe since it's dealing with the address space of a process, and may
+    /// overwrite an existing grant, if [`MAP_FIXED`] is set and [`MAP_FIXED_NOREPLACE`] is not.
     pub async unsafe fn mmap2(
         &self,
         fd: usize,
@@ -662,6 +712,21 @@ impl Handle {
         let pointer = Error::demux64(cqe.status)?;
         Ok(pointer as *const ())
     }
+
+    /// Create a memory map from an offset+len pair inside a file descriptor, in a similar way
+    /// compared to [`mmap2`]. The only distinction between [`mmap2`] and this call, is that there
+    /// is cannot be any hint information to where the memory map will exist, and instead the
+    /// kernel will arbitrarily choose the any address it finds useful.
+    ///
+    /// # Safety
+    ///
+    /// While there is no obvious invariant that comes with this call, unlike [`mmap2`] when
+    /// discarding existing mappings as part for [`MAP_FIXED`], the only reason this call is marked
+    /// as unsafe, is simply because it deals with memory, and may have side effects. If the mmap
+    /// is shared with another process, that could also lead to data races, however returning a
+    /// pointer forwards this invariant to the caller.
+    ///
+    /// [`mmap2`]: #variant.mmap2
     pub async unsafe fn mmap(
         &self,
         fd: usize,

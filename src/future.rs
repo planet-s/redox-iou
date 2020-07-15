@@ -102,15 +102,13 @@ fn try_submit(
             } else {
                 *state = State::Completing(cx.waker().clone());
             }
-            return task::Poll::Pending;
+            task::Poll::Pending
         }
         Err(RingPushError::Full(sqe)) => {
             *state = State::Submitting(sqe, cx.waker().clone());
-            return task::Poll::Pending;
+            task::Poll::Pending
         }
-        Err(RingPushError::Shutdown(_)) => {
-            return task::Poll::Ready(Some(Err(Error::new(ESHUTDOWN))));
-        }
+        Err(RingPushError::Shutdown(_)) => task::Poll::Ready(Some(Err(Error::new(ESHUTDOWN)))),
     }
 }
 
@@ -170,7 +168,7 @@ impl CommandFutureInner {
                 },
                 is_stream,
             ),
-            &mut State::Completing(_) => return task::Poll::Pending,
+            &mut State::Completing(_) => task::Poll::Pending,
             &mut State::ReceivingMulti(ref mut received, ref mut waker) => {
                 if !waker.will_wake(cx.waker()) {
                     *waker = cx.waker().clone();
