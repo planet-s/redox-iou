@@ -5,8 +5,8 @@ use std::sync::{Arc, Weak};
 use std::{cmp, fmt, ops, slice};
 
 use syscall::data::Map as Mmap;
-use syscall::error::{Error, Result};
 use syscall::error::EOVERFLOW;
+use syscall::error::{Error, Result};
 use syscall::flag::MapFlags;
 use syscall::io_uring::operation::Dup2Flags;
 
@@ -57,9 +57,7 @@ impl OccOffsetHalf {
     }
     fn unused(offset: u32) -> Self {
         assert_eq!(offset & RANGE_OFF_OFFSET_MASK, offset);
-        Self {
-            offset,
-        }
+        Self { offset }
     }
     fn used(offset: u32) -> Self {
         assert_eq!(offset & RANGE_OFF_OFFSET_MASK, offset);
@@ -92,9 +90,7 @@ struct OccInfoHalf {
 }
 impl OccInfoHalf {
     const fn with_size(size: u32) -> Self {
-        Self {
-            size,
-        }
+        Self { size }
     }
 }
 struct OccMap {
@@ -205,7 +201,7 @@ impl<'a> BufferSlice<'a> {
     pub fn as_slice(&self) -> &[u8] {
         unsafe { slice::from_raw_parts(self.pointer as *const u8, self.size.try_into().unwrap()) }
     }
-    pub fn as_slice_mut(&self) -> &mut [u8] {
+    pub fn as_slice_mut(&mut self) -> &mut [u8] {
         unsafe { slice::from_raw_parts_mut(self.pointer, self.size.try_into().unwrap()) }
     }
     fn reclaim_inner(&mut self) {
@@ -346,13 +342,19 @@ impl BufferPool {
         // acquired again.
         let pointer = match self.handle {
             Some(ref h) => unsafe {
-                h.mmap(self.fd, map_flags, len, u64::from(new_offset)).await?
-            }
-            None => unsafe { syscall::fmap(self.fd, &Mmap {
-                offset: new_offset.try_into().unwrap(),
-                size: len,
-                flags: map_flags,
-            })? as *const () }
+                h.mmap(self.fd, map_flags, len, u64::from(new_offset))
+                    .await?
+            },
+            None => unsafe {
+                syscall::fmap(
+                    self.fd,
+                    &Mmap {
+                        offset: new_offset.try_into().unwrap(),
+                        size: len,
+                        flags: map_flags,
+                    },
+                )? as *const ()
+            },
         };
 
         let mut write_guard = self.mmap_map.write();
@@ -383,9 +385,23 @@ impl BufferPool {
         let mut occ_write_guard = self.occ_map.write();
         let occ_map = &mut *occ_write_guard;
 
-        debug_assert!(occ_map.map.get_or_less(OccOffsetHalf::unused(new_offset), &occ_map.forest, &RangeOffsetComparator).map_or(false, |(k, v)| k.offset() < new_offset && k.offset() + v.size < new_offset + additional));
-        occ_map.map
-            .insert(OccOffsetHalf::unused(new_offset), OccInfoHalf::with_size(additional), &mut occ_map.forest, &RangeOffsetComparator)
+        debug_assert!(occ_map
+            .map
+            .get_or_less(
+                OccOffsetHalf::unused(new_offset),
+                &occ_map.forest,
+                &RangeOffsetComparator
+            )
+            .map_or(false, |(k, v)| k.offset() < new_offset
+                && k.offset() + v.size < new_offset + additional));
+        occ_map
+            .map
+            .insert(
+                OccOffsetHalf::unused(new_offset),
+                OccInfoHalf::with_size(additional),
+                &mut occ_map.forest,
+                &RangeOffsetComparator,
+            )
             .expect_none("expected newly-acquired slice not to conflict with any existing");
 
         Ok(())
@@ -398,8 +414,10 @@ impl BufferPool {
             Some(ref h) => unsafe {
                 // Closing will automagically unmap all mmaps.
                 h.close(self.fd, false).await?;
+            },
+            None => {
+                syscall::close(self.fd)?;
             }
-            None => { syscall::close(self.fd)?; },
         }
         Ok(())
     }
@@ -422,21 +440,17 @@ impl BufferPool {
         let size = initial_len.try_into().or(Err(Error::new(EOVERFLOW)))?;
 
         let addr = match self.handle {
-            Some(ref h) => unsafe {
-                h.mmap(
-                    self.fd,
-                    map_flags,
-                    size,
-                    0,
-                ).await?
-            }
+            Some(ref h) => unsafe { h.mmap(self.fd, map_flags, size, 0).await? },
             None => unsafe {
-                syscall::fmap(self.fd, &Mmap {
-                    offset: 0,
-                    flags: map_flags,
-                    size
-                })? as *const ()
-            }
+                syscall::fmap(
+                    self.fd,
+                    &Mmap {
+                        offset: 0,
+                        flags: map_flags,
+                        size,
+                    },
+                )? as *const ()
+            },
         };
 
         let mmap_map = self.mmap_map.get_mut();
@@ -463,7 +477,8 @@ impl BufferPool {
         // threads checking whether it's safe to munmap certain offsets.
         let intent_guard = self.occ_map.upgradable_read();
 
-        let (k, _) = intent_guard.map
+        let (k, _) = intent_guard
+            .map
             .iter(&intent_guard.forest)
             .find(|(k, v)| k.is_free() && v.size >= len)?;
 
@@ -471,7 +486,8 @@ impl BufferPool {
             let mut write_guard = RwLockUpgradableReadGuard::upgrade(intent_guard);
             let occ_map = &mut *write_guard;
 
-            let mut v = occ_map.map
+            let mut v = occ_map
+                .map
                 .remove(k, &mut occ_map.forest, &RangeOffsetThenUsedComparator)
                 .expect("expected entry not to be removed by itself when acquiring slice");
 
@@ -481,15 +497,22 @@ impl BufferPool {
                 v.size -= len;
 
                 let k_for_reinsert = OccOffsetHalf::unused(k.offset() + len);
-                occ_map.map
-                    .insert(k_for_reinsert, v, &mut occ_map.forest, &RangeOffsetComparator)
+                occ_map
+                    .map
+                    .insert(
+                        k_for_reinsert,
+                        v,
+                        &mut occ_map.forest,
+                        &RangeOffsetComparator,
+                    )
                     .expect_none("expected previous entry not to have been reinserted by itself");
             }
 
             let new_offset = k.offset();
             let new_k = OccOffsetHalf::used(new_offset);
             let new_v = OccInfoHalf::with_size(len);
-            occ_map.map
+            occ_map
+                .map
                 .insert(new_k, new_v, &mut occ_map.forest, &RangeOffsetComparator)
                 .expect_none("expected new entry not to already be inserted");
 
@@ -497,15 +520,29 @@ impl BufferPool {
         };
         let pointer = {
             let read_guard = self.mmap_map.read();
-            let (mmap_k, mmap_v) = read_guard.map
-                .get_or_less(MmapOffsetHalf::ready(new_offset), &read_guard.forest, &MmapComparatorOffset)
-                .expect("expected all free entries in the occ map to have a corresponding mmap entry");
+            let (mmap_k, mmap_v) = read_guard
+                .map
+                .get_or_less(
+                    MmapOffsetHalf::ready(new_offset),
+                    &read_guard.forest,
+                    &MmapComparatorOffset,
+                )
+                .expect(
+                    "expected all free entries in the occ map to have a corresponding mmap entry",
+                );
 
             assert!(mmap_k.is_ready());
             assert!(mmap_k.offset() <= new_offset);
             assert!(mmap_k.offset() + mmap_v.size >= new_offset + len);
-            let base_pointer = mmap_v.addr.expect("Expected ready mmap entry to have a valid pointer");
-            unsafe { base_pointer.as_ptr().add((new_offset - mmap_k.offset()).try_into().unwrap()) as *mut u8 }
+            let base_pointer = mmap_v
+                .addr
+                .expect("Expected ready mmap entry to have a valid pointer");
+            unsafe {
+                base_pointer
+                    .as_ptr()
+                    .add((new_offset - mmap_k.offset()).try_into().unwrap())
+                    as *mut u8
+            }
         };
 
         let offset = k.offset();
@@ -540,17 +577,26 @@ impl BufferPool {
         };
 
         let lower_partial_key = OccOffsetHalf::unused(lower_offset);
-        if let Some((lower_actual_key, lower_value)) = occ_map.map
-            .get_or_less(lower_partial_key, &occ_map.forest, &()) {
-
-            if lower_actual_key.is_used() { return false }
+        if let Some((lower_actual_key, lower_value)) =
+            occ_map
+                .map
+                .get_or_less(lower_partial_key, &occ_map.forest, &())
+        {
+            if lower_actual_key.is_used() {
+                return false;
+            }
 
             if lower_actual_key.offset() + lower_value.size != previous_start {
                 // There is another occupied range between these.
                 return false;
             }
-            let v = occ_map.map
-                .remove(lower_actual_key, &mut occ_map.forest, &RangeOffsetThenUsedComparator)
+            let v = occ_map
+                .map
+                .remove(
+                    lower_actual_key,
+                    &mut occ_map.forest,
+                    &RangeOffsetThenUsedComparator,
+                )
                 .expect("expected previously found key to exist in the b-tree map");
 
             assert_eq!(v, lower_value);
@@ -567,9 +613,7 @@ impl BufferPool {
 
         let higher_key = OccOffsetHalf::unused(end);
 
-        if let Some(higher_value) = occ_map.map
-            .get(higher_key, &occ_map.forest, &()) {
-
+        if let Some(higher_value) = occ_map.map.get(higher_key, &occ_map.forest, &()) {
             if higher_key.offset == *start {
                 // The entry was not above the initially freed one.
                 return false;
@@ -577,9 +621,12 @@ impl BufferPool {
 
             // We don't have to check that there is no range between, since there cannot exist
             // multiple overlapping ranges (yet).
-            if higher_key.is_used() { return false }
+            if higher_key.is_used() {
+                return false;
+            }
 
-            let v = occ_map.map
+            let v = occ_map
+                .map
                 .remove(higher_key, &mut occ_map.forest, &())
                 .expect("expected previously found key to exist in the b-tree map");
 
@@ -599,17 +646,30 @@ impl BufferPool {
         let mut start = slice.start;
         let mut size = slice.size;
 
-        let v = occ_map.map
-            .remove(OccOffsetHalf::used(slice.start), &mut occ_map.forest, &RangeOffsetComparator)
+        let v = occ_map
+            .map
+            .remove(
+                OccOffsetHalf::used(slice.start),
+                &mut occ_map.forest,
+                &RangeOffsetComparator,
+            )
             .expect("expected occ map to contain buffer slice when reclaiming it");
         assert_eq!(v.size, slice.size);
 
         while Self::remove_free_offset_below(occ_map, &mut start, &mut size) {}
         while Self::remove_free_offset_above(occ_map, &mut start, &mut size) {}
 
-        occ_map.map
-            .insert(OccOffsetHalf::unused(start), OccInfoHalf::with_size(size), &mut occ_map.forest, &RangeOffsetComparator)
-            .expect_none("expected newly resized free range not to start existing again before insertion");
+        occ_map
+            .map
+            .insert(
+                OccOffsetHalf::unused(start),
+                OccInfoHalf::with_size(size),
+                &mut occ_map.forest,
+                &RangeOffsetComparator,
+            )
+            .expect_none(
+                "expected newly resized free range not to start existing again before insertion",
+            );
     }
 }
 
@@ -642,8 +702,21 @@ mod tests {
             let (addr, len, _) = memory.into_raw_parts();
             let size = u32::try_from(len).unwrap();
 
-            mmap_map.map.insert(MmapOffsetHalf::ready(0), MmapInfoHalf { size, addr: NonNull::new(addr).unwrap().into() }, &mut mmap_map.forest, &());
-            occ_map.map.insert(OccOffsetHalf::unused(0), OccInfoHalf::with_size(size), &mut occ_map.forest, &());
+            mmap_map.map.insert(
+                MmapOffsetHalf::ready(0),
+                MmapInfoHalf {
+                    size,
+                    addr: NonNull::new(addr).unwrap().into(),
+                },
+                &mut mmap_map.forest,
+                &(),
+            );
+            occ_map.map.insert(
+                OccOffsetHalf::unused(0),
+                OccInfoHalf::with_size(size),
+                &mut occ_map.forest,
+                &(),
+            );
             total_size += size;
         }
         let pool = BufferPool {
