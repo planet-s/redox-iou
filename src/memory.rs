@@ -509,15 +509,66 @@ impl BufferPool {
             pool: Right(Arc::downgrade(self)),
         })
     }
+    fn remove_free_offset_below(occ_map: &mut OccMap, start: &mut u32, size: &mut u32) {
+        let previous_start = *start;
+        let lower_offset = match previous_start.checked_sub(1) {
+            Some(l) => l,
+            None => return,
+        };
+
+        let lower_partial_key = OccOffsetHalf::unused(lower_offset);
+        if let Some((lower_actual_key, lower_value)) = occ_map.map
+            .get_or_less(lower_partial_key, &occ_map.forest, &RangeOffsetComparator) {
+
+            if lower_actual_key.is_used() { return }
+
+            if lower_actual_key.offset() + lower_value.size != previous_start {
+                // There is another occupied range between these.
+                return;
+            }
+            let v = occ_map.map.remove(lower_actual_key, &mut occ_map.forest, &()).expect("expected previously found key to exist in the b-tree map");
+            assert_eq!(v, lower_value);
+            *start = lower_actual_key.offset;
+            *size += lower_value.size;
+        }
+    }
+    fn remove_free_offset_above(occ_map: &mut OccMap, start: &mut u32, size: &mut u32) {
+        let end = *start + *size;
+
+        let higher_partial_key = OccOffsetHalf::unused(end);
+
+        if let Some((higher_actual_key, higher_value)) = occ_map.map
+            .get_or_less(higher_partial_key, &occ_map.forest, &RangeOffsetComparator) {
+
+            // We don't have to check that there is no range between, since there cannot exist
+            // multiple overlapping ranges (yet).
+            if higher_actual_key.is_used() { return }
+
+            let v = occ_map.map
+                .remove(higher_actual_key, &mut occ_map.forest, &())
+                .expect("expected previously found key to exist in the b-tree map");
+
+            assert_eq!(v, higher_value);
+            *size += higher_value.size;
+        }
+    }
+
     fn reclaim_slice_inner(&self, slice: &BufferSlice<'_>) {
         let mut occ_write_guard = self.occ_map.write();
         let occ_map = &mut *occ_write_guard;
 
+        let mut start = slice.start;
+        let mut size = slice.size;
+
         let v = occ_map.map
             .remove(OccOffsetHalf::used(slice.start), &mut occ_map.forest, &())
             .expect("expected occ map to contain buffer slice when reclaiming it");
-        // TODO: Merge multiple free ranges if their corresponding mmap ranges don't overlap.
-        occ_map.map.insert(OccOffsetHalf::unused(slice.start), OccInfoHalf::with_size(v.size), &mut occ_map.forest, &());
+        assert_eq!(v.size, slice.size);
+        
+        Self::remove_free_offset_below(occ_map, &mut start, &mut size);
+        Self::remove_free_offset_above(occ_map, &mut start, &mut size);
+
+        occ_map.map.insert(OccOffsetHalf::unused(start), OccInfoHalf::with_size(size), &mut occ_map.forest, &());
     }
 }
 
