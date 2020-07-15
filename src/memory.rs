@@ -1,20 +1,18 @@
 use std::borrow::{Borrow, BorrowMut};
 use std::convert::{TryFrom, TryInto};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
-use std::{cmp, mem, ops, slice};
+use std::{cmp, fmt, ops, slice};
 
 use syscall::data::Map as Mmap;
 use syscall::error::{Error, Result};
-use syscall::error::{EMFILE, EOVERFLOW};
+use syscall::error::EOVERFLOW;
 use syscall::flag::MapFlags;
 use syscall::io_uring::operation::Dup2Flags;
-use syscall::io_uring::{IoUringSqeFlags, SqEntry64};
 
 use cranelift_bforest::{Comparator, Map, MapForest};
 use either::*;
-use parking_lot::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
+use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 
 use crate::reactor::Handle;
 
@@ -29,10 +27,19 @@ struct RangeOffsetThenUsedComparator;
 /// occupied), and then their offsets.
 struct RangeUsedThenOffsetComparator;
 
-#[derive(Clone, Copy, Debug, Ord, Eq, Hash, PartialOrd, PartialEq)]
+#[derive(Clone, Copy, Ord, Eq, Hash, PartialOrd, PartialEq)]
 struct OccOffsetHalf {
     offset: u32,
 }
+impl fmt::Debug for OccOffsetHalf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OccOffsetHalf")
+            .field("offset", &self.offset())
+            .field("is_used", &self.is_used())
+            .finish()
+    }
+}
+
 const RANGE_OFF_OFFSET_MASK: u32 = 0x7FFF_FFFF;
 const RANGE_OFF_OFFSET_SHIFT: u8 = 0;
 const RANGE_OFF_OCCUPD_SHIFT: u8 = 31;
@@ -138,7 +145,6 @@ impl MmapInfoHalf {
 }
 /// Compares whether the mmap is pending (pending is greater than non-pending), and then the actual
 /// offset.
-type MmapComparatorPendingThenOffset = ();
 struct MmapComparatorOffset;
 
 impl Comparator<MmapOffsetHalf> for MmapComparatorOffset {
@@ -168,9 +174,22 @@ pub struct BufferPool {
     occ_map: RwLock<OccMap>,
     mmap_map: RwLock<MmapMap>,
 }
+unsafe impl Send for BufferPool {}
+unsafe impl Sync for BufferPool {}
+
+impl fmt::Debug for BufferPool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BufferPool")
+            .field("fd", &self.fd)
+            .field("handle", &self.handle)
+            // TODO: maps
+            .finish()
+    }
+}
 
 // TODO: Support mutable/immutable slices, maybe even with refcounts? A refcount of 1 would mean
 // exclusive, while a higher refcount would mean shared.
+#[derive(Debug)]
 pub struct BufferSlice<'a> {
     start: u32,
     size: u32,
@@ -178,6 +197,10 @@ pub struct BufferSlice<'a> {
 
     pool: Either<&'a BufferPool, Weak<BufferPool>>,
 }
+
+unsafe impl<'a> Send for BufferSlice<'a> {}
+unsafe impl<'a> Sync for BufferSlice<'a> {}
+
 impl<'a> BufferSlice<'a> {
     pub fn as_slice(&self) -> &[u8] {
         unsafe { slice::from_raw_parts(self.pointer as *const u8, self.size.try_into().unwrap()) }
@@ -361,7 +384,9 @@ impl BufferPool {
         let occ_map = &mut *occ_write_guard;
 
         debug_assert!(occ_map.map.get_or_less(OccOffsetHalf::unused(new_offset), &occ_map.forest, &RangeOffsetComparator).map_or(false, |(k, v)| k.offset() < new_offset && k.offset() + v.size < new_offset + additional));
-        occ_map.map.insert(OccOffsetHalf::unused(new_offset), OccInfoHalf::with_size(additional), &mut occ_map.forest, &());
+        occ_map.map
+            .insert(OccOffsetHalf::unused(new_offset), OccInfoHalf::with_size(additional), &mut occ_map.forest, &RangeOffsetComparator)
+            .expect_none("expected newly-acquired slice not to conflict with any existing");
 
         Ok(())
     }
@@ -374,9 +399,7 @@ impl BufferPool {
                 // Closing will automagically unmap all mmaps.
                 h.close(self.fd, false).await?;
             }
-            None => unsafe {
-                syscall::close(self.fd)?;
-            }
+            None => { syscall::close(self.fd)?; },
         }
         Ok(())
     }
@@ -440,7 +463,7 @@ impl BufferPool {
         // threads checking whether it's safe to munmap certain offsets.
         let intent_guard = self.occ_map.upgradable_read();
 
-        let (k, v) = intent_guard.map
+        let (k, _) = intent_guard.map
             .iter(&intent_guard.forest)
             .find(|(k, v)| k.is_free() && v.size >= len)?;
 
@@ -449,17 +472,17 @@ impl BufferPool {
             let occ_map = &mut *write_guard;
 
             let mut v = occ_map.map
-                .remove(k, &mut occ_map.forest, &())
+                .remove(k, &mut occ_map.forest, &RangeOffsetThenUsedComparator)
                 .expect("expected entry not to be removed by itself when acquiring slice");
 
             if v.size >= len {
                 // Reinsert the free entry, but with a reduced length.
-                v.size -= len;
                 assert!(k.is_free());
+                v.size -= len;
 
                 let k_for_reinsert = OccOffsetHalf::unused(k.offset() + len);
                 occ_map.map
-                    .insert(k_for_reinsert, v, &mut occ_map.forest, &())
+                    .insert(k_for_reinsert, v, &mut occ_map.forest, &RangeOffsetComparator)
                     .expect_none("expected previous entry not to have been reinserted by itself");
             }
 
@@ -467,7 +490,7 @@ impl BufferPool {
             let new_k = OccOffsetHalf::used(new_offset);
             let new_v = OccInfoHalf::with_size(len);
             occ_map.map
-                .insert(new_k, new_v, &mut occ_map.forest, &())
+                .insert(new_k, new_v, &mut occ_map.forest, &RangeOffsetComparator)
                 .expect_none("expected new entry not to already be inserted");
 
             new_offset
@@ -509,47 +532,63 @@ impl BufferPool {
             pool: Right(Arc::downgrade(self)),
         })
     }
-    fn remove_free_offset_below(occ_map: &mut OccMap, start: &mut u32, size: &mut u32) {
+    fn remove_free_offset_below(occ_map: &mut OccMap, start: &mut u32, size: &mut u32) -> bool {
         let previous_start = *start;
         let lower_offset = match previous_start.checked_sub(1) {
             Some(l) => l,
-            None => return,
+            None => return false,
         };
 
         let lower_partial_key = OccOffsetHalf::unused(lower_offset);
         if let Some((lower_actual_key, lower_value)) = occ_map.map
-            .get_or_less(lower_partial_key, &occ_map.forest, &RangeOffsetComparator) {
+            .get_or_less(lower_partial_key, &occ_map.forest, &()) {
 
-            if lower_actual_key.is_used() { return }
+            if lower_actual_key.is_used() { return false }
 
             if lower_actual_key.offset() + lower_value.size != previous_start {
                 // There is another occupied range between these.
-                return;
+                return false;
             }
-            let v = occ_map.map.remove(lower_actual_key, &mut occ_map.forest, &()).expect("expected previously found key to exist in the b-tree map");
+            let v = occ_map.map
+                .remove(lower_actual_key, &mut occ_map.forest, &RangeOffsetThenUsedComparator)
+                .expect("expected previously found key to exist in the b-tree map");
+
             assert_eq!(v, lower_value);
             *start = lower_actual_key.offset;
             *size += lower_value.size;
+
+            true
+        } else {
+            false
         }
     }
-    fn remove_free_offset_above(occ_map: &mut OccMap, start: &mut u32, size: &mut u32) {
+    fn remove_free_offset_above(occ_map: &mut OccMap, start: &mut u32, size: &mut u32) -> bool {
         let end = *start + *size;
 
-        let higher_partial_key = OccOffsetHalf::unused(end);
+        let higher_key = OccOffsetHalf::unused(end);
 
-        if let Some((higher_actual_key, higher_value)) = occ_map.map
-            .get_or_less(higher_partial_key, &occ_map.forest, &RangeOffsetComparator) {
+        if let Some(higher_value) = occ_map.map
+            .get(higher_key, &occ_map.forest, &()) {
+
+            if higher_key.offset == *start {
+                // The entry was not above the initially freed one.
+                return false;
+            }
 
             // We don't have to check that there is no range between, since there cannot exist
             // multiple overlapping ranges (yet).
-            if higher_actual_key.is_used() { return }
+            if higher_key.is_used() { return false }
 
             let v = occ_map.map
-                .remove(higher_actual_key, &mut occ_map.forest, &())
+                .remove(higher_key, &mut occ_map.forest, &())
                 .expect("expected previously found key to exist in the b-tree map");
 
             assert_eq!(v, higher_value);
             *size += higher_value.size;
+
+            true
+        } else {
+            false
         }
     }
 
@@ -561,14 +600,16 @@ impl BufferPool {
         let mut size = slice.size;
 
         let v = occ_map.map
-            .remove(OccOffsetHalf::used(slice.start), &mut occ_map.forest, &())
+            .remove(OccOffsetHalf::used(slice.start), &mut occ_map.forest, &RangeOffsetComparator)
             .expect("expected occ map to contain buffer slice when reclaiming it");
         assert_eq!(v.size, slice.size);
-        
-        Self::remove_free_offset_below(occ_map, &mut start, &mut size);
-        Self::remove_free_offset_above(occ_map, &mut start, &mut size);
 
-        occ_map.map.insert(OccOffsetHalf::unused(start), OccInfoHalf::with_size(size), &mut occ_map.forest, &());
+        while Self::remove_free_offset_below(occ_map, &mut start, &mut size) {}
+        while Self::remove_free_offset_above(occ_map, &mut start, &mut size) {}
+
+        occ_map.map
+            .insert(OccOffsetHalf::unused(start), OccInfoHalf::with_size(size), &mut occ_map.forest, &RangeOffsetComparator)
+            .expect_none("expected newly resized free range not to start existing again before insertion");
     }
 }
 
@@ -582,14 +623,9 @@ impl Drop for BufferPool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn occ_map_acquisition_single_mmap() {
-        let mut memory = vec! [0u8; 32768];
-        memory.shrink_to_fit();
+    use std::{mem, thread};
 
-        let (addr, len, _) = memory.into_raw_parts();
-        let size = u32::try_from(len).unwrap();
-
+    fn setup_pool(maps: impl IntoIterator<Item = Vec<u8>>) -> (BufferPool, u32) {
         let mut mmap_map = MmapMap {
             map: Map::new(),
             forest: MapForest::new(),
@@ -598,11 +634,19 @@ mod tests {
             map: Map::new(),
             forest: MapForest::new(),
         };
+        let mut total_size = 0;
 
-        mmap_map.map.insert(MmapOffsetHalf::ready(0), MmapInfoHalf { size, addr: NonNull::new(addr).unwrap().into() }, &mut mmap_map.forest, &());
-        occ_map.map.insert(OccOffsetHalf::unused(0), OccInfoHalf::with_size(size), &mut occ_map.forest, &());
+        for mut memory in maps {
+            memory.shrink_to_fit();
 
-        let mut pool = BufferPool {
+            let (addr, len, _) = memory.into_raw_parts();
+            let size = u32::try_from(len).unwrap();
+
+            mmap_map.map.insert(MmapOffsetHalf::ready(0), MmapInfoHalf { size, addr: NonNull::new(addr).unwrap().into() }, &mut mmap_map.forest, &());
+            occ_map.map.insert(OccOffsetHalf::unused(0), OccInfoHalf::with_size(size), &mut occ_map.forest, &());
+            total_size += size;
+        }
+        let pool = BufferPool {
             // redox_syscall should panic on other systems than Redox, and if this test was run on
             // Redox, this file descriptor would *most likely* be invalid
             fd: !0,
@@ -610,19 +654,78 @@ mod tests {
             mmap_map: RwLock::new(mmap_map),
             occ_map: RwLock::new(occ_map),
         };
+        (pool, total_size)
+    }
+    fn setup_default_pool() -> (BufferPool, u32) {
+        setup_pool(vec![vec![0u8; 32768], vec![0u8; 4096], vec![0u8; 65536]])
+    }
 
-        fn assert_occ_map_match<'a, 'b>(occ_map: &OccMap, against: impl IntoIterator<Item = (OccOffsetHalf, OccInfoHalf)>) {
-            assert!(occ_map.map.iter(&occ_map.forest).eq(against.into_iter()));
-        }
-        assert_occ_map_match(pool.occ_map.get_mut(), vec! [(OccOffsetHalf::unused(0), OccInfoHalf::with_size(size))]);
+    #[test]
+    fn occ_map_acquisition_single_mmap() {
+        let (pool, _) = setup_default_pool();
 
-        {
-            let mut slice = pool.acquire_borrowed_slice(4096).unwrap();
+        let mut slices = Vec::new();
+
+        loop {
+            let mut slice = match pool.acquire_borrowed_slice(4096) {
+                Some(s) => s,
+                None => break,
+            };
+
             let text = b"Hello, world!";
             slice[..text.len()].copy_from_slice(text);
             assert_eq!(&slice[..text.len()], text);
+            slices.push(slice);
         }
+        drop(slices);
 
         mem::forget(pool);
+    }
+    #[test]
+    fn occ_multithreaded() {
+        // This test is not about aliasing, but rather to get all the assertions and expects, to
+        // work when there are multiple threads constantly trying to acquire and release slices.
+
+        let (pool, _) = setup_default_pool();
+        let pool = pool.shared();
+
+        const THREAD_COUNT: usize = 8;
+        const N: usize = 1000;
+
+        let threads = (0..THREAD_COUNT).map(|_| {
+            let pool = Arc::clone(&pool);
+            thread::spawn(move || {
+                use rand::Rng;
+
+                let mut thread_rng = rand::thread_rng();
+
+                for _ in 0..N {
+                    let len = thread_rng.gen_range(64, 4096);
+                    pool.acquire_slice(len);
+                }
+            })
+        });
+        for thread in threads {
+            thread.join().unwrap();
+        }
+    }
+    #[test]
+    fn no_aliasing() {
+        let (pool, _) = setup_default_pool();
+        const SIZE: u32 = 512;
+
+        let mut slices = Vec::new();
+
+        loop {
+            let slice = match pool.acquire_borrowed_slice(SIZE) {
+                Some(s) => s,
+                None => break,
+            };
+            slices.push(slice);
+        }
+        for slice in &mut slices {
+            assert!(slice.iter().all(|&byte| byte == 0));
+            slice.fill(63);
+        }
     }
 }

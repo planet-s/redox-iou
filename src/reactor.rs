@@ -659,7 +659,8 @@ impl Handle {
             ))
             .await?;
 
-        todo!()
+        let pointer = Error::demux64(cqe.status)?;
+        Ok(pointer as *const ())
     }
     pub async unsafe fn mmap(
         &self,

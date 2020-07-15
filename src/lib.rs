@@ -3,6 +3,7 @@
     option_expect_none,
     vec_into_raw_parts,
 )]
+#![cfg_attr(test, feature(slice_fill))]
 
 pub use syscall::io_uring::*;
 
