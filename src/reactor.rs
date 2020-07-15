@@ -5,9 +5,10 @@ use std::sync::{Arc, Weak};
 use std::task;
 
 use syscall::data::IoVec;
-use syscall::flag::EventFlags;
 use syscall::error::{Error, Result};
-use syscall::error::{ECANCELED, EINVAL, EOVERFLOW};
+use syscall::error::{E2BIG, EBADF, ECANCELED, EINVAL, EOPNOTSUPP, EOVERFLOW};
+use syscall::flag::{EventFlags, MapFlags};
+use syscall::io_uring::operation::Dup2Flags;
 use syscall::io_uring::{CqEntry64, IoUringEnterFlags, IoUringSqeFlags, RingPopError, SqEntry64};
 
 use crossbeam_queue::ArrayQueue;
@@ -15,11 +16,14 @@ use either::*;
 use once_cell::sync::OnceCell;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 
-use crate::future::{AtomicTag, CommandFuture, CommandFutureInner, CommandFutureRepr, FdUpdates, State, Tag};
+use crate::future::{
+    AtomicTag, CommandFuture, CommandFutureInner, CommandFutureRepr, FdUpdates, State, Tag,
+};
 use crate::instance::ConsumerInstance;
 
 /// A reactor driven by one primary `io_uring` and zero or more secondary `io_uring`s. May or may
 /// not be integrated into `Executor`
+#[derive(Debug)]
 pub struct Reactor {
     // the primary instance - when using secondary instances, this should be a kernel-attached
     // instance, that can monitor secondary instances (typically userspace-to-userspace rings).
@@ -65,6 +69,7 @@ pub struct Reactor {
     weak_ref: OnceCell<Weak<Reactor>>,
 }
 
+#[derive(Debug)]
 pub(crate) struct InstanceWrapper {
     // a convenient safe wrapper over the raw underlying interface.
     pub(crate) consumer_instance: RwLock<ConsumerInstance>,
@@ -274,7 +279,9 @@ impl Reactor {
         let mut state = state_lock.lock();
         match &mut *state {
             // invalid state after having received a completion
-            State::Initial | State::Submitting(_, _) | State::Completed(_) | State::Cancelled => return None,
+            State::Initial | State::Submitting(_, _) | State::Completed(_) | State::Cancelled => {
+                return None
+            }
 
             State::Completing(waker) => {
                 // Wake other executors which have futures using this reactor.
@@ -300,13 +307,21 @@ impl Reactor {
 }
 
 /// A handle to the reactor, used for creating futures.
+#[derive(Clone, Debug)]
 pub struct Handle {
-    reactor: Weak<Reactor>,
+    pub(crate) reactor: Weak<Reactor>,
 }
 
 impl Handle {
+    /// Retrieve the reactor that this handle is using.
+    ///
+    /// # Panics
+    ///
+    /// This method will panic if the reactor Arc has been dropped.
     pub fn reactor(&self) -> Arc<Reactor> {
-        self.reactor.upgrade().expect("couldn't retrieve reactor from Handle: reactor is dead")
+        self.reactor
+            .upgrade()
+            .expect("couldn't retrieve reactor from Handle: reactor is dead")
     }
 
     ///
@@ -324,9 +339,15 @@ impl Handle {
     /// is UB.
     ///
     pub unsafe fn send(&self, sqe: SqEntry64) -> CommandFuture {
-        self.send_inner(sqe, false).left().expect("send_inner() must return CommandFuture if is_stream is set to false")
+        self.send_inner(sqe, false)
+            .left()
+            .expect("send_inner() must return CommandFuture if is_stream is set to false")
     }
-    unsafe fn send_inner(&self, sqe: SqEntry64, is_stream: bool) -> Either<CommandFuture, FdUpdates> {
+    unsafe fn send_inner(
+        &self,
+        sqe: SqEntry64,
+        is_stream: bool,
+    ) -> Either<CommandFuture, FdUpdates> {
         let reactor = self
             .reactor
             .upgrade()
@@ -404,10 +425,20 @@ impl Handle {
     /// Create an asynchronous stream that represents the events coming from one of more file
     /// descriptors that are triggered when e.g. the file has changed, or is capable of reading new
     /// data, etc.
-    pub unsafe fn subscribe_to_fd_updates(&self, fd: usize, event_flags: EventFlags, oneshot: bool) -> FdUpdates {
-        let sqe = SqEntry64::new(IoUringSqeFlags::SUBSCRIBE, 0, 0)
-            .file_update(fd.try_into().unwrap(), event_flags, oneshot);
-        self.send_inner(sqe, true).right().expect("send_inner must return Right if is_stream is set to true")
+    pub unsafe fn subscribe_to_fd_updates(
+        &self,
+        fd: usize,
+        event_flags: EventFlags,
+        oneshot: bool,
+    ) -> FdUpdates {
+        let sqe = SqEntry64::new(IoUringSqeFlags::SUBSCRIBE, 0, 0).file_update(
+            fd.try_into().unwrap(),
+            event_flags,
+            oneshot,
+        );
+        self.send_inner(sqe, true)
+            .right()
+            .expect("send_inner must return Right if is_stream is set to true")
     }
 
     fn completion_as_rw_io_result(cqe: CqEntry64) -> Result<usize> {
@@ -421,7 +452,7 @@ impl Handle {
                 if let Ok(actual_bytes_read) = Error::demux64(signed as u64) {
                     let trunc =
                         std::cmp::min(isize::max_value() as u64, actual_bytes_read) as usize;
-                    log::warn!("Truncating the number of bytes read as it could not fit usize, from {} to {}", signed, trunc);
+                    log::warn!("Truncating the number of bytes/written read as it could not fit usize, from {} to {}", signed, trunc);
                     return Ok(trunc as usize);
                 }
                 Err(Error::new(EOVERFLOW))
@@ -573,5 +604,71 @@ impl Handle {
     pub async unsafe fn pwritev(&self, fd: usize, bufs: &[IoVec], offset: u64) -> Result<usize> {
         self.rw_io(fd, |sqe, fd| sqe.pwritev(fd, bufs, offset))
             .await
+    }
+
+    /// "Duplicate" a file descriptor, returning a new one based on the old one.
+    ///
+    /// # Panics
+    /// This function will panic if the parameter is set, but the flags don't contain
+    /// [`Dup2Flags::PARAM`].
+    ///
+    /// # Safety
+    /// If the parameter is used, that mut point to a slice that is valid for the receiver.
+    pub async unsafe fn dup2(
+        &self,
+        fd: usize,
+        flags: Dup2Flags,
+        param: Option<&[u8]>,
+    ) -> Result<usize> {
+        let fd64 = u64::try_from(fd).or(Err(Error::new(EBADF)))?;
+
+        let cqe = self
+            .send(SqEntry64::new(IoUringSqeFlags::empty(), 0, 0).dup2(fd64, flags, param))
+            .await?;
+
+        let res_fd = Error::demux64(cqe.status)?;
+        let res_fd = usize::try_from(res_fd).or(Err(Error::new(EOVERFLOW)))?;
+
+        Ok(res_fd)
+    }
+
+    pub async unsafe fn mmap2(
+        &self,
+        fd: usize,
+        flags: MapFlags,
+        addr_hint: Option<usize>,
+        len: usize,
+        offset: u64,
+    ) -> Result<*const ()> {
+        let fd64 = u64::try_from(fd).or(Err(Error::new(EBADF)))?;
+        let len64 = u64::try_from(len).or(Err(Error::new(E2BIG)))?;
+
+        if flags.contains(MapFlags::MAP_FIXED) && addr_hint.is_none() {
+            panic!("An mmap2 with MAP_FIXED requires the addr hint to be specified, but here it was None.");
+        }
+        let addr_hint = addr_hint.unwrap_or(0);
+        let addr_hint64 = u64::try_from(addr_hint).or(Err(Error::new(EOPNOTSUPP)))?;
+
+        let cqe = self
+            .send(SqEntry64::new(IoUringSqeFlags::empty(), 0, 0).mmap(
+                fd64,
+                flags,
+                addr_hint64,
+                len64,
+                offset,
+            ))
+            .await?;
+
+        todo!()
+    }
+    pub async unsafe fn mmap(
+        &self,
+        fd: usize,
+        flags: MapFlags,
+        len: usize,
+        offset: u64,
+    ) -> Result<*const ()> {
+        assert!(!flags.contains(MapFlags::MAP_FIXED));
+        self.mmap2(fd, flags, None, len, offset).await
     }
 }

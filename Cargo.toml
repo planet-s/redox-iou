@@ -12,11 +12,14 @@ repository = "https://gitlab.redox-os.org/redox-os/redox-iou"
 readme = "README.md"
 homepage = "https://redox-os.org/"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+buffer_pool = ["cranelift-bforest"]
+default = ["buffer_pool"]
 
 [dependencies]
 async-task = "3"
-bytes = "0.5"
+bitflags = "1.2"
+cranelift-bforest = { version = "0.65", optional = true }
 crossbeam-queue = "0.2"
 either = "1.5"
 futures = "0.3"

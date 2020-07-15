@@ -64,16 +64,12 @@ pub(crate) enum CommandFutureRepr {
 }
 impl From<CommandFutureInner> for CommandFuture {
     fn from(inner: CommandFutureInner) -> Self {
-        Self {
-            inner,
-        }
+        Self { inner }
     }
 }
 impl From<CommandFutureInner> for FdUpdates {
     fn from(inner: CommandFutureInner) -> Self {
-        Self {
-            inner,
-        }
+        Self { inner }
     }
 }
 
@@ -119,12 +115,15 @@ fn try_submit(
 }
 
 impl CommandFutureInner {
-    fn poll(&mut self, is_stream: bool, cx: &mut task::Context) -> task::Poll<Option<Result<CqEntry64>>> {
+    fn poll(
+        &mut self,
+        is_stream: bool,
+        cx: &mut task::Context,
+    ) -> task::Poll<Option<Result<CqEntry64>>> {
         let reactor = self
             .reactor
             .upgrade()
             .expect("failed to poll CommandFuture: reactor is dead");
-
 
         let tags_guard;
         let mut initial_sqe;
@@ -212,7 +211,9 @@ impl Future for CommandFuture {
         let this = self.get_mut();
 
         match this.inner.poll(false, cx) {
-            task::Poll::Ready(value) => task::Poll::Ready(value.expect("expected return value of non-stream to always be Some")),
+            task::Poll::Ready(value) => task::Poll::Ready(
+                value.expect("expected return value of non-stream to always be Some"),
+            ),
             task::Poll::Pending => task::Poll::Pending,
         }
     }

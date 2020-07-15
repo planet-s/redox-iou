@@ -1,3 +1,9 @@
+#![feature(
+    get_mut_unchecked,
+    option_expect_none,
+    vec_into_raw_parts,
+)]
+
 pub use syscall::io_uring::*;
 
 pub use futures::io::AsyncBufRead;
@@ -7,6 +13,9 @@ pub mod future;
 pub mod instance;
 pub mod reactor;
 pub mod ring;
+
+#[cfg(feature = "buffer_pool")]
+pub mod memory;
 
 /*
 pub struct Buffer<'a> {

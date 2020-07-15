@@ -1,5 +1,5 @@
-use std::{fmt, mem};
 use std::sync::atomic::Ordering;
+use std::{fmt, mem};
 
 use syscall::error::ESHUTDOWN;
 use syscall::error::{Error, Result};
