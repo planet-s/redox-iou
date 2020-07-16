@@ -221,6 +221,15 @@ impl<'a> BufferSlice<'a> {
     }
     /// Reclaim the buffer slice. Equivalent to dropping.
     pub fn reclaim(self) {}
+
+    /// Get the internal offset from the mmap file.
+    pub fn offset(&self) -> u32 {
+        self.start
+    }
+    /// Get the length of the slice.
+    pub fn len(&self) -> u32 {
+        self.size
+    }
 }
 impl<'a> Drop for BufferSlice<'a> {
     fn drop(&mut self) {
