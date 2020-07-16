@@ -586,16 +586,35 @@ impl BufferPool {
     pub fn shared(self) -> Arc<Self> {
         Arc::new(self)
     }
-    fn acquire_slice(&self, len: u32) -> Option<(ops::Range<u32>, *mut u8)> {
+    fn acquire_slice(&self, len: u32, alignment: u32) -> Option<(ops::Range<u32>, *mut u8)> {
         // Begin by obtaining an intent guard. This will unfortunately prevent other threads from
         // simultaneously searching the map for partitioning it; however, there can still be other
         // threads checking whether it's safe to munmap certain offsets.
         let intent_guard = self.occ_map.upgradable_read();
 
-        let (k, _) = intent_guard
-            .map
-            .iter(&intent_guard.forest)
-            .find(|(k, v)| k.is_free() && v.size >= len)?;
+        fn align(off: u32, alignment: u32) -> Option<u32> {
+            assert_ne!(alignment, 0);
+            assert!(alignment.is_power_of_two());
+
+            if alignment == 1 {
+                return Some(off);
+            }
+
+            off.checked_add(alignment - 1)?
+                .checked_div(alignment)?
+                .checked_mul(alignment)
+        }
+
+        let (k, _) = intent_guard.map.iter(&intent_guard.forest).find(|(k, v)| {
+            k.is_free()
+                && v.size >= len
+                && align(k.offset(), alignment)
+                    .map_or(false, |aligned| v.size - (aligned - k.offset()) >= len)
+        })?;
+
+        let aligned_off =
+            align(k.offset(), alignment).expect("bypassed alignment check in iterator");
+        let align_advancement = aligned_off - k.offset();
 
         let new_offset = {
             let mut write_guard = RwLockUpgradableReadGuard::upgrade(intent_guard);
@@ -622,8 +641,19 @@ impl BufferPool {
                     )
                     .expect_none("expected previous entry not to have been reinserted by itself");
             }
+            if align_advancement > 0 {
+                // If there was unused space due to alignment, insert that small region marked
+                // unused as well.
+                let k = OccOffsetHalf::unused(k.offset());
+                let v = OccInfoHalf::with_size(align_advancement);
 
-            let new_offset = k.offset();
+                occ_map
+                    .map
+                    .insert(k, v, &mut occ_map.forest, &RangeOffsetComparator)
+                    .expect_none("somehow the small alignment region was already mapped");
+            }
+
+            let new_offset = aligned_off;
             let new_k = OccOffsetHalf::used(new_offset);
             let new_v = OccInfoHalf::with_size(len);
             occ_map
@@ -660,12 +690,12 @@ impl BufferPool {
             }
         };
 
-        let offset = k.offset();
+        let offset = aligned_off;
 
         Some((offset..offset + len, pointer))
     }
-    pub fn acquire_borrowed_slice(&self, len: u32) -> Option<BufferSlice<'_>> {
-        let (range, pointer) = self.acquire_slice(len)?;
+    pub fn acquire_borrowed_slice(&self, len: u32, alignment: u32) -> Option<BufferSlice<'_>> {
+        let (range, pointer) = self.acquire_slice(len, alignment)?;
 
         Some(BufferSlice {
             start: range.start,
@@ -675,8 +705,12 @@ impl BufferPool {
             guard: None,
         })
     }
-    pub fn acquire_weak_slice(self: &Arc<Self>, len: u32) -> Option<BufferSlice<'static>> {
-        let (range, pointer) = self.acquire_slice(len)?;
+    pub fn acquire_weak_slice(
+        self: &Arc<Self>,
+        len: u32,
+        alignment: u32,
+    ) -> Option<BufferSlice<'static>> {
+        let (range, pointer) = self.acquire_slice(len, alignment)?;
 
         Some(BufferSlice {
             start: range.start,
@@ -864,7 +898,7 @@ mod tests {
         let mut slices = Vec::new();
 
         loop {
-            let mut slice = match pool.acquire_borrowed_slice(4096) {
+            let mut slice = match pool.acquire_borrowed_slice(4096, 1) {
                 Some(s) => s,
                 None => break,
             };
@@ -887,7 +921,12 @@ mod tests {
         let pool = pool.shared();
 
         const THREAD_COUNT: usize = 8;
+
+        #[cfg(not(miri))]
         const N: usize = 1000;
+
+        #[cfg(miri)]
+        const N: usize = 128;
 
         let threads = (0..THREAD_COUNT).map(|_| {
             let pool = Arc::clone(&pool);
@@ -897,8 +936,14 @@ mod tests {
                 let mut thread_rng = rand::thread_rng();
 
                 for _ in 0..N {
-                    let len = thread_rng.gen_range(64, 4096);
-                    pool.acquire_slice(len);
+                    'retry: loop {
+                        let len = thread_rng.gen_range(64, 4096);
+                        let align = 1 << thread_rng.gen_range(0, 3);
+                        match pool.acquire_borrowed_slice(len, align) {
+                            Some(_) => break 'retry,
+                            None => continue 'retry,
+                        }
+                    }
                 }
             })
         });
@@ -914,7 +959,7 @@ mod tests {
         let mut slices = Vec::new();
 
         loop {
-            let slice = match pool.acquire_borrowed_slice(SIZE) {
+            let slice = match pool.acquire_borrowed_slice(SIZE, 1) {
                 Some(s) => s,
                 None => break,
             };
@@ -923,6 +968,31 @@ mod tests {
         for slice in &mut slices {
             assert!(slice.iter().all(|&byte| byte == 0));
             slice.fill(63);
+        }
+    }
+    #[test]
+    fn alignment() {
+        let (pool, _) = setup_pool(vec![vec![0u8; 4096]]);
+
+        fn get_and_check_slice(
+            pool: &BufferPool,
+            size: u32,
+            align: u32,
+            fill_byte: u8,
+        ) -> BufferSlice {
+            let mut slice = pool.acquire_borrowed_slice(size, align).unwrap();
+            assert!(slice.iter().all(|&byte| byte == 0));
+            slice.fill(fill_byte);
+            assert!(slice.iter().all(|&byte| byte == fill_byte));
+            assert_eq!(slice.len(), size);
+            assert_eq!(slice.offset() % align, 0);
+            slice
+        }
+
+        {
+            let _small_begin_slice = get_and_check_slice(&pool, 64, 1, 0x01);
+            let _aligned_slice = get_and_check_slice(&pool, 128, 128, 0x02);
+            let _half_page = get_and_check_slice(&pool, 2048, 2048, 0xFE);
         }
     }
 }

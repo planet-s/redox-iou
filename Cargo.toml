@@ -34,6 +34,7 @@ rand = "0.7"
 [target.'cfg(miri)'.dependencies.parking_lot]
 # Don't use assembly with miri
 version = "0.11"
+features = []
 
 [target.'cfg(not(miri))'.dependencies.parking_lot]
 version = "0.11"
