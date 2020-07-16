@@ -1,19 +1,21 @@
 use std::borrow::{Borrow, BorrowMut};
 use std::convert::{TryFrom, TryInto};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
-use std::{cmp, fmt, ops, slice};
+use std::{cmp, fmt, mem, ops, slice};
 
 use syscall::data::Map as Mmap;
-use syscall::error::EOVERFLOW;
 use syscall::error::{Error, Result};
+use syscall::error::{EADDRINUSE, EOVERFLOW};
 use syscall::flag::MapFlags;
 use syscall::io_uring::operation::Dup2Flags;
 
 use cranelift_bforest::{Comparator, Map, MapForest};
 use either::*;
-use parking_lot::{RwLock, RwLockUpgradableReadGuard};
+use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 
+use crate::future::{CommandFuture, CommandFutureRepr, State as CommandFutureState};
 use crate::reactor::Handle;
 
 /// A comparator that only compares the offsets of two ranges.
@@ -165,6 +167,7 @@ pub struct BufferPool {
 
     // TODO: Concurrent B-tree
     // TODO: Don't use forests!
+    guarded_occ_count: AtomicUsize,
 
     // The map all occupations
     occ_map: RwLock<OccMap>,
@@ -192,6 +195,7 @@ pub struct BufferSlice<'a> {
     pointer: *mut u8,
 
     pool: Either<&'a BufferPool, Weak<BufferPool>>,
+    guard: Option<Weak<Mutex<CommandFutureState>>>,
 }
 
 unsafe impl<'a> Send for BufferSlice<'a> {}
@@ -204,7 +208,16 @@ impl<'a> BufferSlice<'a> {
     pub fn as_slice_mut(&mut self) -> &mut [u8] {
         unsafe { slice::from_raw_parts_mut(self.pointer, self.size.try_into().unwrap()) }
     }
-    fn reclaim_inner(&mut self) {
+    /// Forcefully remove a guard from a future, from this slice.
+    ///
+    /// # Safety
+    /// This is unsafe because it allows removing guards set by pending futures; although this is
+    /// completely fine when there are no pending ones, the buffer slice will be reclaimed without
+    /// the guard, causing UB if any producer keeps using its pointer.
+    pub unsafe fn unguard(&mut self) {
+        self.guard = None;
+    }
+    fn reclaim_inner(&mut self) -> Result<()> {
         let arc;
 
         let pool = match self.pool {
@@ -212,15 +225,52 @@ impl<'a> BufferSlice<'a> {
             Right(ref weak) => {
                 arc = match weak.upgrade() {
                     Some(a) => a,
-                    None => return,
+                    None => return Ok(()),
                 };
                 &*arc
             }
         };
-        pool.reclaim_slice_inner(&*self)
+        let (was_guarded, can_be_reclaimed) = match self.guard {
+            Some(ref weak) => {
+                if let Some(arc) = weak.upgrade() {
+                    // Only allow reclaiming buffer slices when their guarded future has actually
+                    // completed.
+                    let is_complete = matches!(&*arc.lock(), CommandFutureState::Cancelled | CommandFutureState::Completed(_));
+                    if is_complete {
+                        unsafe {
+                            self.unguard();
+                        }
+                    }
+                    (true, is_complete)
+                } else {
+                    // Future is not used anymore, we can safely remove the guard now.
+                    unsafe {
+                        self.unguard();
+                    }
+                    (false, true)
+                }
+            }
+            None => (false, true),
+        };
+        if can_be_reclaimed {
+            unsafe { pool.reclaim_slice_inner(&*self) };
+            if was_guarded {
+                let prev = pool.guarded_occ_count.fetch_sub(1, Ordering::Release);
+                assert_ne!(prev, 0, "someone forgot to increment the guarded_occ_count, now I'm getting a subtraction overflow!");
+            }
+            Ok(())
+        } else {
+            Err(Error::new(EADDRINUSE))
+        }
     }
-    /// Reclaim the buffer slice. Equivalent to dropping.
-    pub fn reclaim(self) {}
+    /// Reclaim the buffer slice, equivalent to dropping but with a Result. If the buffer slice was
+    /// guarded by a future, this will fail with [`EADDRINUSE`] if the future hadn't completed when
+    /// this was called.
+    pub fn reclaim(mut self) -> Result<()> {
+        self.reclaim_inner()?;
+        mem::forget(self);
+        Ok(())
+    }
 
     /// Get the internal offset from the mmap file.
     pub fn offset(&self) -> u32 {
@@ -230,10 +280,22 @@ impl<'a> BufferSlice<'a> {
     pub fn len(&self) -> u32 {
         self.size
     }
+    /// Check whether the slice is empty or not.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 impl<'a> Drop for BufferSlice<'a> {
     fn drop(&mut self) {
-        self.reclaim_inner();
+        match self.reclaim_inner() {
+            Ok(()) => (),
+            Err(err) => {
+                log::debug!(
+                    "Trying to drop a BufferSlice that is in use, leaking memory: {}",
+                    err
+                );
+            }
+        }
     }
 }
 impl<'a> ops::Deref for BufferSlice<'a> {
@@ -266,6 +328,42 @@ impl<'a> AsRef<[u8]> for BufferSlice<'a> {
 impl<'a> AsMut<[u8]> for BufferSlice<'a> {
     fn as_mut(&mut self) -> &mut [u8] {
         self.as_slice_mut()
+    }
+}
+impl CommandFuture {
+    /// Protect a slice with a future guard, preventing the memory from being reclaimed until the
+    /// future has completed. This will cause the buffer slice to leak memory if dropped too early,
+    /// but prevents undefined behavior.
+    pub fn guard<'a>(&self, slice: &mut BufferSlice<'a>) {
+        let weak = match self.inner.repr {
+            CommandFutureRepr::Direct { ref state, .. } => Arc::downgrade(state),
+            CommandFutureRepr::Tagged { tag, .. } => {
+                if let Some(reactor) = self.inner.reactor.upgrade() {
+                    if let Some(state) = reactor.tag_map.read().get(&tag) {
+                        Arc::downgrade(state)
+                    } else {
+                        return;
+                    }
+                } else {
+                    return;
+                }
+            }
+        };
+        slice.guard = Some(weak);
+
+        let arc;
+
+        let pool = match slice.pool {
+            Left(pool) => pool,
+            Right(ref pool_weak) => {
+                arc = pool_weak
+                    .upgrade()
+                    .expect("Guarding buffer slice which pool has been dropped");
+                &*arc
+            }
+        };
+        // TODO: Is Relaxed ok here?
+        pool.guarded_occ_count.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -418,7 +516,14 @@ impl BufferPool {
 
     // TODO: Shrink support
 
+    /// Close an thus free the entire pool. If there are any pending commands that have guarded
+    /// buffer slices from this pool, the entire memory will be leaked (TODO: Free as much memory
+    /// as possible when this happens, rather than the entire pool).
     pub async fn close(self) -> Result<()> {
+        if self.guarded_occ_count.load(Ordering::Acquire) > 0 {
+            return Err(Error::new(EADDRINUSE));
+        }
+
         match self.handle {
             Some(ref h) => unsafe {
                 // Closing will automagically unmap all mmaps.
@@ -440,6 +545,7 @@ impl BufferPool {
                 forest: MapForest::new(),
                 map: Map::new(),
             }),
+            guarded_occ_count: AtomicUsize::new(0),
             fd,
             handle,
         }
@@ -566,6 +672,7 @@ impl BufferPool {
             size: range.end - range.start,
             pointer,
             pool: Left(self),
+            guard: None,
         })
     }
     pub fn acquire_weak_slice(self: &Arc<Self>, len: u32) -> Option<BufferSlice<'static>> {
@@ -576,6 +683,7 @@ impl BufferPool {
             size: range.end - range.start,
             pointer,
             pool: Right(Arc::downgrade(self)),
+            guard: None,
         })
     }
     fn remove_free_offset_below(occ_map: &mut OccMap, start: &mut u32, size: &mut u32) -> bool {
@@ -648,7 +756,7 @@ impl BufferPool {
         }
     }
 
-    fn reclaim_slice_inner(&self, slice: &BufferSlice<'_>) {
+    unsafe fn reclaim_slice_inner(&self, slice: &BufferSlice<'_>) {
         let mut occ_write_guard = self.occ_map.write();
         let occ_map = &mut *occ_write_guard;
 
@@ -684,7 +792,13 @@ impl BufferPool {
 
 impl Drop for BufferPool {
     fn drop(&mut self) {
-        let _ = syscall::close(self.fd);
+        let count = self.guarded_occ_count.load(Ordering::Acquire);
+
+        if count == 0 {
+            let _ = syscall::close(self.fd);
+        } else {
+            log::warn!("Leaking entire buffer pool, since there were {} slices that were guarded by futures that haven't been completed", count);
+        }
     }
 }
 
@@ -735,6 +849,7 @@ mod tests {
             handle: None,
             mmap_map: RwLock::new(mmap_map),
             occ_map: RwLock::new(occ_map),
+            guarded_occ_count: AtomicUsize::new(0),
         };
         (pool, total_size)
     }

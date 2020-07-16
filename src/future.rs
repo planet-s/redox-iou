@@ -24,7 +24,7 @@ pub(crate) struct CommandFutureInner {
     pub(crate) reactor: Weak<Reactor>,
 }
 pub struct CommandFuture {
-    inner: CommandFutureInner,
+    pub(crate) inner: CommandFutureInner,
 }
 
 // the internal state of the pending command.
