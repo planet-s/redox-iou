@@ -206,7 +206,7 @@ mod consumer_instance {
             }
         }
         pub fn create_instance(mut self) -> Result<Self> {
-            let ringfd = syscall::open("io_uring:", O_CREAT | O_CLOEXEC | O_RDWR)?;
+            let ringfd = syscall::open("io_uring:instance", O_CREAT | O_CLOEXEC | O_RDWR)?;
             let create_info = self.create_info();
 
             let len = mem::size_of::<IoUringCreateInfo>();
