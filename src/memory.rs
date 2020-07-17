@@ -379,7 +379,7 @@ impl Handle {
             .expect("can't create_buffer_pool: reactor is dead");
 
         let ringfd = reactor.main_instance.consumer_instance.read().ringfd();
-        let fd = unsafe { self.dup2(ringfd, Dup2Flags::PARAM, Some(b"pool")) }.await?;
+        let fd = unsafe { self.dup2(reactor.primary_instance().into(), ringfd, Dup2Flags::PARAM, Some(b"pool")) }.await?;
 
         Ok(unsafe {
             BufferPool::new_from_raw(fd, Some(Handle::clone(self)))
@@ -449,7 +449,7 @@ impl BufferPool {
         // acquired again.
         let pointer = match self.handle {
             Some(ref h) => unsafe {
-                h.mmap(self.fd, map_flags, len, u64::from(new_offset))
+                h.mmap(h.reactor().primary_instance().into(), self.fd, map_flags, len, u64::from(new_offset))
                     .await?
             },
             None => unsafe {
@@ -527,7 +527,7 @@ impl BufferPool {
         match self.handle {
             Some(ref h) => unsafe {
                 // Closing will automagically unmap all mmaps.
-                h.close(self.fd, false).await?;
+                h.close(h.reactor().primary_instance().into(), self.fd, false).await?;
             },
             None => {
                 syscall::close(self.fd)?;
@@ -555,7 +555,7 @@ impl BufferPool {
         let size = initial_len.try_into().or(Err(Error::new(EOVERFLOW)))?;
 
         let addr = match self.handle {
-            Some(ref h) => unsafe { h.mmap(self.fd, map_flags, size, 0).await? },
+            Some(ref h) => unsafe { h.mmap(h.reactor().primary_instance().into(), self.fd, map_flags, size, 0).await? },
             None => unsafe {
                 syscall::fmap(
                     self.fd,

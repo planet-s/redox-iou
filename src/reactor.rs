@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::convert::{TryFrom, TryInto};
-use std::sync::atomic::AtomicBool;
+use std::num::NonZeroUsize;
+use std::sync::atomic::{self, AtomicBool, AtomicUsize};
 use std::sync::{Arc, Weak};
 use std::task;
 
@@ -14,17 +15,26 @@ use syscall::io_uring::{CqEntry64, IoUringEnterFlags, IoUringSqeFlags, RingPopEr
 use crossbeam_queue::ArrayQueue;
 use either::*;
 use once_cell::sync::OnceCell;
-use parking_lot::{Mutex, RwLock, RwLockReadGuard};
+use parking_lot::{MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard};
 
 use crate::future::{
     AtomicTag, CommandFuture, CommandFutureInner, CommandFutureRepr, FdUpdates, State, Tag,
 };
 use crate::instance::ConsumerInstance;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReactorId {
+    inner: usize,
+}
+
+static LAST_REACTOR_ID: AtomicUsize = AtomicUsize::new(0);
+
 /// A reactor driven by one primary `io_uring` and zero or more secondary `io_uring`s. May or may
 /// not be integrated into `Executor`
 #[derive(Debug)]
 pub struct Reactor {
+    pub(crate) id: ReactorId,
+
     // the primary instance - when using secondary instances, this should be a kernel-attached
     // instance, that can monitor secondary instances (typically userspace-to-userspace rings).
     // when only a single instance is used, then this instance is free to also be a
@@ -77,6 +87,82 @@ pub(crate) struct InstanceWrapper {
     // stored when the ring encounters a shutdown error either when submitting an SQ, or receiving
     // a CQ.
     dropped: AtomicBool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RingId {
+    pub(crate) reactor: ReactorId,
+    // 0 means main instance, a number above zero is the index of the secondary instance in the
+    // vec, plus 1.
+    pub(crate) inner: usize,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SecondaryRingId {
+    pub(crate) reactor: ReactorId,
+    // the index into the secondary array, plus 1
+    pub(crate) inner: NonZeroUsize,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrimaryRingId {
+    pub(crate) reactor: ReactorId,
+}
+impl PrimaryRingId {
+    pub fn reactor(&self) -> ReactorId {
+        self.reactor
+    }
+}
+impl SecondaryRingId {
+    pub fn reactor(&self) -> ReactorId {
+        self.reactor
+    }
+}
+impl RingId {
+    pub fn reactor(&self) -> ReactorId {
+        self.reactor
+    }
+    pub fn is_primary(&self) -> bool {
+        self.inner == 0
+    }
+    pub fn is_secondary(&self) -> bool {
+        self.inner > 0
+    }
+}
+
+impl PartialEq<RingId> for PrimaryRingId {
+    fn eq(&self, other: &RingId) -> bool {
+        self.reactor == other.reactor && other.inner == 0
+    }
+}
+impl PartialEq<RingId> for SecondaryRingId {
+    fn eq(&self, other: &RingId) -> bool {
+        self.reactor == other.reactor && self.inner.get() == other.inner
+    }
+}
+impl PartialEq<PrimaryRingId> for RingId {
+    fn eq(&self, other: &PrimaryRingId) -> bool {
+        other == self
+    }
+}
+impl PartialEq<SecondaryRingId> for RingId {
+    fn eq(&self, other: &SecondaryRingId) -> bool {
+        other == self
+    }
+}
+impl From<PrimaryRingId> for RingId {
+    fn from(primary: PrimaryRingId) -> Self {
+        Self {
+            reactor: primary.reactor,
+            inner: 0,
+        }
+    }
+}
+impl From<SecondaryRingId> for RingId {
+    fn from(secondary: SecondaryRingId) -> Self {
+        Self {
+            reactor: secondary.reactor,
+            inner: secondary.inner.get(),
+        }
+    }
 }
 
 /// A builder that configures the reactor.
@@ -173,6 +259,9 @@ impl Reactor {
         };
 
         let reactor_arc = Arc::new(Reactor {
+            id: ReactorId {
+                inner: LAST_REACTOR_ID.fetch_add(1, atomic::Ordering::Relaxed),
+            },
             main_instance,
             trusted_main_instance,
             secondary_instances: RwLock::new(secondary_instances),
@@ -188,6 +277,11 @@ impl Reactor {
         }
         reactor_arc
     }
+    pub fn primary_instance(&self) -> PrimaryRingId {
+        PrimaryRingId {
+            reactor: self.id,
+        }
+    }
     /// Obtain a handle to this reactor, capable of creating futures that use it.
     pub fn handle(&self) -> Handle {
         Handle {
@@ -196,11 +290,19 @@ impl Reactor {
     }
     /// Add an additional secondary instance to the reactor, waking up the executor to include it
     /// if necessary.
-    pub fn add_secondary_instance(&self, instance: ConsumerInstance) {
-        self.secondary_instances.write().push(InstanceWrapper {
+    pub fn add_secondary_instance(&self, instance: ConsumerInstance) -> SecondaryRingId {
+        let mut guard = self.secondary_instances.write();
+        guard.push(InstanceWrapper {
             consumer_instance: RwLock::new(instance),
             dropped: AtomicBool::new(false),
         });
+        SecondaryRingId {
+            reactor: self.id,
+            inner: NonZeroUsize::new(guard.len()).unwrap(),
+        }
+    }
+    pub fn id(&self) -> ReactorId {
+        self.id
     }
     pub(crate) fn drive(&self, waker: &task::Waker) {
         let a = {
@@ -304,6 +406,17 @@ impl Reactor {
         }
         Some(())
     }
+    pub(crate) fn instance(&self, ring: RingId) -> Either<&RwLock<ConsumerInstance>, MappedRwLockReadGuard<RwLock<ConsumerInstance>>> {
+        if ring.reactor() != self.id() {
+            panic!("Using a reactor id from another reactor to get an instance: {:?} is not from {:?}", ring, self.id());
+        }
+
+        if ring == self.primary_instance() {
+            Left(&self.main_instance.consumer_instance)
+        } else {
+            Right(RwLockReadGuard::map(self.secondary_instances.read(), |instances| &instances[ring.inner - 1].consumer_instance))
+        }
+    }
 }
 
 /// A handle to the reactor, used for creating futures.
@@ -338,13 +451,14 @@ impl Handle {
     /// Additionally, the buffers used may point to invalid locations on the stack or heap, which
     /// is UB.
     ///
-    pub unsafe fn send(&self, sqe: SqEntry64) -> CommandFuture {
-        self.send_inner(sqe, false)
+    pub unsafe fn send(&self, ring: RingId, sqe: SqEntry64) -> CommandFuture {
+        self.send_inner(ring, sqe, false)
             .left()
             .expect("send_inner() must return CommandFuture if is_stream is set to false")
     }
     unsafe fn send_inner(
         &self,
+        ring: RingId,
         sqe: SqEntry64,
         is_stream: bool,
     ) -> Either<CommandFuture, FdUpdates> {
@@ -401,6 +515,7 @@ impl Handle {
         };
 
         let inner = CommandFutureInner {
+            ring,
             reactor: Weak::clone(&self.reactor),
             repr: if reactor.trusted_main_instance {
                 CommandFutureRepr::Direct {
@@ -427,6 +542,7 @@ impl Handle {
     /// data, etc.
     pub fn subscribe_to_fd_updates(
         &self,
+        ring: RingId,
         fd: usize,
         event_flags: EventFlags,
         oneshot: bool,
@@ -437,7 +553,7 @@ impl Handle {
             oneshot,
         );
         unsafe {
-            self.send_inner(sqe, true)
+            self.send_inner(ring, sqe, true)
                 .right()
                 .expect("send_inner must return Right if is_stream is set to true")
         }
@@ -461,7 +577,7 @@ impl Handle {
             }
         }
     }
-    async unsafe fn rw_io<F>(&self, fd: usize, f: F) -> Result<usize>
+    async unsafe fn rw_io<F>(&self, ring: RingId, fd: usize, f: F) -> Result<usize>
     where
         F: FnOnce(SqEntry64, u64) -> SqEntry64,
     {
@@ -470,7 +586,7 @@ impl Handle {
         let base_sqe = SqEntry64::new(IoUringSqeFlags::empty(), 0, (-1i64) as u64);
         let sqe = f(base_sqe, fd);
 
-        let cqe = self.send(sqe).await?;
+        let cqe = self.send(ring, sqe).await?;
         Self::completion_as_rw_io_result(cqe)
     }
 
@@ -484,23 +600,25 @@ impl Handle {
     /// [`open`]: #variant.open
     pub async unsafe fn open_raw<B: AsRef<[u8]> + ?Sized>(
         &self,
+        ring: RingId,
         path: &B,
         flags: u64,
     ) -> Result<usize> {
         let sqe =
             SqEntry64::new(IoUringSqeFlags::empty(), 0, (-1i64) as u64).open(path.as_ref(), flags);
-        let cqe = self.send(sqe).await?;
+        let cqe = self.send(ring, sqe).await?;
         Self::completion_as_rw_io_result(cqe)
     }
     pub async fn open_raw_static<B: AsRef<[u8]> + ?Sized + 'static>(
         &self,
+        ring: RingId,
         path: &'static B,
         flags: u64,
     ) -> Result<usize> {
-        unsafe { self.open_raw(path, flags) }.await
+        unsafe { self.open_raw(ring, path, flags) }.await
     }
-    pub async fn open_raw_move_buf(&self, path: Vec<u8>, flags: u64) -> Result<(usize, Vec<u8>)> {
-        let fd = unsafe { self.open_raw(&*path, flags) }.await?;
+    pub async fn open_raw_move_buf(&self, ring: RingId, path: Vec<u8>, flags: u64) -> Result<(usize, Vec<u8>)> {
+        let fd = unsafe { self.open_raw(ring, &*path, flags) }.await?;
         Ok((fd, path))
     }
     /// Open a path, returning a new file descriptor for the file specified by that path.
@@ -509,18 +627,19 @@ impl Handle {
     ///
     /// For this to be safe, the path buffer that is used by the path, _must_ outlive the execution
     /// of this future, and the buffer must not be reclaimed until completion or cancellation.
-    pub async unsafe fn open<S: AsRef<str> + ?Sized>(&self, path: &S, flags: u64) -> Result<usize> {
-        self.open_raw(path.as_ref().as_bytes(), flags).await
+    pub async unsafe fn open<S: AsRef<str> + ?Sized>(&self, ring: RingId, path: &S, flags: u64) -> Result<usize> {
+        self.open_raw(ring, path.as_ref().as_bytes(), flags).await
     }
     pub async fn open_static<S: AsRef<str> + ?Sized + 'static>(
         &self,
+        ring: RingId,
         path: &'static S,
         flags: u64,
     ) -> Result<usize> {
-        unsafe { self.open_raw(path.as_ref().as_bytes(), flags) }.await
+        unsafe { self.open_raw(ring, path.as_ref().as_bytes(), flags) }.await
     }
-    pub async fn open_move_buf(&self, path: String, flags: u64) -> Result<(usize, String)> {
-        let fd = unsafe { self.open_raw(path.as_str().as_bytes(), flags) }.await?;
+    pub async fn open_move_buf(&self, ring: RingId, path: String, flags: u64) -> Result<(usize, String)> {
+        let fd = unsafe { self.open_raw(ring, path.as_str().as_bytes(), flags) }.await?;
         Ok((fd, path))
     }
 
@@ -539,10 +658,10 @@ impl Handle {
     /// descriptor _must_ not be used after this command has been submitted, since the kernel is
     /// free to assign the same file descriptor for new handles, even though this may not happen
     /// immediately after submission.
-    pub async unsafe fn close(&self, fd: usize, flush: bool) -> Result<()> {
+    pub async unsafe fn close(&self, ring: RingId, fd: usize, flush: bool) -> Result<()> {
         let sqe = SqEntry64::new(IoUringSqeFlags::empty(), 0, (-1i64) as u64)
             .close(fd.try_into().or(Err(Error::new(EOVERFLOW)))?, flush);
-        let cqe = self.send(sqe).await?;
+        let cqe = self.send(ring, sqe).await?;
 
         Self::completion_as_rw_io_result(cqe)?;
 
@@ -560,6 +679,7 @@ impl Handle {
     /// [`close`]: #variant.close
     pub async unsafe fn close_range(
         &self,
+        ring: RingId,
         range: std::ops::Range<usize>,
         flush: bool,
     ) -> Result<()> {
@@ -569,7 +689,7 @@ impl Handle {
 
         let sqe = SqEntry64::new(IoUringSqeFlags::empty(), 0, (-1i64) as u64)
             .close_many(start, count, flush);
-        let cqe = self.send(sqe).await?;
+        let cqe = self.send(ring, sqe).await?;
 
         Self::completion_as_rw_io_result(cqe)?;
 
@@ -581,16 +701,16 @@ impl Handle {
     /// # Safety
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn read(&self, fd: usize, buf: &mut [u8]) -> Result<usize> {
-        self.rw_io(fd, |sqe, fd| sqe.read(fd, buf)).await
+    pub async unsafe fn read(&self, ring: RingId, fd: usize, buf: &mut [u8]) -> Result<usize> {
+        self.rw_io(ring, fd, |sqe, fd| sqe.read(fd, buf)).await
     }
     /// Read bytes, vectored.
     ///
     /// # Safety
     /// The caller must ensure that the buffers outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn readv(&self, fd: usize, bufs: &[IoVec]) -> Result<usize> {
-        self.rw_io(fd, |sqe, fd| sqe.readv(fd, bufs)).await
+    pub async unsafe fn readv(&self, ring: RingId, fd: usize, bufs: &[IoVec]) -> Result<usize> {
+        self.rw_io(ring, fd, |sqe, fd| sqe.readv(fd, bufs)).await
     }
 
     /// Read bytes from a specific offset. Does not change the file offset.
@@ -598,8 +718,8 @@ impl Handle {
     /// # Safety
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn pread(&self, fd: usize, buf: &mut [u8], offset: u64) -> Result<usize> {
-        self.rw_io(fd, |sqe, fd| sqe.pread(fd, buf, offset)).await
+    pub async unsafe fn pread(&self, ring: RingId, fd: usize, buf: &mut [u8], offset: u64) -> Result<usize> {
+        self.rw_io(ring, fd, |sqe, fd| sqe.pread(fd, buf, offset)).await
     }
 
     /// Read bytes from a specific offset, vectored. Does not change the file offset.
@@ -607,8 +727,8 @@ impl Handle {
     /// # Safety
     /// The caller must ensure that the buffers outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn preadv(&self, fd: usize, bufs: &[IoVec], offset: u64) -> Result<usize> {
-        self.rw_io(fd, |sqe, fd| sqe.preadv(fd, bufs, offset)).await
+    pub async unsafe fn preadv(&self, ring: RingId, fd: usize, bufs: &[IoVec], offset: u64) -> Result<usize> {
+        self.rw_io(ring, fd, |sqe, fd| sqe.preadv(fd, bufs, offset)).await
     }
 
     /// Write bytes.
@@ -616,8 +736,8 @@ impl Handle {
     /// # Safety
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn write(&self, fd: usize, buf: &[u8]) -> Result<usize> {
-        self.rw_io(fd, |sqe, fd| sqe.write(fd, buf)).await
+    pub async unsafe fn write(&self, ring: RingId, fd: usize, buf: &[u8]) -> Result<usize> {
+        self.rw_io(ring, fd, |sqe, fd| sqe.write(fd, buf)).await
     }
 
     /// Write bytes, vectored.
@@ -625,8 +745,8 @@ impl Handle {
     /// # Safety
     /// The caller must ensure that the buffers outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn writev(&self, fd: usize, bufs: &[IoVec]) -> Result<usize> {
-        self.rw_io(fd, |sqe, fd| sqe.writev(fd, bufs)).await
+    pub async unsafe fn writev(&self, ring: RingId, fd: usize, bufs: &[IoVec]) -> Result<usize> {
+        self.rw_io(ring, fd, |sqe, fd| sqe.writev(fd, bufs)).await
     }
 
     /// Write bytes to a specific offset. Does not change the file offset.
@@ -634,16 +754,16 @@ impl Handle {
     /// # Safety
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn pwrite(&self, fd: usize, buf: &[u8], offset: u64) -> Result<usize> {
-        self.rw_io(fd, |sqe, fd| sqe.pwrite(fd, buf, offset)).await
+    pub async unsafe fn pwrite(&self, ring: RingId, fd: usize, buf: &[u8], offset: u64) -> Result<usize> {
+        self.rw_io(ring, fd, |sqe, fd| sqe.pwrite(fd, buf, offset)).await
     }
     /// Write bytes to a specific offset, vectored. Does not change the file offset.
     ///
     /// # Safety
     /// The caller must ensure that the buffers outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn pwritev(&self, fd: usize, bufs: &[IoVec], offset: u64) -> Result<usize> {
-        self.rw_io(fd, |sqe, fd| sqe.pwritev(fd, bufs, offset))
+    pub async unsafe fn pwritev(&self, ring: RingId, fd: usize, bufs: &[IoVec], offset: u64) -> Result<usize> {
+        self.rw_io(ring, fd, |sqe, fd| sqe.pwritev(fd, bufs, offset))
             .await
     }
 
@@ -657,6 +777,7 @@ impl Handle {
     /// If the parameter is used, that mut point to a slice that is valid for the receiver.
     pub async unsafe fn dup2(
         &self,
+        ring: RingId,
         fd: usize,
         flags: Dup2Flags,
         param: Option<&[u8]>,
@@ -664,7 +785,7 @@ impl Handle {
         let fd64 = u64::try_from(fd).or(Err(Error::new(EBADF)))?;
 
         let cqe = self
-            .send(SqEntry64::new(IoUringSqeFlags::empty(), 0, 0).dup2(fd64, flags, param))
+            .send(ring, SqEntry64::new(IoUringSqeFlags::empty(), 0, 0).dup2(fd64, flags, param))
             .await?;
 
         let res_fd = Error::demux64(cqe.status)?;
@@ -684,6 +805,7 @@ impl Handle {
     /// overwrite an existing grant, if [`MAP_FIXED`] is set and [`MAP_FIXED_NOREPLACE`] is not.
     pub async unsafe fn mmap2(
         &self,
+        ring: RingId,
         fd: usize,
         flags: MapFlags,
         addr_hint: Option<usize>,
@@ -700,7 +822,7 @@ impl Handle {
         let addr_hint64 = u64::try_from(addr_hint).or(Err(Error::new(EOPNOTSUPP)))?;
 
         let cqe = self
-            .send(SqEntry64::new(IoUringSqeFlags::empty(), 0, 0).mmap(
+            .send(ring, SqEntry64::new(IoUringSqeFlags::empty(), 0, 0).mmap(
                 fd64,
                 flags,
                 addr_hint64,
@@ -729,12 +851,13 @@ impl Handle {
     /// [`mmap2`]: #variant.mmap2
     pub async unsafe fn mmap(
         &self,
+        ring: RingId,
         fd: usize,
         flags: MapFlags,
         len: usize,
         offset: u64,
     ) -> Result<*const ()> {
         assert!(!flags.contains(MapFlags::MAP_FIXED));
-        self.mmap2(fd, flags, None, len, offset).await
+        self.mmap2(ring, fd, flags, None, len, offset).await
     }
 }

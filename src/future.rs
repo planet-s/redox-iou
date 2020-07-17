@@ -14,12 +14,13 @@ use futures::Stream;
 use parking_lot::Mutex;
 
 use crate::instance::ConsumerInstance;
-use crate::reactor::Reactor;
+use crate::reactor::{Reactor, RingId};
 
 pub(crate) type Tag = u64;
 pub(crate) type AtomicTag = AtomicU64;
 
 pub(crate) struct CommandFutureInner {
+    pub(crate) ring: RingId,
     pub(crate) repr: CommandFutureRepr,
     pub(crate) reactor: Weak<Reactor>,
 }
@@ -155,9 +156,12 @@ impl CommandFutureInner {
             in_state_sqe = Some(sqe);
             init_sqe = &mut in_state_sqe;
         }
+        let instance_lock_either = reactor.instance(self.ring);
+        let instance_lock = &*instance_lock_either;
+
         match &mut *state_guard {
             &mut State::Initial | &mut State::Submitting(_, _) => try_submit(
-                &mut *reactor.main_instance.consumer_instance.write(),
+                &mut *instance_lock.write(),
                 &mut *state_guard,
                 cx,
                 init_sqe.expect("expected an initial SQE when submitting command"),
