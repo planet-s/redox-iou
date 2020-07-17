@@ -100,6 +100,15 @@ enum SecondaryInstanceWrapper {
     ProducerInstance(ProducerInstance),
 }
 
+impl SecondaryInstanceWrapper {
+    pub fn as_consumer_instance(&self) -> Option<&ConsumerInstanceWrapper> {
+        match self {
+            Self::ConsumerInstance(ref instance) => Some(instance),
+            Self::ProducerInstance(_) => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SecondaryInstancesWrapper {
     instances: Vec<SecondaryInstanceWrapper>,
@@ -421,12 +430,18 @@ impl Reactor {
                                 continue;
                             }
                         };
-                        let secondary_instance = &secondary_instances_guard.instances
+                        let secondary_instance = match secondary_instances_guard.instances
                             .get(secondary_instance_index)
                             .expect("fd backref BTreeMap corrupt, contains a file descriptor that was removed")
-                            .consumer_instance;
+                        {
+                            SecondaryInstanceWrapper::ConsumerInstance(ref instance) => instance,
+                            SecondaryInstanceWrapper::ProducerInstance(_) => {
+                                log::warn!("TODO: Support producer instances. Ignoring event.");
+                                continue;
+                            }
+                        };
 
-                        self.drive(secondary_instance, waker, false);
+                        self.drive(&secondary_instance.consumer_instance, waker, false);
                     } else {
                         let _ = Self::handle_cqe(self.trusted_main_instance, self.tag_map.read(), waker, cqe);
                     }
@@ -497,7 +512,7 @@ impl Reactor {
     pub(crate) fn instance(
         &self,
         ring: impl Into<RingId>,
-    ) -> Either<&RwLock<ConsumerInstance>, MappedRwLockReadGuard<RwLock<ConsumerInstance>>> {
+    ) -> Option<Either<&RwLock<ConsumerInstance>, MappedRwLockReadGuard<RwLock<ConsumerInstance>>>> {
         let ring = ring.into();
 
         if ring.reactor() != self.id() {
@@ -509,12 +524,12 @@ impl Reactor {
         }
 
         if ring == self.primary_instance() {
-            Left(&self.main_instance.consumer_instance)
+            Some(Left(&self.main_instance.consumer_instance))
         } else {
-            Right(RwLockReadGuard::map(
+            RwLockReadGuard::try_map(
                 self.secondary_instances.read(),
-                |instances| &instances.instances[ring.inner - 1].consumer_instance,
-            ))
+                |instances| instances.instances[ring.inner - 1].as_consumer_instance().map(|i| &i.consumer_instance),
+            ).ok().map(Right)
         }
     }
 }

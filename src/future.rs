@@ -157,7 +157,7 @@ impl CommandFutureInner {
             init_sqe = &mut in_state_sqe;
         }
         let instance_lock_either = reactor.instance(self.ring);
-        let instance_lock = &*instance_lock_either;
+        let instance_lock = &*instance_lock_either.expect("cannot poll CommandFuture: instance is a producer instance");
 
         match &mut *state_guard {
             &mut State::Initial | &mut State::Submitting(_, _) => try_submit(
