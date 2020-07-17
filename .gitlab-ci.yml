@@ -1,0 +1,12 @@
+stages:
+  - build
+
+rust-nightly:
+  stage: build
+  image: rustlang/rust:nightly
+  script:
+    - cargo build --verbose
+    - cargo test --verbose
+    - cargo fmt --all --verbose -- --check
+
+# TODO: Test on Redox with a VM
