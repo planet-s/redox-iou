@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::{task, thread};
 
 use crossbeam_queue::SegQueue;
@@ -80,11 +80,17 @@ impl Executor {
         this
     }
 
-    fn driving_waker(reactor: &Arc<Reactor>, runqueue: Option<(Weak<Runqueue>, usize)>) -> task::Waker {
+    fn driving_waker(
+        reactor: &Arc<Reactor>,
+        runqueue: Option<(Weak<Runqueue>, usize)>,
+    ) -> task::Waker {
         let reactor = Arc::downgrade(reactor);
 
         async_task::waker_fn(move || {
-            if let Some((runqueue, tag)) = runqueue.as_ref().and_then(|(rq, tag)| Some((rq.upgrade()?, tag))) {
+            if let Some((runqueue, tag)) = runqueue
+                .as_ref()
+                .and_then(|(rq, tag)| Some((rq.upgrade()?, tag)))
+            {
                 let removed = runqueue.pending_futures.lock().remove(&tag);
 
                 match removed {
@@ -105,11 +111,17 @@ impl Executor {
             }
         })
     }
-    fn standard_waker(standard_waker_thread: &Arc<RwLock<thread::Thread>>, runqueue: Option<(Weak<Runqueue>, usize)>) -> task::Waker {
+    fn standard_waker(
+        standard_waker_thread: &Arc<RwLock<thread::Thread>>,
+        runqueue: Option<(Weak<Runqueue>, usize)>,
+    ) -> task::Waker {
         let standard_waker_thread = Arc::downgrade(standard_waker_thread);
 
         async_task::waker_fn(move || {
-            if let Some((runqueue, tag)) = runqueue.as_ref().and_then(|(rq, tag)| Some((rq.upgrade()?, tag))) {
+            if let Some((runqueue, tag)) = runqueue
+                .as_ref()
+                .and_then(|(rq, tag)| Some((rq.upgrade()?, tag)))
+            {
                 let removed = runqueue.pending_futures.lock().remove(&tag);
 
                 match removed {
@@ -123,7 +135,6 @@ impl Executor {
                 .expect("failed to wake up executor: executor dead");
             let thread = thread_lock.read();
             thread.unpark();
-
         })
     }
 
@@ -150,7 +161,7 @@ impl Executor {
 
                 task::Poll::Pending => {
                     if let Some(reactor_wrapper) = self.reactor.as_ref() {
-                        reactor_wrapper.reactor.drive(&waker);
+                        reactor_wrapper.reactor.drive_primary(&waker);
                         self.poll_spawned_futures()
                     } else {
                         self.poll_spawned_futures();
@@ -165,12 +176,21 @@ impl Executor {
             let mut ready_future = ready_future;
             let pinned = ready_future.as_mut();
 
-            let tag = self.runqueue.next_pending_tag.fetch_add(1, Ordering::Relaxed);
+            let tag = self
+                .runqueue
+                .next_pending_tag
+                .fetch_add(1, Ordering::Relaxed);
 
             let secondary_waker = if let Some(reactor) = self.reactor.as_ref() {
-                Self::driving_waker(&reactor.reactor, Some((Arc::downgrade(&self.runqueue), tag)))
+                Self::driving_waker(
+                    &reactor.reactor,
+                    Some((Arc::downgrade(&self.runqueue), tag)),
+                )
             } else {
-                Self::standard_waker(&self.standard_waker_thread, Some((Arc::downgrade(&self.runqueue), tag)))
+                Self::standard_waker(
+                    &self.standard_waker_thread,
+                    Some((Arc::downgrade(&self.runqueue), tag)),
+                )
             };
 
             let mut cx = task::Context::from_waker(&secondary_waker);
@@ -178,7 +198,10 @@ impl Executor {
             match Future::poll(pinned, &mut cx) {
                 task::Poll::Ready(()) => (),
                 task::Poll::Pending => {
-                    self.runqueue.pending_futures.lock().insert(tag, ready_future);
+                    self.runqueue
+                        .pending_futures
+                        .lock()
+                        .insert(tag, ready_future);
                 }
             }
         }
@@ -214,7 +237,8 @@ impl SpawnHandle {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let runqueue = self.runqueue
+        let runqueue = self
+            .runqueue
             .upgrade()
             .expect("cannot spawn future: runqueue (and therefore executor) is dead");
         runqueue.ready_futures.push(Box::pin(future));

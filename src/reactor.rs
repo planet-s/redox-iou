@@ -9,8 +9,11 @@ use syscall::data::IoVec;
 use syscall::error::{Error, Result};
 use syscall::error::{E2BIG, EBADF, ECANCELED, EINVAL, EOPNOTSUPP, EOVERFLOW};
 use syscall::flag::{EventFlags, MapFlags};
-use syscall::io_uring::operation::Dup2Flags;
-use syscall::io_uring::{CqEntry64, IoUringEnterFlags, IoUringSqeFlags, RingPopError, SqEntry64};
+use syscall::io_uring::operation::{Dup2Flags, FilesUpdateFlags};
+use syscall::io_uring::{
+    CqEntry64, IoUringCqeFlags, IoUringEnterFlags, IoUringSqeFlags, RingPopError, SqEntry64,
+    StandardOpcode,
+};
 
 use crossbeam_queue::ArrayQueue;
 use either::*;
@@ -54,7 +57,7 @@ pub struct Reactor {
     // on the main instance (which __must__ be attached to the kernel for secondary instances to
     // exist whatsoever), and then pops the entries of that ring separately, precisely like with
     // the primary ring.
-    secondary_instances: RwLock<Vec<InstanceWrapper>>,
+    secondary_instances: RwLock<SecondaryInstancesWrapper>,
 
     // TODO: ConcurrentBTreeMap - I (4lDO2) am currently writing this.
 
@@ -87,6 +90,12 @@ pub(crate) struct InstanceWrapper {
     // stored when the ring encounters a shutdown error either when submitting an SQ, or receiving
     // a CQ.
     dropped: AtomicBool,
+}
+#[derive(Debug)]
+struct SecondaryInstancesWrapper {
+    instances: Vec<InstanceWrapper>,
+    // maps file descriptor to index within the instances
+    fds_backref: BTreeMap<usize, usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,7 +177,6 @@ impl From<SecondaryRingId> for RingId {
 /// A builder that configures the reactor.
 pub struct ReactorBuilder {
     trusted_instance: bool,
-    secondary_instances: Vec<InstanceWrapper>,
     primary_instance: Option<ConsumerInstance>,
 }
 
@@ -178,7 +186,6 @@ impl ReactorBuilder {
         Self {
             trusted_instance: false,
             primary_instance: None,
-            secondary_instances: Vec::new(),
         }
     }
     ///
@@ -222,17 +229,6 @@ impl ReactorBuilder {
     }
 
     ///
-    /// Add a secondary instance, typically a userspace-to-userspace ring.
-    ///
-    pub fn add_secondary_instance(mut self, secondary_instance: ConsumerInstance) -> Self {
-        self.secondary_instances.push(InstanceWrapper {
-            consumer_instance: RwLock::new(secondary_instance),
-            dropped: AtomicBool::new(false),
-        });
-        self
-    }
-
-    ///
     /// Finalize the reactor, using the options that have been specified here.
     ///
     /// # Panics
@@ -240,19 +236,11 @@ impl ReactorBuilder {
     ///
     pub fn build(self) -> Arc<Reactor> {
         let primary_instance = self.primary_instance.expect("expected");
-        Reactor::new(
-            primary_instance,
-            self.trusted_instance,
-            self.secondary_instances,
-        )
+        Reactor::new(primary_instance, self.trusted_instance)
     }
 }
 impl Reactor {
-    fn new(
-        main_instance: ConsumerInstance,
-        trusted_main_instance: bool,
-        secondary_instances: Vec<InstanceWrapper>,
-    ) -> Arc<Self> {
+    fn new(main_instance: ConsumerInstance, trusted_main_instance: bool) -> Arc<Self> {
         let main_instance = InstanceWrapper {
             consumer_instance: RwLock::new(main_instance),
             dropped: AtomicBool::new(false),
@@ -264,7 +252,10 @@ impl Reactor {
             },
             main_instance,
             trusted_main_instance,
-            secondary_instances: RwLock::new(secondary_instances),
+            secondary_instances: RwLock::new(SecondaryInstancesWrapper {
+                instances: Vec::new(),
+                fds_backref: BTreeMap::new(),
+            }),
 
             tag_map: RwLock::new(BTreeMap::new()),
             next_tag: AtomicTag::new(1),
@@ -278,9 +269,7 @@ impl Reactor {
         reactor_arc
     }
     pub fn primary_instance(&self) -> PrimaryRingId {
-        PrimaryRingId {
-            reactor: self.id,
-        }
+        PrimaryRingId { reactor: self.id }
     }
     /// Obtain a handle to this reactor, capable of creating futures that use it.
     pub fn handle(&self) -> Handle {
@@ -289,24 +278,69 @@ impl Reactor {
         }
     }
     /// Add an additional secondary instance to the reactor, waking up the executor to include it
-    /// if necessary.
-    pub fn add_secondary_instance(&self, instance: ConsumerInstance) -> SecondaryRingId {
+    /// if necessary. If the main SQ is full, this will fail with ENOSPC (TODO: fix this).
+    pub fn add_secondary_instance(
+        &self,
+        instance: ConsumerInstance,
+        priority: u16,
+    ) -> Result<SecondaryRingId> {
         let mut guard = self.secondary_instances.write();
-        guard.push(InstanceWrapper {
+
+        // Tell the kernel to send us speciel event CQEs which indicate that other io_urings have
+        // received additional entries, which is what actually allows secondary instances to make
+        // progress.
+        {
+            let fd64 = instance.ringfd().try_into().or(Err(Error::new(EBADF)))?;
+
+            self.main_instance
+                .consumer_instance
+                .write()
+                .sender_mut()
+                .as_64_mut()
+                .expect("expected SqEntry64")
+                .try_send(SqEntry64 {
+                    opcode: StandardOpcode::FilesUpdate as u8,
+                    priority,
+                    flags: IoUringSqeFlags::SUBSCRIBE.bits(),
+                    // not used since the driver will know that it's an io_uring being updated
+                    user_data: 0,
+
+                    syscall_flags: (FilesUpdateFlags::READ
+                        | FilesUpdateFlags::WRITE
+                        | FilesUpdateFlags::IO_URING)
+                        .bits(),
+                    addr: 0, // unused
+                    fd: fd64,
+                    offset: 0, // unused
+                    len: 0,    // unused
+
+                    additional1: 0,
+                    additional2: 0,
+                })?;
+        }
+
+        let instances_len = guard.instances.len();
+
+        guard.fds_backref.insert(instance.ringfd(), instances_len);
+        guard.instances.push(InstanceWrapper {
             consumer_instance: RwLock::new(instance),
             dropped: AtomicBool::new(false),
         });
-        SecondaryRingId {
+
+        Ok(SecondaryRingId {
             reactor: self.id,
-            inner: NonZeroUsize::new(guard.len()).unwrap(),
-        }
+            inner: NonZeroUsize::new(guard.instances.len()).unwrap(),
+        })
     }
     pub fn id(&self) -> ReactorId {
         self.id
     }
-    pub(crate) fn drive(&self, waker: &task::Waker) {
-        let a = {
-            let read_guard = self.main_instance.consumer_instance.read();
+    pub(crate) fn drive_primary(&self, waker: &task::Waker) {
+        self.drive(&self.main_instance.consumer_instance, waker, true)
+    }
+    fn drive(&self, instance: &RwLock<ConsumerInstance>, waker: &task::Waker, wait: bool) {
+        let a = if wait {
+            let read_guard = instance.read();
             let flags = if unsafe {
                 read_guard
                     .sender()
@@ -321,17 +355,21 @@ impl Reactor {
             } else {
                 IoUringEnterFlags::WAKEUP_ON_SQ_AVAIL
             };
-            read_guard
-                .wait(0, flags)
-                .expect("redox_iou: failed to enter io_uring")
+            Some(
+                read_guard
+                    .wait(0, flags)
+                    .expect("redox_iou: failed to enter io_uring"),
+            )
+        } else {
+            None
         };
 
-        let mut write_guard = self.main_instance.consumer_instance.write();
+        let mut write_guard = instance.write();
 
         let ring_header = unsafe { write_guard.receiver().as_64().unwrap().ring_header() };
         let available_completions = ring_header.available_entry_count_spsc();
 
-        if a > available_completions {
+        if a.unwrap_or(0) > available_completions {
             log::warn!("The kernel/other process gave us a higher number of available completions than present on the ring.");
         }
 
@@ -343,7 +381,48 @@ impl Reactor {
                 .try_recv();
 
             match result {
-                Ok(cqe) => { let _ = Self::handle_cqe(self.trusted_main_instance, self.tag_map.read(), waker, cqe); }
+                Ok(cqe) => {
+                    if IoUringCqeFlags::from_bits_truncate((cqe.flags & 0xFF) as u8).contains(IoUringCqeFlags::EVENT) && EventFlags::from_bits_truncate((cqe.flags >> 8) as usize).contains(EventFlags::EVENT_IO_URING) {
+                        // if this was an event, that was tagged io_uring, we can assume that the
+                        // event came from the kernel having polled some secondary io_urings. We'll
+                        // then drive those instances and wakeup futures.
+
+                        let fd64 = match Error::demux64(cqe.status) {
+                            Ok(fd64) => fd64,
+                            Err(error) => {
+                                log::warn!("Error on receiving an event about secondary io_uring progress: {}. Ignoring event.", error);
+                                continue;
+                            }
+                        };
+
+                        let fd = match usize::try_from(fd64) {
+                            Ok(fd) => fd,
+                            Err(_) => {
+                                log::warn!("The kernel gave us a CQE with a status that was too large to fit a system-wide file descriptor ({} > {}). Ignoring event.", cqe.status, usize::max_value());
+                                continue;
+                            }
+                        };
+
+                        let secondary_instances_guard = self.secondary_instances.read();
+
+                        let secondary_instance_index = match secondary_instances_guard.fds_backref.get(&fd) {
+                            Some(idx) => *idx,
+                            None => {
+                                log::warn!("The fd ({}) meant to describe the instance to drive, was not recognized. Ignoring event.", fd);
+                                continue;
+                            }
+                        };
+                        let secondary_instance = &secondary_instances_guard.instances
+                            .get(secondary_instance_index)
+                            .expect("fd backref BTreeMap corrupt, contains a file descriptor that was removed")
+                            .consumer_instance;
+
+                        self.drive(secondary_instance, waker, false);
+                    } else {
+                        let _ = Self::handle_cqe(self.trusted_main_instance, self.tag_map.read(), waker, cqe);
+                    }
+
+                }
                 Err(RingPopError::Empty { .. }) => panic!("the kernel gave us a higher number of available completions than actually available (at {}/{})", i, available_completions),
                 Err(RingPopError::Shutdown) => self.main_instance.dropped.store(true, std::sync::atomic::Ordering::Release),
             }
@@ -406,17 +485,27 @@ impl Reactor {
         }
         Some(())
     }
-    pub(crate) fn instance(&self, ring: impl Into<RingId>) -> Either<&RwLock<ConsumerInstance>, MappedRwLockReadGuard<RwLock<ConsumerInstance>>> {
+    pub(crate) fn instance(
+        &self,
+        ring: impl Into<RingId>,
+    ) -> Either<&RwLock<ConsumerInstance>, MappedRwLockReadGuard<RwLock<ConsumerInstance>>> {
         let ring = ring.into();
 
         if ring.reactor() != self.id() {
-            panic!("Using a reactor id from another reactor to get an instance: {:?} is not from {:?}", ring, self.id());
+            panic!(
+                "Using a reactor id from another reactor to get an instance: {:?} is not from {:?}",
+                ring,
+                self.id()
+            );
         }
 
         if ring == self.primary_instance() {
             Left(&self.main_instance.consumer_instance)
         } else {
-            Right(RwLockReadGuard::map(self.secondary_instances.read(), |instances| &instances[ring.inner - 1].consumer_instance))
+            Right(RwLockReadGuard::map(
+                self.secondary_instances.read(),
+                |instances| &instances.instances[ring.inner - 1].consumer_instance,
+            ))
         }
     }
 }
@@ -549,6 +638,7 @@ impl Handle {
         event_flags: EventFlags,
         oneshot: bool,
     ) -> FdUpdates {
+        assert!(!event_flags.contains(EventFlags::EVENT_IO_URING), "only the redox_iou reactor is allowed to use this flag unless io_uring API is used directly");
         let sqe = SqEntry64::new(IoUringSqeFlags::SUBSCRIBE, 0, 0).file_update(
             fd.try_into().unwrap(),
             event_flags,
@@ -619,7 +709,12 @@ impl Handle {
     ) -> Result<usize> {
         unsafe { self.open_raw(ring, path, flags) }.await
     }
-    pub async fn open_raw_move_buf(&self, ring: impl Into<RingId>, path: Vec<u8>, flags: u64) -> Result<(usize, Vec<u8>)> {
+    pub async fn open_raw_move_buf(
+        &self,
+        ring: impl Into<RingId>,
+        path: Vec<u8>,
+        flags: u64,
+    ) -> Result<(usize, Vec<u8>)> {
         let fd = unsafe { self.open_raw(ring, &*path, flags) }.await?;
         Ok((fd, path))
     }
@@ -629,7 +724,12 @@ impl Handle {
     ///
     /// For this to be safe, the path buffer that is used by the path, _must_ outlive the execution
     /// of this future, and the buffer must not be reclaimed until completion or cancellation.
-    pub async unsafe fn open<S: AsRef<str> + ?Sized>(&self, ring: impl Into<RingId>, path: &S, flags: u64) -> Result<usize> {
+    pub async unsafe fn open<S: AsRef<str> + ?Sized>(
+        &self,
+        ring: impl Into<RingId>,
+        path: &S,
+        flags: u64,
+    ) -> Result<usize> {
         self.open_raw(ring, path.as_ref().as_bytes(), flags).await
     }
     pub async fn open_static<S: AsRef<str> + ?Sized + 'static>(
@@ -640,7 +740,12 @@ impl Handle {
     ) -> Result<usize> {
         unsafe { self.open_raw(ring, path.as_ref().as_bytes(), flags) }.await
     }
-    pub async fn open_move_buf(&self, ring: impl Into<RingId>, path: String, flags: u64) -> Result<(usize, String)> {
+    pub async fn open_move_buf(
+        &self,
+        ring: impl Into<RingId>,
+        path: String,
+        flags: u64,
+    ) -> Result<(usize, String)> {
         let fd = unsafe { self.open_raw(ring, path.as_str().as_bytes(), flags) }.await?;
         Ok((fd, path))
     }
@@ -660,7 +765,12 @@ impl Handle {
     /// descriptor _must_ not be used after this command has been submitted, since the kernel is
     /// free to assign the same file descriptor for new handles, even though this may not happen
     /// immediately after submission.
-    pub async unsafe fn close(&self, ring: impl Into<RingId>, fd: usize, flush: bool) -> Result<()> {
+    pub async unsafe fn close(
+        &self,
+        ring: impl Into<RingId>,
+        fd: usize,
+        flush: bool,
+    ) -> Result<()> {
         let sqe = SqEntry64::new(IoUringSqeFlags::empty(), 0, (-1i64) as u64)
             .close(fd.try_into().or(Err(Error::new(EOVERFLOW)))?, flush);
         let cqe = self.send(ring, sqe).await?;
@@ -703,7 +813,12 @@ impl Handle {
     /// # Safety
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn read(&self, ring: impl Into<RingId>, fd: usize, buf: &mut [u8]) -> Result<usize> {
+    pub async unsafe fn read(
+        &self,
+        ring: impl Into<RingId>,
+        fd: usize,
+        buf: &mut [u8],
+    ) -> Result<usize> {
         self.rw_io(ring, fd, |sqe, fd| sqe.read(fd, buf)).await
     }
     /// Read bytes, vectored.
@@ -711,7 +826,12 @@ impl Handle {
     /// # Safety
     /// The caller must ensure that the buffers outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn readv(&self, ring: impl Into<RingId>, fd: usize, bufs: &[IoVec]) -> Result<usize> {
+    pub async unsafe fn readv(
+        &self,
+        ring: impl Into<RingId>,
+        fd: usize,
+        bufs: &[IoVec],
+    ) -> Result<usize> {
         self.rw_io(ring, fd, |sqe, fd| sqe.readv(fd, bufs)).await
     }
 
@@ -720,8 +840,15 @@ impl Handle {
     /// # Safety
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn pread(&self, ring: impl Into<RingId>, fd: usize, buf: &mut [u8], offset: u64) -> Result<usize> {
-        self.rw_io(ring, fd, |sqe, fd| sqe.pread(fd, buf, offset)).await
+    pub async unsafe fn pread(
+        &self,
+        ring: impl Into<RingId>,
+        fd: usize,
+        buf: &mut [u8],
+        offset: u64,
+    ) -> Result<usize> {
+        self.rw_io(ring, fd, |sqe, fd| sqe.pread(fd, buf, offset))
+            .await
     }
 
     /// Read bytes from a specific offset, vectored. Does not change the file offset.
@@ -729,8 +856,15 @@ impl Handle {
     /// # Safety
     /// The caller must ensure that the buffers outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn preadv(&self, ring: impl Into<RingId>, fd: usize, bufs: &[IoVec], offset: u64) -> Result<usize> {
-        self.rw_io(ring, fd, |sqe, fd| sqe.preadv(fd, bufs, offset)).await
+    pub async unsafe fn preadv(
+        &self,
+        ring: impl Into<RingId>,
+        fd: usize,
+        bufs: &[IoVec],
+        offset: u64,
+    ) -> Result<usize> {
+        self.rw_io(ring, fd, |sqe, fd| sqe.preadv(fd, bufs, offset))
+            .await
     }
 
     /// Write bytes.
@@ -738,7 +872,12 @@ impl Handle {
     /// # Safety
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn write(&self, ring: impl Into<RingId>, fd: usize, buf: &[u8]) -> Result<usize> {
+    pub async unsafe fn write(
+        &self,
+        ring: impl Into<RingId>,
+        fd: usize,
+        buf: &[u8],
+    ) -> Result<usize> {
         self.rw_io(ring, fd, |sqe, fd| sqe.write(fd, buf)).await
     }
 
@@ -747,7 +886,12 @@ impl Handle {
     /// # Safety
     /// The caller must ensure that the buffers outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn writev(&self, ring: impl Into<RingId>, fd: usize, bufs: &[IoVec]) -> Result<usize> {
+    pub async unsafe fn writev(
+        &self,
+        ring: impl Into<RingId>,
+        fd: usize,
+        bufs: &[IoVec],
+    ) -> Result<usize> {
         self.rw_io(ring, fd, |sqe, fd| sqe.writev(fd, bufs)).await
     }
 
@@ -756,15 +900,28 @@ impl Handle {
     /// # Safety
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn pwrite(&self, ring: impl Into<RingId>, fd: usize, buf: &[u8], offset: u64) -> Result<usize> {
-        self.rw_io(ring, fd, |sqe, fd| sqe.pwrite(fd, buf, offset)).await
+    pub async unsafe fn pwrite(
+        &self,
+        ring: impl Into<RingId>,
+        fd: usize,
+        buf: &[u8],
+        offset: u64,
+    ) -> Result<usize> {
+        self.rw_io(ring, fd, |sqe, fd| sqe.pwrite(fd, buf, offset))
+            .await
     }
     /// Write bytes to a specific offset, vectored. Does not change the file offset.
     ///
     /// # Safety
     /// The caller must ensure that the buffers outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn pwritev(&self, ring: impl Into<RingId>, fd: usize, bufs: &[IoVec], offset: u64) -> Result<usize> {
+    pub async unsafe fn pwritev(
+        &self,
+        ring: impl Into<RingId>,
+        fd: usize,
+        bufs: &[IoVec],
+        offset: u64,
+    ) -> Result<usize> {
         self.rw_io(ring, fd, |sqe, fd| sqe.pwritev(fd, bufs, offset))
             .await
     }
@@ -787,7 +944,10 @@ impl Handle {
         let fd64 = u64::try_from(fd).or(Err(Error::new(EBADF)))?;
 
         let cqe = self
-            .send(ring, SqEntry64::new(IoUringSqeFlags::empty(), 0, 0).dup2(fd64, flags, param))
+            .send(
+                ring,
+                SqEntry64::new(IoUringSqeFlags::empty(), 0, 0).dup2(fd64, flags, param),
+            )
             .await?;
 
         let res_fd = Error::demux64(cqe.status)?;
@@ -824,13 +984,16 @@ impl Handle {
         let addr_hint64 = u64::try_from(addr_hint).or(Err(Error::new(EOPNOTSUPP)))?;
 
         let cqe = self
-            .send(ring, SqEntry64::new(IoUringSqeFlags::empty(), 0, 0).mmap(
-                fd64,
-                flags,
-                addr_hint64,
-                len64,
-                offset,
-            ))
+            .send(
+                ring,
+                SqEntry64::new(IoUringSqeFlags::empty(), 0, 0).mmap(
+                    fd64,
+                    flags,
+                    addr_hint64,
+                    len64,
+                    offset,
+                ),
+            )
             .await?;
 
         let pointer = Error::demux64(cqe.status)?;
