@@ -406,7 +406,9 @@ impl Reactor {
         }
         Some(())
     }
-    pub(crate) fn instance(&self, ring: RingId) -> Either<&RwLock<ConsumerInstance>, MappedRwLockReadGuard<RwLock<ConsumerInstance>>> {
+    pub(crate) fn instance(&self, ring: impl Into<RingId>) -> Either<&RwLock<ConsumerInstance>, MappedRwLockReadGuard<RwLock<ConsumerInstance>>> {
+        let ring = ring.into();
+
         if ring.reactor() != self.id() {
             panic!("Using a reactor id from another reactor to get an instance: {:?} is not from {:?}", ring, self.id());
         }
@@ -451,14 +453,14 @@ impl Handle {
     /// Additionally, the buffers used may point to invalid locations on the stack or heap, which
     /// is UB.
     ///
-    pub unsafe fn send(&self, ring: RingId, sqe: SqEntry64) -> CommandFuture {
+    pub unsafe fn send(&self, ring: impl Into<RingId>, sqe: SqEntry64) -> CommandFuture {
         self.send_inner(ring, sqe, false)
             .left()
             .expect("send_inner() must return CommandFuture if is_stream is set to false")
     }
     unsafe fn send_inner(
         &self,
-        ring: RingId,
+        ring: impl Into<RingId>,
         sqe: SqEntry64,
         is_stream: bool,
     ) -> Either<CommandFuture, FdUpdates> {
@@ -515,7 +517,7 @@ impl Handle {
         };
 
         let inner = CommandFutureInner {
-            ring,
+            ring: ring.into(),
             reactor: Weak::clone(&self.reactor),
             repr: if reactor.trusted_main_instance {
                 CommandFutureRepr::Direct {
@@ -542,7 +544,7 @@ impl Handle {
     /// data, etc.
     pub fn subscribe_to_fd_updates(
         &self,
-        ring: RingId,
+        ring: impl Into<RingId>,
         fd: usize,
         event_flags: EventFlags,
         oneshot: bool,
@@ -577,7 +579,7 @@ impl Handle {
             }
         }
     }
-    async unsafe fn rw_io<F>(&self, ring: RingId, fd: usize, f: F) -> Result<usize>
+    async unsafe fn rw_io<F>(&self, ring: impl Into<RingId>, fd: usize, f: F) -> Result<usize>
     where
         F: FnOnce(SqEntry64, u64) -> SqEntry64,
     {
@@ -600,7 +602,7 @@ impl Handle {
     /// [`open`]: #variant.open
     pub async unsafe fn open_raw<B: AsRef<[u8]> + ?Sized>(
         &self,
-        ring: RingId,
+        ring: impl Into<RingId>,
         path: &B,
         flags: u64,
     ) -> Result<usize> {
@@ -611,13 +613,13 @@ impl Handle {
     }
     pub async fn open_raw_static<B: AsRef<[u8]> + ?Sized + 'static>(
         &self,
-        ring: RingId,
+        ring: impl Into<RingId>,
         path: &'static B,
         flags: u64,
     ) -> Result<usize> {
         unsafe { self.open_raw(ring, path, flags) }.await
     }
-    pub async fn open_raw_move_buf(&self, ring: RingId, path: Vec<u8>, flags: u64) -> Result<(usize, Vec<u8>)> {
+    pub async fn open_raw_move_buf(&self, ring: impl Into<RingId>, path: Vec<u8>, flags: u64) -> Result<(usize, Vec<u8>)> {
         let fd = unsafe { self.open_raw(ring, &*path, flags) }.await?;
         Ok((fd, path))
     }
@@ -627,18 +629,18 @@ impl Handle {
     ///
     /// For this to be safe, the path buffer that is used by the path, _must_ outlive the execution
     /// of this future, and the buffer must not be reclaimed until completion or cancellation.
-    pub async unsafe fn open<S: AsRef<str> + ?Sized>(&self, ring: RingId, path: &S, flags: u64) -> Result<usize> {
+    pub async unsafe fn open<S: AsRef<str> + ?Sized>(&self, ring: impl Into<RingId>, path: &S, flags: u64) -> Result<usize> {
         self.open_raw(ring, path.as_ref().as_bytes(), flags).await
     }
     pub async fn open_static<S: AsRef<str> + ?Sized + 'static>(
         &self,
-        ring: RingId,
+        ring: impl Into<RingId>,
         path: &'static S,
         flags: u64,
     ) -> Result<usize> {
         unsafe { self.open_raw(ring, path.as_ref().as_bytes(), flags) }.await
     }
-    pub async fn open_move_buf(&self, ring: RingId, path: String, flags: u64) -> Result<(usize, String)> {
+    pub async fn open_move_buf(&self, ring: impl Into<RingId>, path: String, flags: u64) -> Result<(usize, String)> {
         let fd = unsafe { self.open_raw(ring, path.as_str().as_bytes(), flags) }.await?;
         Ok((fd, path))
     }
@@ -658,7 +660,7 @@ impl Handle {
     /// descriptor _must_ not be used after this command has been submitted, since the kernel is
     /// free to assign the same file descriptor for new handles, even though this may not happen
     /// immediately after submission.
-    pub async unsafe fn close(&self, ring: RingId, fd: usize, flush: bool) -> Result<()> {
+    pub async unsafe fn close(&self, ring: impl Into<RingId>, fd: usize, flush: bool) -> Result<()> {
         let sqe = SqEntry64::new(IoUringSqeFlags::empty(), 0, (-1i64) as u64)
             .close(fd.try_into().or(Err(Error::new(EOVERFLOW)))?, flush);
         let cqe = self.send(ring, sqe).await?;
@@ -679,7 +681,7 @@ impl Handle {
     /// [`close`]: #variant.close
     pub async unsafe fn close_range(
         &self,
-        ring: RingId,
+        ring: impl Into<RingId>,
         range: std::ops::Range<usize>,
         flush: bool,
     ) -> Result<()> {
@@ -701,7 +703,7 @@ impl Handle {
     /// # Safety
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn read(&self, ring: RingId, fd: usize, buf: &mut [u8]) -> Result<usize> {
+    pub async unsafe fn read(&self, ring: impl Into<RingId>, fd: usize, buf: &mut [u8]) -> Result<usize> {
         self.rw_io(ring, fd, |sqe, fd| sqe.read(fd, buf)).await
     }
     /// Read bytes, vectored.
@@ -709,7 +711,7 @@ impl Handle {
     /// # Safety
     /// The caller must ensure that the buffers outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn readv(&self, ring: RingId, fd: usize, bufs: &[IoVec]) -> Result<usize> {
+    pub async unsafe fn readv(&self, ring: impl Into<RingId>, fd: usize, bufs: &[IoVec]) -> Result<usize> {
         self.rw_io(ring, fd, |sqe, fd| sqe.readv(fd, bufs)).await
     }
 
@@ -718,7 +720,7 @@ impl Handle {
     /// # Safety
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn pread(&self, ring: RingId, fd: usize, buf: &mut [u8], offset: u64) -> Result<usize> {
+    pub async unsafe fn pread(&self, ring: impl Into<RingId>, fd: usize, buf: &mut [u8], offset: u64) -> Result<usize> {
         self.rw_io(ring, fd, |sqe, fd| sqe.pread(fd, buf, offset)).await
     }
 
@@ -727,7 +729,7 @@ impl Handle {
     /// # Safety
     /// The caller must ensure that the buffers outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn preadv(&self, ring: RingId, fd: usize, bufs: &[IoVec], offset: u64) -> Result<usize> {
+    pub async unsafe fn preadv(&self, ring: impl Into<RingId>, fd: usize, bufs: &[IoVec], offset: u64) -> Result<usize> {
         self.rw_io(ring, fd, |sqe, fd| sqe.preadv(fd, bufs, offset)).await
     }
 
@@ -736,7 +738,7 @@ impl Handle {
     /// # Safety
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn write(&self, ring: RingId, fd: usize, buf: &[u8]) -> Result<usize> {
+    pub async unsafe fn write(&self, ring: impl Into<RingId>, fd: usize, buf: &[u8]) -> Result<usize> {
         self.rw_io(ring, fd, |sqe, fd| sqe.write(fd, buf)).await
     }
 
@@ -745,7 +747,7 @@ impl Handle {
     /// # Safety
     /// The caller must ensure that the buffers outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn writev(&self, ring: RingId, fd: usize, bufs: &[IoVec]) -> Result<usize> {
+    pub async unsafe fn writev(&self, ring: impl Into<RingId>, fd: usize, bufs: &[IoVec]) -> Result<usize> {
         self.rw_io(ring, fd, |sqe, fd| sqe.writev(fd, bufs)).await
     }
 
@@ -754,7 +756,7 @@ impl Handle {
     /// # Safety
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn pwrite(&self, ring: RingId, fd: usize, buf: &[u8], offset: u64) -> Result<usize> {
+    pub async unsafe fn pwrite(&self, ring: impl Into<RingId>, fd: usize, buf: &[u8], offset: u64) -> Result<usize> {
         self.rw_io(ring, fd, |sqe, fd| sqe.pwrite(fd, buf, offset)).await
     }
     /// Write bytes to a specific offset, vectored. Does not change the file offset.
@@ -762,7 +764,7 @@ impl Handle {
     /// # Safety
     /// The caller must ensure that the buffers outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn pwritev(&self, ring: RingId, fd: usize, bufs: &[IoVec], offset: u64) -> Result<usize> {
+    pub async unsafe fn pwritev(&self, ring: impl Into<RingId>, fd: usize, bufs: &[IoVec], offset: u64) -> Result<usize> {
         self.rw_io(ring, fd, |sqe, fd| sqe.pwritev(fd, bufs, offset))
             .await
     }
@@ -777,7 +779,7 @@ impl Handle {
     /// If the parameter is used, that mut point to a slice that is valid for the receiver.
     pub async unsafe fn dup2(
         &self,
-        ring: RingId,
+        ring: impl Into<RingId>,
         fd: usize,
         flags: Dup2Flags,
         param: Option<&[u8]>,
@@ -805,7 +807,7 @@ impl Handle {
     /// overwrite an existing grant, if [`MAP_FIXED`] is set and [`MAP_FIXED_NOREPLACE`] is not.
     pub async unsafe fn mmap2(
         &self,
-        ring: RingId,
+        ring: impl Into<RingId>,
         fd: usize,
         flags: MapFlags,
         addr_hint: Option<usize>,
@@ -851,7 +853,7 @@ impl Handle {
     /// [`mmap2`]: #variant.mmap2
     pub async unsafe fn mmap(
         &self,
-        ring: RingId,
+        ring: impl Into<RingId>,
         fd: usize,
         flags: MapFlags,
         len: usize,
