@@ -23,7 +23,7 @@ use parking_lot::{MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard};
 use crate::future::{
     AtomicTag, CommandFuture, CommandFutureInner, CommandFutureRepr, FdUpdates, State, Tag,
 };
-use crate::instance::ConsumerInstance;
+use crate::instance::{ConsumerInstance, ProducerInstance};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReactorId {
@@ -42,7 +42,7 @@ pub struct Reactor {
     // instance, that can monitor secondary instances (typically userspace-to-userspace rings).
     // when only a single instance is used, then this instance is free to also be a
     // userspace-to-userspace ring.
-    pub(crate) main_instance: InstanceWrapper,
+    pub(crate) main_instance: ConsumerInstanceWrapper,
 
     // distinguishes "trusted instances" from "non-trusted" instances. the major difference between
     // these two, is that a non-trusted instance will use a map to associate integer tags with the
@@ -83,7 +83,7 @@ pub struct Reactor {
 }
 
 #[derive(Debug)]
-pub(crate) struct InstanceWrapper {
+pub(crate) struct ConsumerInstanceWrapper {
     // a convenient safe wrapper over the raw underlying interface.
     pub(crate) consumer_instance: RwLock<ConsumerInstance>,
 
@@ -92,8 +92,17 @@ pub(crate) struct InstanceWrapper {
     dropped: AtomicBool,
 }
 #[derive(Debug)]
+enum SecondaryInstanceWrapper {
+    // Since this is a secondary instance, a userspace-to-userspace consumer.
+    ConsumerInstance(ConsumerInstanceWrapper),
+
+    // Either a kernel-to-userspace producer, or a userspace-to-userspace producer.
+    ProducerInstance(ProducerInstance),
+}
+
+#[derive(Debug)]
 struct SecondaryInstancesWrapper {
-    instances: Vec<InstanceWrapper>,
+    instances: Vec<SecondaryInstanceWrapper>,
     // maps file descriptor to index within the instances
     fds_backref: BTreeMap<usize, usize>,
 }
@@ -241,7 +250,7 @@ impl ReactorBuilder {
 }
 impl Reactor {
     fn new(main_instance: ConsumerInstance, trusted_main_instance: bool) -> Arc<Self> {
-        let main_instance = InstanceWrapper {
+        let main_instance = ConsumerInstanceWrapper {
             consumer_instance: RwLock::new(main_instance),
             dropped: AtomicBool::new(false),
         };
@@ -322,10 +331,10 @@ impl Reactor {
         let instances_len = guard.instances.len();
 
         guard.fds_backref.insert(instance.ringfd(), instances_len);
-        guard.instances.push(InstanceWrapper {
+        guard.instances.push(SecondaryInstanceWrapper::ConsumerInstance(ConsumerInstanceWrapper {
             consumer_instance: RwLock::new(instance),
             dropped: AtomicBool::new(false),
-        });
+        }));
 
         Ok(SecondaryRingId {
             reactor: self.id,
