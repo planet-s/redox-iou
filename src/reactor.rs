@@ -523,16 +523,6 @@ impl Reactor {
         let state_lock = if trusted_instance {
             let pointer = usize::try_from(cqe.user_data).ok()? as *mut Mutex<State>;
             let state_weak = unsafe { Weak::from_raw(pointer) };
-            assert_eq!(
-                Weak::strong_count(&state_weak),
-                1,
-                "expected strong count to be one when receiving a direct future"
-            );
-            assert_eq!(
-                Weak::weak_count(&state_weak),
-                1,
-                "expected weak count to be one when receiving a direct future"
-            );
             state_arc = state_weak.upgrade()?;
             &state_arc
         } else {
