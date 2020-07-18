@@ -235,3 +235,36 @@ impl Stream for FdUpdates {
         self.get_mut().inner.poll(true, cx)
     }
 }
+
+pub(crate) enum ProducerSqesState {
+    Receiving {
+        deque: VecDeque<SqEntry64>,
+        capacity: usize,
+        waker: Option<task::Waker>,
+    },
+    Cancelled,
+    Finished,
+}
+
+pub struct ProducerSqes {
+    pub(crate) state: Arc<Mutex<ProducerSqesState>>,
+}
+impl Stream for ProducerSqes {
+    type Item = Result<SqEntry64>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let mut state_guard = this.state.lock();
+        match *state_guard {
+            ProducerSqesState::Receiving { ref mut deque, ref mut waker, .. } => match deque.pop_front() {
+                Some(s) => task::Poll::Ready(Some(Ok(s))),
+                None => {
+                    *waker = Some(cx.waker().clone());
+                    task::Poll::Pending
+                }
+            },
+            ProducerSqesState::Cancelled => task::Poll::Ready(Some(Err(Error::new(ECANCELED)))),
+            ProducerSqesState::Finished => task::Poll::Ready(None),
+        }
+    }
+}

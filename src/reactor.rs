@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::convert::{TryFrom, TryInto};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{self, AtomicBool, AtomicUsize};
 use std::sync::{Arc, Weak};
-use std::task;
+use std::{mem, task};
 
 use syscall::data::IoVec;
 use syscall::error::{Error, Result};
@@ -11,8 +11,8 @@ use syscall::error::{E2BIG, EBADF, ECANCELED, EINVAL, EOPNOTSUPP, EOVERFLOW};
 use syscall::flag::{EventFlags, MapFlags};
 use syscall::io_uring::operation::{Dup2Flags, FilesUpdateFlags};
 use syscall::io_uring::{
-    CqEntry64, IoUringCqeFlags, IoUringEnterFlags, IoUringSqeFlags, RingPopError, SqEntry64,
-    StandardOpcode,
+    CqEntry64, IoUringCqeFlags, IoUringEnterFlags, IoUringSqeFlags, RingPopError, RingPushError,
+    SqEntry64, StandardOpcode,
 };
 
 use crossbeam_queue::ArrayQueue;
@@ -21,7 +21,8 @@ use once_cell::sync::OnceCell;
 use parking_lot::{MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard};
 
 use crate::future::{
-    AtomicTag, CommandFuture, CommandFutureInner, CommandFutureRepr, FdUpdates, State, Tag,
+    AtomicTag, CommandFuture, CommandFutureInner, CommandFutureRepr, FdUpdates, ProducerSqes,
+    ProducerSqesState, State, Tag,
 };
 use crate::instance::{ConsumerInstance, ProducerInstance};
 
@@ -92,12 +93,17 @@ pub(crate) struct ConsumerInstanceWrapper {
     dropped: AtomicBool,
 }
 #[derive(Debug)]
+pub(crate) struct ProducerInstanceWrapper {
+    pub(crate) producer_instance: RwLock<ProducerInstance>,
+    dropped: AtomicBool,
+}
+#[derive(Debug)]
 enum SecondaryInstanceWrapper {
     // Since this is a secondary instance, a userspace-to-userspace consumer.
     ConsumerInstance(ConsumerInstanceWrapper),
 
     // Either a kernel-to-userspace producer, or a userspace-to-userspace producer.
-    ProducerInstance(ProducerInstance),
+    ProducerInstance(ProducerInstanceWrapper),
 }
 
 impl SecondaryInstanceWrapper {
@@ -302,13 +308,25 @@ impl Reactor {
         instance: ConsumerInstance,
         priority: u16,
     ) -> Result<SecondaryRingId> {
+        let ringfd = instance.ringfd();
+        self.add_secondary_instance_generic(SecondaryInstanceWrapper::ConsumerInstance(ConsumerInstanceWrapper {
+            consumer_instance: RwLock::new(instance),
+            dropped: AtomicBool::new(false),
+        }), ringfd, priority)
+    }
+    fn add_secondary_instance_generic(
+        &self,
+        instance: SecondaryInstanceWrapper,
+        ringfd: usize,
+        priority: u16,
+    ) -> Result<SecondaryRingId> {
         let mut guard = self.secondary_instances.write();
 
         // Tell the kernel to send us speciel event CQEs which indicate that other io_urings have
         // received additional entries, which is what actually allows secondary instances to make
         // progress.
         {
-            let fd64 = instance.ringfd().try_into().or(Err(Error::new(EBADF)))?;
+            let fd64 = ringfd.try_into().or(Err(Error::new(EBADF)))?;
 
             self.main_instance
                 .consumer_instance
@@ -324,7 +342,6 @@ impl Reactor {
                     user_data: 0,
 
                     syscall_flags: (FilesUpdateFlags::READ
-                        | FilesUpdateFlags::WRITE
                         | FilesUpdateFlags::IO_URING)
                         .bits(),
                     addr: 0, // unused
@@ -339,26 +356,30 @@ impl Reactor {
 
         let instances_len = guard.instances.len();
 
-        guard.fds_backref.insert(instance.ringfd(), instances_len);
-        guard.instances.push(SecondaryInstanceWrapper::ConsumerInstance(ConsumerInstanceWrapper {
-            consumer_instance: RwLock::new(instance),
-            dropped: AtomicBool::new(false),
-        }));
+        guard.fds_backref.insert(ringfd, instances_len);
+        guard.instances.push(instance);
 
         Ok(SecondaryRingId {
             reactor: self.id,
             inner: NonZeroUsize::new(guard.instances.len()).unwrap(),
         })
     }
+    pub fn add_producer_instance(&self, instance: ProducerInstance, priority: u16) -> Result<SecondaryRingId> {
+        let ringfd = instance.ringfd();
+        self.add_secondary_instance_generic(SecondaryInstanceWrapper::ProducerInstance(ProducerInstanceWrapper {
+            producer_instance: RwLock::new(instance),
+            dropped: AtomicBool::new(false),
+        }), ringfd, priority)
+    }
     pub fn id(&self) -> ReactorId {
         self.id
     }
     pub(crate) fn drive_primary(&self, waker: &task::Waker) {
-        self.drive(&self.main_instance.consumer_instance, waker, true)
+        self.drive(&self.main_instance, waker, true)
     }
-    fn drive(&self, instance: &RwLock<ConsumerInstance>, waker: &task::Waker, wait: bool) {
+    fn drive(&self, instance: &ConsumerInstanceWrapper, waker: &task::Waker, wait: bool) {
         let a = if wait {
-            let read_guard = instance.read();
+            let read_guard = instance.consumer_instance.read();
             let flags = if unsafe {
                 read_guard
                     .sender()
@@ -382,7 +403,7 @@ impl Reactor {
             None
         };
 
-        let mut write_guard = instance.write();
+        let mut write_guard = instance.consumer_instance.write();
 
         let ring_header = unsafe { write_guard.receiver().as_64().unwrap().ring_header() };
         let available_completions = ring_header.available_entry_count_spsc();
@@ -430,25 +451,62 @@ impl Reactor {
                                 continue;
                             }
                         };
-                        let secondary_instance = match secondary_instances_guard.instances
+                        match secondary_instances_guard.instances
                             .get(secondary_instance_index)
                             .expect("fd backref BTreeMap corrupt, contains a file descriptor that was removed")
                         {
-                            SecondaryInstanceWrapper::ConsumerInstance(ref instance) => instance,
-                            SecondaryInstanceWrapper::ProducerInstance(_) => {
-                                log::warn!("TODO: Support producer instances. Ignoring event.");
-                                continue;
-                            }
-                        };
+                            SecondaryInstanceWrapper::ConsumerInstance(ref instance) => self.drive(instance, waker, false),
+                            SecondaryInstanceWrapper::ProducerInstance(ref instance) => self.drive_producer_instance(&instance, waker, cqe.user_data),
+                        }
 
-                        self.drive(&secondary_instance.consumer_instance, waker, false);
                     } else {
                         let _ = Self::handle_cqe(self.trusted_main_instance, self.tag_map.read(), waker, cqe);
                     }
 
                 }
                 Err(RingPopError::Empty { .. }) => panic!("the kernel gave us a higher number of available completions than actually available (at {}/{})", i, available_completions),
-                Err(RingPopError::Shutdown) => self.main_instance.dropped.store(true, std::sync::atomic::Ordering::Release),
+                Err(RingPopError::Shutdown) => { instance.dropped.store(true, std::sync::atomic::Ordering::Release); break },
+            }
+        }
+    }
+    fn drive_producer_instance(&self, instance: &ProducerInstanceWrapper, waker: &task::Waker, cqe_user_data: u64) {
+        loop {
+            assert!(self.trusted_main_instance);
+            let cqe_user_data = usize::try_from(cqe_user_data).unwrap();
+
+            let weak = {
+                // Doing the following won't increment the weak count, so we can't technically use
+                // it yet.
+                let not_yet_usable_weak = unsafe { Weak::from_raw(cqe_user_data as *const Mutex<ProducerSqesState>) };
+                let usable_weak = Weak::clone(&not_yet_usable_weak);
+                // Keep the weak count incremented, to let the driver access the state again.
+                mem::forget(not_yet_usable_weak);
+                usable_weak
+            };
+            let arc = match weak.upgrade() {
+                Some(a) => a,
+                None => return,
+            };
+            let mut state_guard = arc.lock();
+
+            match *state_guard {
+                ProducerSqesState::Receiving { ref mut deque, capacity, waker: ref mut future_waker } => {
+                    if deque.len() < capacity {
+                        let mut guard = instance.producer_instance.write();
+                        let sqe = match guard.receiver_mut().as_64_mut().unwrap().try_recv() {
+                            Ok(sqe) => sqe,
+                            Err(RingPopError::Empty { .. }) => break,
+                            Err(RingPopError::Shutdown) => { instance.dropped.store(true, std::sync::atomic::Ordering::Release); *state_guard = ProducerSqesState::Finished; break },
+                        };
+                        deque.push_back(sqe);
+                        future_waker.get_or_insert_with(|| waker.clone()).wake_by_ref();
+                    } else {
+                        // The future doesn't want more SQEs, so we'll avoid the push and let the
+                        // consumer of this producer, encounter a full ring instead.
+                    }
+                }
+                ProducerSqesState::Finished => break,
+                ProducerSqesState::Cancelled => break,
             }
         }
     }
@@ -649,6 +707,51 @@ impl Handle {
             Right(inner.into())
         } else {
             Left(inner.into())
+        }
+    }
+    pub fn send_producer_cqe(&self, instance: SecondaryRingId, cqe: CqEntry64) -> Result<(), RingPushError<CqEntry64>> {
+        let reactor = self.reactor
+            .upgrade()
+            .expect("failed to send producer CQE: reactor is dead");
+
+        assert_eq!(reactor.id(), instance.reactor);
+
+        let guard = reactor.secondary_instances.read();
+
+        let producer_instance = match guard.instances
+            .get(instance.inner.get() - 1)
+            .expect("invalid SecondaryRingId: non-existent instance") {
+                SecondaryInstanceWrapper::ProducerInstance(ref instance) => instance,
+                SecondaryInstanceWrapper::ConsumerInstance(_) => panic!("cannot send producer CQE using a consumer instance"),
+        };
+        let mut producer_instance_guard = producer_instance.producer_instance.write();
+        match producer_instance_guard
+            .sender_mut()
+            .as_64_mut()
+            .unwrap()
+            .try_send(cqe) {
+            Ok(()) => Ok(()),
+            Err(RingPushError::Full(_)) => Err(RingPushError::Full(cqe)),
+            Err(RingPushError::Shutdown(_)) => {
+                producer_instance.dropped.store(true, atomic::Ordering::Release);
+                Err(RingPushError::Shutdown(cqe))
+            }
+        }
+    }
+    pub fn producer_sqes(&self, instance: SecondaryRingId, capacity: usize) -> ProducerSqes {
+        let reactor = self.reactor
+            .upgrade()
+            .expect("failed to send producer CQE: reactor is dead");
+
+        assert_eq!(reactor.id(), instance.reactor);
+        assert!(reactor.trusted_main_instance);
+
+        ProducerSqes {
+            state: Arc::new(Mutex::new(ProducerSqesState::Receiving {
+                capacity,
+                deque: VecDeque::with_capacity(capacity),
+                waker: None,
+            })),
         }
     }
 

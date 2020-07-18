@@ -570,16 +570,45 @@ mod producer_instance {
         Bits32(SpscSender<CqEntry32>),
         Bits64(SpscSender<CqEntry64>),
     }
+    impl GenericSender {
+        pub fn as_32(&self) -> Option<&SpscSender<CqEntry32>> {
+            if let Self::Bits32(ref recv) = self { Some(recv) } else { None }
+        }
+        pub fn as_32_mut(&mut self) -> Option<&mut SpscSender<CqEntry32>> {
+            if let Self::Bits32(ref mut recv) = self { Some(recv) } else { None }
+        }
+        pub fn as_64(&self) -> Option<&SpscSender<CqEntry64>> {
+            if let Self::Bits64(ref recv) = self { Some(recv) } else { None }
+        }
+        pub fn as_64_mut(&mut self) -> Option<&mut SpscSender<CqEntry64>> {
+            if let Self::Bits64(ref mut recv) = self { Some(recv) } else { None }
+        }
+    }
     #[derive(Debug)]
     pub enum GenericReceiver {
         Bits32(SpscReceiver<SqEntry32>),
         Bits64(SpscReceiver<SqEntry64>),
+    }
+    impl GenericReceiver {
+        pub fn as_32(&self) -> Option<&SpscReceiver<SqEntry32>> {
+            if let Self::Bits32(ref recv) = self { Some(recv) } else { None }
+        }
+        pub fn as_32_mut(&mut self) -> Option<&mut SpscReceiver<SqEntry32>> {
+            if let Self::Bits32(ref mut recv) = self { Some(recv) } else { None }
+        }
+        pub fn as_64(&self) -> Option<&SpscReceiver<SqEntry64>> {
+            if let Self::Bits64(ref recv) = self { Some(recv) } else { None }
+        }
+        pub fn as_64_mut(&mut self) -> Option<&mut SpscReceiver<SqEntry64>> {
+            if let Self::Bits64(ref mut recv) = self { Some(recv) } else { None }
+        }
     }
 
     #[derive(Debug)]
     pub struct Instance {
         sender: GenericSender,
         receiver: GenericReceiver,
+        ringfd: usize,
     }
 
     impl Instance {
@@ -617,13 +646,23 @@ mod producer_instance {
                 } else {
                     GenericReceiver::Bits64(init_receiver(recv_info))
                 },
+                ringfd: recv_info.producerfd,
             })
         }
-        pub fn sender(&mut self) -> &mut GenericSender {
+        pub fn sender_mut(&mut self) -> &mut GenericSender {
             &mut self.sender
         }
-        pub fn receiver(&mut self) -> &mut GenericReceiver {
+        pub fn sender(&self) -> &GenericSender {
+            &self.sender
+        }
+        pub fn receiver_mut(&mut self) -> &mut GenericReceiver {
             &mut self.receiver
+        }
+        pub fn receiver(&self) -> &GenericReceiver {
+            &self.receiver
+        }
+        pub fn ringfd(&self) -> usize {
+            self.ringfd
         }
     }
 }
