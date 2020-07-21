@@ -9,14 +9,14 @@ use syscall::data::Map as Mmap;
 use syscall::error::{Error, Result};
 use syscall::error::{EADDRINUSE, EOVERFLOW};
 use syscall::flag::MapFlags;
-use syscall::io_uring::operation::Dup2Flags;
+use syscall::io_uring::operation::DupFlags;
 
 use cranelift_bforest::{Comparator, Map, MapForest};
 use either::*;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 
 use crate::future::{CommandFuture, CommandFutureRepr, State as CommandFutureState};
-use crate::reactor::Handle;
+use crate::reactor::{Handle, SecondaryRingId};
 
 /// A comparator that only compares the offsets of two ranges.
 struct RangeOffsetComparator;
@@ -370,6 +370,7 @@ impl CommandFuture {
 impl Handle {
     pub async fn create_buffer_pool(
         &self,
+        secondary_instance: SecondaryRingId,
         _creation_command_priority: u16,
         initial_len: u32,
     ) -> Result<BufferPool> {
@@ -378,16 +379,31 @@ impl Handle {
             .upgrade()
             .expect("can't create_buffer_pool: reactor is dead");
 
-        let ringfd = reactor.main_instance.consumer_instance.read().ringfd();
+        assert_eq!(reactor.id(), secondary_instance.reactor);
+
+        let ringfd = reactor
+            .secondary_instances
+            .read()
+            .instances
+            .get(secondary_instance.inner.get() - 1)
+            .expect("invalid secondary ring id")
+            .as_consumer_instance()
+            .expect("ring id represents producer instance")
+            .consumer_instance
+            .read()
+            .ringfd();
+
+        log::debug!("Running dup");
         let fd = unsafe {
-            self.dup2(
+            self.dup(
                 reactor.primary_instance(),
                 ringfd,
-                Dup2Flags::PARAM,
+                DupFlags::PARAM,
                 Some(b"pool"),
             )
         }
         .await?;
+        log::debug!("Ran dup");
 
         Ok(unsafe {
             BufferPool::new_from_raw(fd, Some(Handle::clone(self)))
@@ -597,6 +613,9 @@ impl BufferPool {
         mmap_map
             .map
             .insert(offset_half, info_half, &mut mmap_map.forest, &());
+
+        let occ_map = self.occ_map.get_mut();
+        occ_map.map.insert(OccOffsetHalf::unused(0), OccInfoHalf::with_size(initial_len), &mut occ_map.forest, &());
 
         Ok(self)
     }

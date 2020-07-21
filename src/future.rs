@@ -90,6 +90,7 @@ fn try_submit(
     } else {
         sqe
     };
+    log::debug!("Sending SQE {:?}", sqe);
 
     match instance
         .sender_mut()
@@ -99,14 +100,17 @@ fn try_submit(
     {
         Ok(()) => {
             if is_stream {
+                log::debug!("Successfully sent stream command, awaiting CQEs.");
                 *state = State::ReceivingMulti(VecDeque::new(), cx.waker().clone());
             } else {
+                log::debug!("Successfully sent command, awaiting CQE.");
                 *state = State::Completing(cx.waker().clone());
             }
             task::Poll::Pending
         }
         Err(RingPushError::Full(sqe)) => {
             *state = State::Submitting(sqe, cx.waker().clone());
+            log::debug!("Submission ring is full");
             task::Poll::Pending
         }
         Err(RingPushError::Shutdown(_)) => task::Poll::Ready(Some(Err(Error::new(ESHUTDOWN)))),
@@ -119,6 +123,7 @@ impl CommandFutureInner {
         is_stream: bool,
         cx: &mut task::Context,
     ) -> task::Poll<Option<Result<CqEntry64>>> {
+        log::debug!("Polling future");
         let reactor = self
             .reactor
             .upgrade()
@@ -209,7 +214,6 @@ impl Future for CommandFuture {
     type Output = Result<CqEntry64>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<Self::Output> {
-        // TODO: Cleaner code?
         let this = self.get_mut();
 
         match this.inner.poll(false, cx) {

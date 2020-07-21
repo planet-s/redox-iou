@@ -9,7 +9,7 @@ use syscall::data::IoVec;
 use syscall::error::{Error, Result};
 use syscall::error::{E2BIG, EBADF, ECANCELED, EINVAL, EOPNOTSUPP, EOVERFLOW};
 use syscall::flag::{EventFlags, MapFlags};
-use syscall::io_uring::operation::{Dup2Flags, FilesUpdateFlags};
+use syscall::io_uring::operation::{DupFlags, FilesUpdateFlags};
 use syscall::io_uring::{
     CqEntry64, IoUringCqeFlags, IoUringEnterFlags, IoUringSqeFlags, RingPopError, RingPushError,
     SqEntry64, StandardOpcode,
@@ -58,7 +58,7 @@ pub struct Reactor {
     // on the main instance (which __must__ be attached to the kernel for secondary instances to
     // exist whatsoever), and then pops the entries of that ring separately, precisely like with
     // the primary ring.
-    secondary_instances: RwLock<SecondaryInstancesWrapper>,
+    pub(crate) secondary_instances: RwLock<SecondaryInstancesWrapper>,
 
     // TODO: ConcurrentBTreeMap - I (4lDO2) am currently writing this.
 
@@ -98,7 +98,7 @@ pub(crate) struct ProducerInstanceWrapper {
     dropped: AtomicBool,
 }
 #[derive(Debug)]
-enum SecondaryInstanceWrapper {
+pub(crate) enum SecondaryInstanceWrapper {
     // Since this is a secondary instance, a userspace-to-userspace consumer.
     ConsumerInstance(ConsumerInstanceWrapper),
 
@@ -107,7 +107,7 @@ enum SecondaryInstanceWrapper {
 }
 
 impl SecondaryInstanceWrapper {
-    pub fn as_consumer_instance(&self) -> Option<&ConsumerInstanceWrapper> {
+    pub(crate) fn as_consumer_instance(&self) -> Option<&ConsumerInstanceWrapper> {
         match self {
             Self::ConsumerInstance(ref instance) => Some(instance),
             Self::ProducerInstance(_) => None,
@@ -116,8 +116,8 @@ impl SecondaryInstanceWrapper {
 }
 
 #[derive(Debug)]
-struct SecondaryInstancesWrapper {
-    instances: Vec<SecondaryInstanceWrapper>,
+pub(crate) struct SecondaryInstancesWrapper {
+    pub(crate) instances: Vec<SecondaryInstanceWrapper>,
     // maps file descriptor to index within the instances
     fds_backref: BTreeMap<usize, usize>,
 }
@@ -394,6 +394,7 @@ impl Reactor {
             } else {
                 IoUringEnterFlags::WAKEUP_ON_SQ_AVAIL
             };
+            log::debug!("Entering io_uring");
             Some(
                 read_guard
                     .wait(0, flags)
@@ -402,11 +403,14 @@ impl Reactor {
         } else {
             None
         };
+        log::debug!("Entered io_uring with a {:?}", a);
 
         let mut write_guard = instance.consumer_instance.write();
 
         let ring_header = unsafe { write_guard.receiver().as_64().unwrap().ring_header() };
         let available_completions = ring_header.available_entry_count_spsc();
+
+        log::debug!("Available completions: {}", available_completions);
 
         if a.unwrap_or(0) > available_completions {
             log::warn!("The kernel/other process gave us a higher number of available completions than present on the ring.");
@@ -1047,15 +1051,19 @@ impl Handle {
     ///
     /// # Panics
     /// This function will panic if the parameter is set, but the flags don't contain
-    /// [`Dup2Flags::PARAM`].
+    /// [`DupFlags::PARAM`].
     ///
     /// # Safety
-    /// If the parameter is used, that mut point to a slice that is valid for the receiver.
-    pub async unsafe fn dup2(
+    ///
+    /// If the parameter is used, that must point to a slice that is valid for the receiver.
+    /// Additionally, that slice must also outlive the lifetime of this future, and if the future
+    /// is dropped or forgotten, the slice must not be used afterwards, since that would lead to a
+    /// data race.
+    pub async unsafe fn dup(
         &self,
         ring: impl Into<RingId>,
         fd: usize,
-        flags: Dup2Flags,
+        flags: DupFlags,
         param: Option<&[u8]>,
     ) -> Result<usize> {
         let fd64 = u64::try_from(fd).or(Err(Error::new(EBADF)))?;
@@ -1063,7 +1071,7 @@ impl Handle {
         let cqe = self
             .send(
                 ring,
-                SqEntry64::new(IoUringSqeFlags::empty(), 0, 0).dup2(fd64, flags, param),
+                SqEntry64::new(IoUringSqeFlags::empty(), 0, 0).dup(fd64, flags, param),
             )
             .await?;
 
