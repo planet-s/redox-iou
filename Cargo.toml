@@ -13,13 +13,12 @@ readme = "README.md"
 homepage = "https://redox-os.org/"
 
 [features]
-buffer_pool = ["cranelift-bforest", "redox-buffer-pool"]
+buffer_pool = ["redox-buffer-pool"]
 default = ["buffer_pool"]
 
 [dependencies]
 async-task = "3"
 bitflags = "1.2"
-cranelift-bforest = { version = "0.65", optional = true }
 crossbeam-queue = "0.2"
 either = "1.5"
 futures = "0.3"
@@ -29,9 +28,4 @@ parking_lot = { version = "0.11", features = ["nightly"] }
 pin-utils = "0.1"
 redox_syscall = { git = "https://gitlab.redox-os.org/4lDO2/syscall.git", branch = "io_uring" }
 
-redox-buffer-pool = { path = "redox-buffer-pool", version = "0.1", optional = true }
-
-[workspace]
-members = [
-    "redox-buffer-pool",
-]
+redox-buffer-pool = { git = "https://gitlab.redox-os.org/redox-os/redox-buffer-pool.git", optional = true }
