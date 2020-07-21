@@ -1,0 +1,19 @@
+[package]
+name = "redox-buffer-pool"
+version = "0.1.0"
+authors = ["4lDO2 <4lDO2@protonmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+cranelift-bforest = "0.65"
+either = "1.5"
+log = "0.4"
+parking_lot = { version = "0.11", features = ["nightly"] }
+redox_syscall = { git = "https://gitlab.redox-os.org/4lDO2/syscall.git", branch = "io_uring" }
+thiserror = "1"
+
+[dev-dependencies]
+rand = "0.7"
+

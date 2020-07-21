@@ -13,7 +13,7 @@ readme = "README.md"
 homepage = "https://redox-os.org/"
 
 [features]
-buffer_pool = ["cranelift-bforest"]
+buffer_pool = ["cranelift-bforest", "redox-buffer-pool"]
 default = ["buffer_pool"]
 
 [dependencies]
@@ -25,17 +25,13 @@ either = "1.5"
 futures = "0.3"
 log = "0.4"
 once_cell = "1.4"
+parking_lot = { version = "0.11", features = ["nightly"] }
 pin-utils = "0.1"
 redox_syscall = { git = "https://gitlab.redox-os.org/4lDO2/syscall.git", branch = "io_uring" }
 
-[dev-dependencies]
-rand = "0.7"
+redox-buffer-pool = { path = "redox-buffer-pool", version = "0.1", optional = true }
 
-[target.'cfg(miri)'.dependencies.parking_lot]
-# Don't use assembly with miri
-version = "0.11"
-features = []
-
-[target.'cfg(not(miri))'.dependencies.parking_lot]
-version = "0.11"
-features = ["nightly"]
+[workspace]
+members = [
+    "redox-buffer-pool",
+]
