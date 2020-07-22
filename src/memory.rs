@@ -14,7 +14,7 @@ use redox_buffer_pool as pool;
 use crate::future::{CommandFuture, CommandFutureRepr, State as CommandFutureState};
 use crate::reactor::{Handle, SecondaryRingId};
 
-pub type BufferPool<H = BufferPoolHandle> = pool::BufferPool<H>;
+pub type BufferPool<H = BufferPoolHandle, E = ()> = pool::BufferPool<H, E>;
 pub type BufferSlice<'a, G = CommandFutureGuard, H = BufferPoolHandle> = pool::BufferSlice<'a, H, G>;
 
 pub struct BufferPoolHandle {
@@ -22,8 +22,8 @@ pub struct BufferPoolHandle {
     reactor: Option<Handle>,
 }
 impl pool::Handle for BufferPoolHandle {
-    fn close(&mut self) -> Result<()> {
-        let _ = syscall::close(self.fd)?;
+    fn close(self) -> Result<(), pool::CloseError<()>> {
+        let _ = syscall::close(self.fd);
         Ok(())
     }
 }
@@ -47,7 +47,7 @@ impl CommandFuture {
     /// Protect a slice with a future guard, preventing the memory from being reclaimed until the
     /// future has completed. This will cause the buffer slice to leak memory if dropped too early,
     /// but prevents undefined behavior.
-    pub fn guard<'a>(&self, slice: &mut pool::BufferSlice<'a, BufferPoolHandle, CommandFutureGuard>) {
+    pub fn guard<'a, E: Copy>(&self, slice: &mut pool::BufferSlice<'a, BufferPoolHandle, E, CommandFutureGuard>) {
         let weak = match self.inner.repr {
             CommandFutureRepr::Direct { ref state, .. } => Arc::downgrade(state),
             CommandFutureRepr::Tagged { tag, .. } => {
@@ -69,12 +69,13 @@ impl CommandFuture {
     }
 }
 impl Handle {
-    pub async fn create_buffer_pool(
+    pub async fn create_buffer_pool<E: Copy>(
         &self,
         secondary_instance: SecondaryRingId,
         _creation_command_priority: u16,
         initial_len: u32,
-    ) -> Result<pool::BufferPool<BufferPoolHandle>> {
+        initial_extra: E,
+    ) -> Result<pool::BufferPool<BufferPoolHandle, E>> {
         let reactor = self
             .reactor
             .upgrade()
@@ -113,7 +114,8 @@ impl Handle {
 
         let expansion = pool.begin_expand(initial_len)?;
         let pointer = expand(&pool.handle().unwrap(), expansion.offset(), expansion.len()).await?;
-        unsafe { expansion.initialize(pointer)?; }
+        assert_ne!(pointer, std::ptr::null_mut());
+        unsafe { expansion.initialize(pointer, initial_extra); }
         Ok(pool)
     }
 }
