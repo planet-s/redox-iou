@@ -10,10 +10,11 @@ use syscall::error::{Error, Result};
 use syscall::error::{E2BIG, EBADF, ECANCELED, EINVAL, EOPNOTSUPP, EOVERFLOW};
 use syscall::flag::{EventFlags, MapFlags};
 use syscall::io_uring::operation::{DupFlags, FilesUpdateFlags};
-use syscall::io_uring::{
-    CqEntry64, IoUringCqeFlags, IoUringEnterFlags, IoUringSqeFlags, RingPopError, RingPushError,
-    SqEntry64, StandardOpcode,
+use syscall::io_uring::v1::{
+    CqEntry64, IoUringCqeFlags, IoUringSqeFlags, Priority, RingPopError, RingPushError, SqEntry64,
+    StandardOpcode,
 };
+use syscall::io_uring::IoUringEnterFlags;
 
 use crossbeam_queue::ArrayQueue;
 use either::*;
@@ -306,7 +307,7 @@ impl Reactor {
     pub fn add_secondary_instance(
         &self,
         instance: ConsumerInstance,
-        priority: u16,
+        priority: Priority,
     ) -> Result<SecondaryRingId> {
         let ringfd = instance.ringfd();
         self.add_secondary_instance_generic(SecondaryInstanceWrapper::ConsumerInstance(ConsumerInstanceWrapper {
@@ -318,7 +319,7 @@ impl Reactor {
         &self,
         instance: SecondaryInstanceWrapper,
         ringfd: usize,
-        priority: u16,
+        priority: Priority,
     ) -> Result<SecondaryRingId> {
         let mut guard = self.secondary_instances.write();
 
@@ -364,7 +365,7 @@ impl Reactor {
             inner: NonZeroUsize::new(guard.instances.len()).unwrap(),
         })
     }
-    pub fn add_producer_instance(&self, instance: ProducerInstance, priority: u16) -> Result<SecondaryRingId> {
+    pub fn add_producer_instance(&self, instance: ProducerInstance, priority: Priority) -> Result<SecondaryRingId> {
         let ringfd = instance.ringfd();
         self.add_secondary_instance_generic(SecondaryInstanceWrapper::ProducerInstance(ProducerInstanceWrapper {
             producer_instance: RwLock::new(instance),
@@ -760,7 +761,7 @@ impl Handle {
         oneshot: bool,
     ) -> FdUpdates {
         assert!(!event_flags.contains(EventFlags::EVENT_IO_URING), "only the redox_iou reactor is allowed to use this flag unless io_uring API is used directly");
-        let sqe = SqEntry64::new(IoUringSqeFlags::SUBSCRIBE, 0, 0).file_update(
+        let sqe = SqEntry64::new(IoUringSqeFlags::SUBSCRIBE, Priority::default(), (-1i64) as u64).file_update(
             fd.try_into().unwrap(),
             event_flags,
             oneshot,
@@ -796,7 +797,7 @@ impl Handle {
     {
         let fd: u64 = fd.try_into().or(Err(Error::new(EOVERFLOW)))?;
 
-        let base_sqe = SqEntry64::new(IoUringSqeFlags::empty(), 0, (-1i64) as u64);
+        let base_sqe = SqEntry64::new(IoUringSqeFlags::empty(), Priority::default(), (-1i64) as u64);
         let sqe = f(base_sqe, fd);
 
         let cqe = self.send(ring, sqe).await?;
@@ -818,7 +819,7 @@ impl Handle {
         flags: u64,
     ) -> Result<usize> {
         let sqe =
-            SqEntry64::new(IoUringSqeFlags::empty(), 0, (-1i64) as u64).open(path.as_ref(), flags);
+            SqEntry64::new(IoUringSqeFlags::empty(), Priority::default(), (-1i64) as u64).open(path.as_ref(), flags);
         let cqe = self.send(ring, sqe).await?;
         Self::completion_as_rw_io_result(cqe)
     }
@@ -892,7 +893,7 @@ impl Handle {
         fd: usize,
         flush: bool,
     ) -> Result<()> {
-        let sqe = SqEntry64::new(IoUringSqeFlags::empty(), 0, (-1i64) as u64)
+        let sqe = SqEntry64::new(IoUringSqeFlags::empty(), Priority::default(), (-1i64) as u64)
             .close(fd.try_into().or(Err(Error::new(EOVERFLOW)))?, flush);
         let cqe = self.send(ring, sqe).await?;
 
@@ -920,7 +921,7 @@ impl Handle {
         let end: u64 = range.end.try_into().or(Err(Error::new(EOVERFLOW)))?;
         let count = end.checked_sub(start).ok_or(Error::new(EINVAL))?;
 
-        let sqe = SqEntry64::new(IoUringSqeFlags::empty(), 0, (-1i64) as u64)
+        let sqe = SqEntry64::new(IoUringSqeFlags::empty(), Priority::default(), (-1i64) as u64)
             .close_many(start, count, flush);
         let cqe = self.send(ring, sqe).await?;
 
@@ -1071,7 +1072,7 @@ impl Handle {
         let cqe = self
             .send(
                 ring,
-                SqEntry64::new(IoUringSqeFlags::empty(), 0, 0).dup(fd64, flags, param),
+                SqEntry64::new(IoUringSqeFlags::empty(), Priority::default(), (-1i64) as u64).dup(fd64, flags, param),
             )
             .await?;
 
@@ -1111,7 +1112,7 @@ impl Handle {
         let cqe = self
             .send(
                 ring,
-                SqEntry64::new(IoUringSqeFlags::empty(), 0, 0).mmap(
+                SqEntry64::new(IoUringSqeFlags::empty(), Priority::default(), 0).mmap(
                     fd64,
                     flags,
                     addr_hint64,
