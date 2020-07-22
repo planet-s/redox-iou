@@ -5,7 +5,8 @@ use syscall::data::Map as Mmap;
 use syscall::error::{Error, Result};
 use syscall::error::EOVERFLOW;
 use syscall::flag::MapFlags;
-use syscall::io_uring::operation::DupFlags;
+use syscall::io_uring::v1::operation::DupFlags;
+use syscall::io_uring::v1::Priority;
 
 use parking_lot::Mutex;
 
@@ -72,7 +73,7 @@ impl Handle {
     pub async fn create_buffer_pool<E: Copy>(
         &self,
         secondary_instance: SecondaryRingId,
-        _creation_command_priority: u16,
+        _creation_command_priority: Priority,
         initial_len: u32,
         initial_extra: E,
     ) -> Result<pool::BufferPool<BufferPoolHandle, E>> {
