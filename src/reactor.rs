@@ -19,7 +19,9 @@ use syscall::io_uring::IoUringEnterFlags;
 use crossbeam_queue::ArrayQueue;
 use either::*;
 use once_cell::sync::OnceCell;
-use parking_lot::{MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard};
+use parking_lot::{
+    MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard,
+};
 
 use crate::future::{
     AtomicTag, CommandFuture, CommandFutureInner, CommandFutureRepr, FdUpdates, ProducerSqes,
@@ -96,6 +98,7 @@ pub(crate) struct ConsumerInstanceWrapper {
 #[derive(Debug)]
 pub(crate) struct ProducerInstanceWrapper {
     pub(crate) producer_instance: RwLock<ProducerInstance>,
+    stream_state: Option<Arc<Mutex<ProducerSqesState>>>,
     dropped: AtomicBool,
 }
 #[derive(Debug)]
@@ -310,10 +313,14 @@ impl Reactor {
         priority: Priority,
     ) -> Result<SecondaryRingId> {
         let ringfd = instance.ringfd();
-        self.add_secondary_instance_generic(SecondaryInstanceWrapper::ConsumerInstance(ConsumerInstanceWrapper {
-            consumer_instance: RwLock::new(instance),
-            dropped: AtomicBool::new(false),
-        }), ringfd, priority)
+        self.add_secondary_instance_generic(
+            SecondaryInstanceWrapper::ConsumerInstance(ConsumerInstanceWrapper {
+                consumer_instance: RwLock::new(instance),
+                dropped: AtomicBool::new(false),
+            }),
+            ringfd,
+            priority,
+        )
     }
     fn add_secondary_instance_generic(
         &self,
@@ -342,9 +349,7 @@ impl Reactor {
                     // not used since the driver will know that it's an io_uring being updated
                     user_data: 0,
 
-                    syscall_flags: (FilesUpdateFlags::READ
-                        | FilesUpdateFlags::IO_URING)
-                        .bits(),
+                    syscall_flags: (FilesUpdateFlags::READ | FilesUpdateFlags::IO_URING).bits(),
                     addr: 0, // unused
                     fd: fd64,
                     offset: 0, // unused
@@ -365,20 +370,29 @@ impl Reactor {
             inner: NonZeroUsize::new(guard.instances.len()).unwrap(),
         })
     }
-    pub fn add_producer_instance(&self, instance: ProducerInstance, priority: Priority) -> Result<SecondaryRingId> {
+    pub fn add_producer_instance(
+        &self,
+        instance: ProducerInstance,
+        priority: Priority,
+    ) -> Result<SecondaryRingId> {
         let ringfd = instance.ringfd();
-        self.add_secondary_instance_generic(SecondaryInstanceWrapper::ProducerInstance(ProducerInstanceWrapper {
-            producer_instance: RwLock::new(instance),
-            dropped: AtomicBool::new(false),
-        }), ringfd, priority)
+        self.add_secondary_instance_generic(
+            SecondaryInstanceWrapper::ProducerInstance(ProducerInstanceWrapper {
+                producer_instance: RwLock::new(instance),
+                dropped: AtomicBool::new(false),
+                stream_state: None,
+            }),
+            ringfd,
+            priority,
+        )
     }
     pub fn id(&self) -> ReactorId {
         self.id
     }
-    pub(crate) fn drive_primary(&self, waker: &task::Waker) {
-        self.drive(&self.main_instance, waker, true)
+    pub(crate) fn drive_primary(&self, waker: &task::Waker, wait: bool) {
+        self.drive(&self.main_instance, waker, wait, true)
     }
-    fn drive(&self, instance: &ConsumerInstanceWrapper, waker: &task::Waker, wait: bool) {
+    fn drive(&self, instance: &ConsumerInstanceWrapper, waker: &task::Waker, wait: bool, primary: bool) {
         let a = if wait {
             let read_guard = instance.consumer_instance.read();
             let flags = if unsafe {
@@ -406,9 +420,9 @@ impl Reactor {
         };
         log::debug!("Entered io_uring with a {:?}", a);
 
-        let mut write_guard = instance.consumer_instance.write();
+        let mut intent_guard = instance.consumer_instance.upgradable_read();
 
-        let ring_header = unsafe { write_guard.receiver().as_64().unwrap().ring_header() };
+        let ring_header = unsafe { intent_guard.receiver().as_64().unwrap().ring_header() };
         let available_completions = ring_header.available_entry_count_spsc();
 
         log::debug!("Available completions: {}", available_completions);
@@ -418,14 +432,17 @@ impl Reactor {
         }
 
         for i in 0..available_completions {
+            let mut write_guard = RwLockUpgradableReadGuard::upgrade(intent_guard);
             let result = write_guard
                 .receiver_mut()
                 .as_64_mut()
                 .expect("expected 64-bit CQEs")
                 .try_recv();
+            intent_guard = RwLockWriteGuard::downgrade_to_upgradable(write_guard);
 
             match result {
                 Ok(cqe) => {
+                    log::debug!("Received CQE: {:?}", cqe);
                     if IoUringCqeFlags::from_bits_truncate((cqe.flags & 0xFF) as u8).contains(IoUringCqeFlags::EVENT) && EventFlags::from_bits_truncate((cqe.flags >> 8) as usize).contains(EventFlags::EVENT_IO_URING) {
                         // if this was an event, that was tagged io_uring, we can assume that the
                         // event came from the kernel having polled some secondary io_urings. We'll
@@ -460,12 +477,12 @@ impl Reactor {
                             .get(secondary_instance_index)
                             .expect("fd backref BTreeMap corrupt, contains a file descriptor that was removed")
                         {
-                            SecondaryInstanceWrapper::ConsumerInstance(ref instance) => self.drive(instance, waker, false),
-                            SecondaryInstanceWrapper::ProducerInstance(ref instance) => self.drive_producer_instance(&instance, waker, cqe.user_data),
+                            SecondaryInstanceWrapper::ConsumerInstance(ref instance) => self.drive(instance, waker, false, false),
+                            SecondaryInstanceWrapper::ProducerInstance(ref instance) => self.drive_producer_instance(&instance),
                         }
 
                     } else {
-                        let _ = Self::handle_cqe(self.trusted_main_instance, self.tag_map.read(), waker, cqe);
+                        let _ = Self::handle_cqe(self.trusted_main_instance && primary, self.tag_map.read(), waker, cqe);
                     }
 
                 }
@@ -474,40 +491,53 @@ impl Reactor {
             }
         }
     }
-    fn drive_producer_instance(&self, instance: &ProducerInstanceWrapper, waker: &task::Waker, cqe_user_data: u64) {
+    fn drive_producer_instance(&self, instance: &ProducerInstanceWrapper) {
+        log::debug!("Event was an external producer io_uring, thus polling the ring itself");
         loop {
             assert!(self.trusted_main_instance);
-            let cqe_user_data = usize::try_from(cqe_user_data).unwrap();
 
-            let weak = {
-                // Doing the following won't increment the weak count, so we can't technically use
-                // it yet.
-                let not_yet_usable_weak = unsafe { Weak::from_raw(cqe_user_data as *const Mutex<ProducerSqesState>) };
-                let usable_weak = Weak::clone(&not_yet_usable_weak);
-                // Keep the weak count incremented, to let the driver access the state again.
-                mem::forget(not_yet_usable_weak);
-                usable_weak
-            };
-            let arc = match weak.upgrade() {
-                Some(a) => a,
+            let state_lock = match instance.stream_state {
+                Some(ref s) => s,
                 None => return,
             };
-            let mut state_guard = arc.lock();
+            let mut state_guard = state_lock.lock();
+            log::debug!("Driving state: {:?}", &*state_guard);
 
             match *state_guard {
-                ProducerSqesState::Receiving { ref mut deque, capacity, waker: ref mut future_waker } => {
+                // TODO: Since ProducerSqes only supports one stream per producer instance, as it
+                // does nothing but receiving SQEs from that ring with proper notification, this
+                // could happen inside the future instead. Actually, the future needs not contain
+                // any state arc at all, and could consist of nothing but a waker.
+                ProducerSqesState::Receiving {
+                    ref mut deque,
+                    capacity,
+                    waker: ref mut future_waker,
+                } => {
                     if deque.len() < capacity {
                         let mut guard = instance.producer_instance.write();
                         let sqe = match guard.receiver_mut().as_64_mut().unwrap().try_recv() {
                             Ok(sqe) => sqe,
                             Err(RingPopError::Empty { .. }) => break,
-                            Err(RingPopError::Shutdown) => { instance.dropped.store(true, std::sync::atomic::Ordering::Release); *state_guard = ProducerSqesState::Finished; break },
+                            Err(RingPopError::Shutdown) => {
+                                log::debug!("Secondary producer ring dropped");
+                                instance
+                                    .dropped
+                                    .store(true, std::sync::atomic::Ordering::Release);
+                                *state_guard = ProducerSqesState::Finished;
+                                break;
+                            }
                         };
+                        log::info!("Secondary producer SQE: {:?}", sqe);
                         deque.push_back(sqe);
-                        future_waker.get_or_insert_with(|| waker.clone()).wake_by_ref();
+                        if let Some(future_waker) = future_waker.take() {
+                            future_waker.wake();
+                        }
+                        log::debug!("New driving state: {:?}", &*state_guard);
                     } else {
                         // The future doesn't want more SQEs, so we'll avoid the push and let the
-                        // consumer of this producer, encounter a full ring instead.
+                        // consumer of this producer, encounter a full ring instead, forming a very
+                        // basic sort of congestion control.
+                        log::debug!("Ignoring state");
                     }
                 }
                 ProducerSqesState::Finished => break,
@@ -565,7 +595,8 @@ impl Reactor {
     pub(crate) fn instance(
         &self,
         ring: impl Into<RingId>,
-    ) -> Option<Either<&RwLock<ConsumerInstance>, MappedRwLockReadGuard<RwLock<ConsumerInstance>>>> {
+    ) -> Option<Either<&RwLock<ConsumerInstance>, MappedRwLockReadGuard<RwLock<ConsumerInstance>>>>
+    {
         let ring = ring.into();
 
         if ring.reactor() != self.id() {
@@ -579,10 +610,13 @@ impl Reactor {
         if ring == self.primary_instance() {
             Some(Left(&self.main_instance.consumer_instance))
         } else {
-            RwLockReadGuard::try_map(
-                self.secondary_instances.read(),
-                |instances| instances.instances[ring.inner - 1].as_consumer_instance().map(|i| &i.consumer_instance),
-            ).ok().map(Right)
+            RwLockReadGuard::try_map(self.secondary_instances.read(), |instances| {
+                instances.instances[ring.inner - 1]
+                    .as_consumer_instance()
+                    .map(|i| &i.consumer_instance)
+            })
+            .ok()
+            .map(Right)
         }
     }
 }
@@ -630,10 +664,14 @@ impl Handle {
         sqe: SqEntry64,
         is_stream: bool,
     ) -> Either<CommandFuture, FdUpdates> {
+        let ring = ring.into();
+
         let reactor = self
             .reactor
             .upgrade()
             .expect("failed to initiate new command: reactor is dead");
+
+        assert_eq!(ring.reactor, reactor.id());
 
         let (tag_num_opt, state_opt) = match reactor.reusable_tags.pop() {
             // try getting a reusable tag to minimize unnecessary allocations
@@ -653,7 +691,7 @@ impl Handle {
                     "weird leakage of weak refs to CommandFuture state"
                 );
 
-                if reactor.trusted_main_instance {
+                if reactor.trusted_main_instance && ring.is_primary() {
                     (None, Some(state))
                 } else {
                     reactor
@@ -673,7 +711,7 @@ impl Handle {
                     .next_tag
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                if reactor.trusted_main_instance {
+                if reactor.trusted_main_instance && ring.is_primary() {
                     (None, Some(state_arc))
                 } else {
                     reactor.tag_map.write().insert(n, state_arc);
@@ -683,9 +721,9 @@ impl Handle {
         };
 
         let inner = CommandFutureInner {
-            ring: ring.into(),
+            ring,
             reactor: Weak::clone(&self.reactor),
-            repr: if reactor.trusted_main_instance {
+            repr: if reactor.trusted_main_instance && ring.is_primary() {
                 CommandFutureRepr::Direct {
                     state: state_opt.unwrap(),
                     initial_sqe: sqe,
@@ -704,8 +742,13 @@ impl Handle {
             Left(inner.into())
         }
     }
-    pub fn send_producer_cqe(&self, instance: SecondaryRingId, cqe: CqEntry64) -> Result<(), RingPushError<CqEntry64>> {
-        let reactor = self.reactor
+    pub fn send_producer_cqe(
+        &self,
+        instance: SecondaryRingId,
+        cqe: CqEntry64,
+    ) -> Result<(), RingPushError<CqEntry64>> {
+        let reactor = self
+            .reactor
             .upgrade()
             .expect("failed to send producer CQE: reactor is dead");
 
@@ -713,41 +756,84 @@ impl Handle {
 
         let guard = reactor.secondary_instances.read();
 
-        let producer_instance = match guard.instances
+        let producer_instance = match guard
+            .instances
             .get(instance.inner.get() - 1)
-            .expect("invalid SecondaryRingId: non-existent instance") {
-                SecondaryInstanceWrapper::ProducerInstance(ref instance) => instance,
-                SecondaryInstanceWrapper::ConsumerInstance(_) => panic!("cannot send producer CQE using a consumer instance"),
+            .expect("invalid SecondaryRingId: non-existent instance")
+        {
+            SecondaryInstanceWrapper::ProducerInstance(ref instance) => instance,
+            SecondaryInstanceWrapper::ConsumerInstance(_) => {
+                panic!("cannot send producer CQE using a consumer instance")
+            }
         };
         let mut producer_instance_guard = producer_instance.producer_instance.write();
         match producer_instance_guard
             .sender_mut()
             .as_64_mut()
             .unwrap()
-            .try_send(cqe) {
+            .try_send(cqe)
+        {
             Ok(()) => Ok(()),
             Err(RingPushError::Full(_)) => Err(RingPushError::Full(cqe)),
             Err(RingPushError::Shutdown(_)) => {
-                producer_instance.dropped.store(true, atomic::Ordering::Release);
+                producer_instance
+                    .dropped
+                    .store(true, atomic::Ordering::Release);
                 Err(RingPushError::Shutdown(cqe))
             }
         }
     }
-    pub fn producer_sqes(&self, instance: SecondaryRingId, capacity: usize) -> ProducerSqes {
-        let reactor = self.reactor
+    pub fn producer_sqes(&self, ring_id: SecondaryRingId, capacity: usize) -> ProducerSqes {
+        let reactor = self
+            .reactor
             .upgrade()
             .expect("failed to send producer CQE: reactor is dead");
 
-        assert_eq!(reactor.id(), instance.reactor);
+        assert_eq!(reactor.id(), ring_id.reactor);
         assert!(reactor.trusted_main_instance);
 
-        ProducerSqes {
-            state: Arc::new(Mutex::new(ProducerSqesState::Receiving {
-                capacity,
-                deque: VecDeque::with_capacity(capacity),
-                waker: None,
-            })),
-        }
+        let secondary_instances = reactor.secondary_instances.upgradable_read();
+
+        let state_opt = match secondary_instances
+            .instances
+            .get(ring_id.inner.get() - 1)
+            .unwrap()
+        {
+            SecondaryInstanceWrapper::ConsumerInstance(_) => {
+                panic!("calling producer_sqes on a consumer instance")
+            }
+            SecondaryInstanceWrapper::ProducerInstance(ref instance) => {
+                instance.stream_state.clone()
+            }
+        };
+        // TODO: Override capacity if the stream state already is present.
+
+        let state = match state_opt {
+            Some(st) => st,
+            None => {
+                let mut secondary_instances =
+                    RwLockUpgradableReadGuard::upgrade(secondary_instances);
+                match secondary_instances
+                    .instances
+                    .get_mut(ring_id.inner.get() - 1)
+                    .unwrap()
+                {
+                    SecondaryInstanceWrapper::ConsumerInstance(_) => unreachable!(),
+                    SecondaryInstanceWrapper::ProducerInstance(ref mut instance) => {
+                        let new_state = Arc::new(Mutex::new(ProducerSqesState::Receiving {
+                            capacity,
+                            deque: VecDeque::with_capacity(capacity),
+                            waker: None,
+                        }));
+
+                        instance.stream_state = Some(Arc::clone(&new_state));
+                        new_state
+                    }
+                }
+            }
+        };
+
+        ProducerSqes { state }
     }
 
     /// Create an asynchronous stream that represents the events coming from one of more file
@@ -761,11 +847,12 @@ impl Handle {
         oneshot: bool,
     ) -> FdUpdates {
         assert!(!event_flags.contains(EventFlags::EVENT_IO_URING), "only the redox_iou reactor is allowed to use this flag unless io_uring API is used directly");
-        let sqe = SqEntry64::new(IoUringSqeFlags::SUBSCRIBE, Priority::default(), (-1i64) as u64).file_update(
-            fd.try_into().unwrap(),
-            event_flags,
-            oneshot,
-        );
+        let sqe = SqEntry64::new(
+            IoUringSqeFlags::SUBSCRIBE,
+            Priority::default(),
+            (-1i64) as u64,
+        )
+        .file_update(fd.try_into().unwrap(), event_flags, oneshot);
         unsafe {
             self.send_inner(ring, sqe, true)
                 .right()
@@ -797,7 +884,11 @@ impl Handle {
     {
         let fd: u64 = fd.try_into().or(Err(Error::new(EOVERFLOW)))?;
 
-        let base_sqe = SqEntry64::new(IoUringSqeFlags::empty(), Priority::default(), (-1i64) as u64);
+        let base_sqe = SqEntry64::new(
+            IoUringSqeFlags::empty(),
+            Priority::default(),
+            (-1i64) as u64,
+        );
         let sqe = f(base_sqe, fd);
 
         let cqe = self.send(ring, sqe).await?;
@@ -818,8 +909,12 @@ impl Handle {
         path: &B,
         flags: u64,
     ) -> Result<usize> {
-        let sqe =
-            SqEntry64::new(IoUringSqeFlags::empty(), Priority::default(), (-1i64) as u64).open(path.as_ref(), flags);
+        let sqe = SqEntry64::new(
+            IoUringSqeFlags::empty(),
+            Priority::default(),
+            (-1i64) as u64,
+        )
+        .open(path.as_ref(), flags);
         let cqe = self.send(ring, sqe).await?;
         Self::completion_as_rw_io_result(cqe)
     }
@@ -893,8 +988,12 @@ impl Handle {
         fd: usize,
         flush: bool,
     ) -> Result<()> {
-        let sqe = SqEntry64::new(IoUringSqeFlags::empty(), Priority::default(), (-1i64) as u64)
-            .close(fd.try_into().or(Err(Error::new(EOVERFLOW)))?, flush);
+        let sqe = SqEntry64::new(
+            IoUringSqeFlags::empty(),
+            Priority::default(),
+            (-1i64) as u64,
+        )
+        .close(fd.try_into().or(Err(Error::new(EOVERFLOW)))?, flush);
         let cqe = self.send(ring, sqe).await?;
 
         Self::completion_as_rw_io_result(cqe)?;
@@ -921,8 +1020,12 @@ impl Handle {
         let end: u64 = range.end.try_into().or(Err(Error::new(EOVERFLOW)))?;
         let count = end.checked_sub(start).ok_or(Error::new(EINVAL))?;
 
-        let sqe = SqEntry64::new(IoUringSqeFlags::empty(), Priority::default(), (-1i64) as u64)
-            .close_many(start, count, flush);
+        let sqe = SqEntry64::new(
+            IoUringSqeFlags::empty(),
+            Priority::default(),
+            (-1i64) as u64,
+        )
+        .close_many(start, count, flush);
         let cqe = self.send(ring, sqe).await?;
 
         Self::completion_as_rw_io_result(cqe)?;
@@ -1072,7 +1175,12 @@ impl Handle {
         let cqe = self
             .send(
                 ring,
-                SqEntry64::new(IoUringSqeFlags::empty(), Priority::default(), (-1i64) as u64).dup(fd64, flags, param),
+                SqEntry64::new(
+                    IoUringSqeFlags::empty(),
+                    Priority::default(),
+                    (-1i64) as u64,
+                )
+                .dup(fd64, flags, param),
             )
             .await?;
 

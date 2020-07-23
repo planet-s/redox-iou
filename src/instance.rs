@@ -572,16 +572,32 @@ mod producer_instance {
     }
     impl GenericSender {
         pub fn as_32(&self) -> Option<&SpscSender<CqEntry32>> {
-            if let Self::Bits32(ref recv) = self { Some(recv) } else { None }
+            if let Self::Bits32(ref recv) = self {
+                Some(recv)
+            } else {
+                None
+            }
         }
         pub fn as_32_mut(&mut self) -> Option<&mut SpscSender<CqEntry32>> {
-            if let Self::Bits32(ref mut recv) = self { Some(recv) } else { None }
+            if let Self::Bits32(ref mut recv) = self {
+                Some(recv)
+            } else {
+                None
+            }
         }
         pub fn as_64(&self) -> Option<&SpscSender<CqEntry64>> {
-            if let Self::Bits64(ref recv) = self { Some(recv) } else { None }
+            if let Self::Bits64(ref recv) = self {
+                Some(recv)
+            } else {
+                None
+            }
         }
         pub fn as_64_mut(&mut self) -> Option<&mut SpscSender<CqEntry64>> {
-            if let Self::Bits64(ref mut recv) = self { Some(recv) } else { None }
+            if let Self::Bits64(ref mut recv) = self {
+                Some(recv)
+            } else {
+                None
+            }
         }
     }
     #[derive(Debug)]
@@ -591,16 +607,32 @@ mod producer_instance {
     }
     impl GenericReceiver {
         pub fn as_32(&self) -> Option<&SpscReceiver<SqEntry32>> {
-            if let Self::Bits32(ref recv) = self { Some(recv) } else { None }
+            if let Self::Bits32(ref recv) = self {
+                Some(recv)
+            } else {
+                None
+            }
         }
         pub fn as_32_mut(&mut self) -> Option<&mut SpscReceiver<SqEntry32>> {
-            if let Self::Bits32(ref mut recv) = self { Some(recv) } else { None }
+            if let Self::Bits32(ref mut recv) = self {
+                Some(recv)
+            } else {
+                None
+            }
         }
         pub fn as_64(&self) -> Option<&SpscReceiver<SqEntry64>> {
-            if let Self::Bits64(ref recv) = self { Some(recv) } else { None }
+            if let Self::Bits64(ref recv) = self {
+                Some(recv)
+            } else {
+                None
+            }
         }
         pub fn as_64_mut(&mut self) -> Option<&mut SpscReceiver<SqEntry64>> {
-            if let Self::Bits64(ref mut recv) = self { Some(recv) } else { None }
+            if let Self::Bits64(ref mut recv) = self {
+                Some(recv)
+            } else {
+                None
+            }
         }
     }
 

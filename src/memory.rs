@@ -2,8 +2,8 @@ use std::convert::{TryFrom, TryInto};
 use std::sync::{Arc, Weak};
 
 use syscall::data::Map as Mmap;
-use syscall::error::{Error, Result};
 use syscall::error::EOVERFLOW;
+use syscall::error::{Error, Result};
 use syscall::flag::MapFlags;
 use syscall::io_uring::v1::operation::DupFlags;
 use syscall::io_uring::v1::Priority;
@@ -16,7 +16,8 @@ use crate::future::{CommandFuture, CommandFutureRepr, State as CommandFutureStat
 use crate::reactor::{Handle, SecondaryRingId};
 
 pub type BufferPool<H = BufferPoolHandle, E = ()> = pool::BufferPool<H, E>;
-pub type BufferSlice<'a, G = CommandFutureGuard, H = BufferPoolHandle> = pool::BufferSlice<'a, H, G>;
+pub type BufferSlice<'a, G = CommandFutureGuard, H = BufferPoolHandle> =
+    pool::BufferSlice<'a, H, G>;
 
 pub struct BufferPoolHandle {
     fd: usize,
@@ -48,7 +49,10 @@ impl CommandFuture {
     /// Protect a slice with a future guard, preventing the memory from being reclaimed until the
     /// future has completed. This will cause the buffer slice to leak memory if dropped too early,
     /// but prevents undefined behavior.
-    pub fn guard<'a, E: Copy>(&self, slice: &mut pool::BufferSlice<'a, BufferPoolHandle, E, CommandFutureGuard>) {
+    pub fn guard<'a, E: Copy>(
+        &self,
+        slice: &mut pool::BufferSlice<'a, BufferPoolHandle, E, CommandFutureGuard>,
+    ) {
         let weak = match self.inner.repr {
             CommandFutureRepr::Direct { ref state, .. } => Arc::downgrade(state),
             CommandFutureRepr::Tagged { tag, .. } => {
@@ -63,10 +67,10 @@ impl CommandFuture {
                 }
             }
         };
-        let guard = CommandFutureGuard {
-            inner: weak,
-        };
-        slice.guard(guard).expect("cannot guard using future: another guard already present");
+        let guard = CommandFutureGuard { inner: weak };
+        slice
+            .guard(guard)
+            .expect("cannot guard using future: another guard already present");
     }
 }
 impl Handle {
@@ -116,7 +120,9 @@ impl Handle {
         let expansion = pool.begin_expand(initial_len)?;
         let pointer = expand(&pool.handle().unwrap(), expansion.offset(), expansion.len()).await?;
         assert_ne!(pointer, std::ptr::null_mut());
-        unsafe { expansion.initialize(pointer, initial_extra); }
+        unsafe {
+            expansion.initialize(pointer, initial_extra);
+        }
         Ok(pool)
     }
 }
@@ -136,12 +142,15 @@ async fn expand(handle: &BufferPoolHandle, offset: u32, len: u32) -> Result<*mut
             .await
             .map(|addr| addr as *mut u8)
         },
-        None => unsafe {
-            expand_blocking(handle.fd, offset, len, map_flags)
-        },
+        None => unsafe { expand_blocking(handle.fd, offset, len, map_flags) },
     }
 }
-unsafe fn expand_blocking(fd: usize, offset: u32, len: usize, map_flags: MapFlags) -> Result<*mut u8> {
+unsafe fn expand_blocking(
+    fd: usize,
+    offset: u32,
+    len: usize,
+    map_flags: MapFlags,
+) -> Result<*mut u8> {
     syscall::fmap(
         fd,
         &Mmap {
@@ -149,7 +158,8 @@ unsafe fn expand_blocking(fd: usize, offset: u32, len: usize, map_flags: MapFlag
             size: len,
             flags: map_flags,
         },
-    ).map(|addr| addr as *mut u8)
+    )
+    .map(|addr| addr as *mut u8)
 }
 
 #[derive(Debug)]
@@ -168,4 +178,3 @@ impl pool::Guard for CommandFutureGuard {
         }
     }
 }
-

@@ -19,6 +19,7 @@ use crate::reactor::{Reactor, RingId};
 pub(crate) type Tag = u64;
 pub(crate) type AtomicTag = AtomicU64;
 
+#[derive(Debug)]
 pub(crate) struct CommandFutureInner {
     pub(crate) ring: RingId,
     pub(crate) repr: CommandFutureRepr,
@@ -52,6 +53,7 @@ pub(crate) enum State {
     Cancelled,
 }
 
+#[derive(Debug)]
 pub(crate) enum CommandFutureRepr {
     Direct {
         state: Arc<Mutex<State>>,
@@ -162,7 +164,8 @@ impl CommandFutureInner {
             init_sqe = &mut in_state_sqe;
         }
         let instance_lock_either = reactor.instance(self.ring);
-        let instance_lock = &*instance_lock_either.expect("cannot poll CommandFuture: instance is a producer instance");
+        let instance_lock = &*instance_lock_either
+            .expect("cannot poll CommandFuture: instance is a producer instance");
 
         match &mut *state_guard {
             &mut State::Initial | &mut State::Submitting(_, _) => try_submit(
@@ -225,6 +228,7 @@ impl Future for CommandFuture {
     }
 }
 
+#[derive(Debug)]
 pub struct FdUpdates {
     inner: CommandFutureInner,
 }
@@ -240,6 +244,7 @@ impl Stream for FdUpdates {
     }
 }
 
+#[derive(Debug)]
 pub(crate) enum ProducerSqesState {
     Receiving {
         deque: VecDeque<SqEntry64>,
@@ -250,17 +255,29 @@ pub(crate) enum ProducerSqesState {
     Finished,
 }
 
+#[derive(Debug)]
 pub struct ProducerSqes {
     pub(crate) state: Arc<Mutex<ProducerSqesState>>,
 }
 impl Stream for ProducerSqes {
     type Item = Result<SqEntry64>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<Option<Self::Item>> {
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> task::Poll<Option<Self::Item>> {
         let this = self.get_mut();
         let mut state_guard = this.state.lock();
+        log::debug!(
+            "Polling ProducerSqes, currently in state {:?}",
+            &*state_guard
+        );
         match *state_guard {
-            ProducerSqesState::Receiving { ref mut deque, ref mut waker, .. } => match deque.pop_front() {
+            ProducerSqesState::Receiving {
+                ref mut deque,
+                ref mut waker,
+                ..
+            } => match deque.pop_front() {
                 Some(s) => task::Poll::Ready(Some(Ok(s))),
                 None => {
                     *waker = Some(cx.waker().clone());
