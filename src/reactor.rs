@@ -117,6 +117,12 @@ impl SecondaryInstanceWrapper {
             Self::ProducerInstance(_) => None,
         }
     }
+    pub(crate) fn as_producer_instance(&self) -> Option<&ProducerInstanceWrapper> {
+        match self {
+            Self::ConsumerInstance(_) => None,
+            Self::ProducerInstance(ref instance) => Some(instance),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -619,6 +625,60 @@ impl Reactor {
             .map(Right)
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum SubmissionSync {
+    NoSync,
+    Drain,
+    Chain,
+}
+impl Default for SubmissionSync {
+    fn default() -> Self {
+        Self::NoSync
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct SubmissionContext {
+    priority: Priority,
+    sync: SubmissionSync,
+}
+impl SubmissionContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub const fn with_priority(self, priority: Priority) -> Self {
+        Self {
+            priority,
+            .. self
+        }
+    }
+    pub const fn priority(&self) -> Priority {
+        self.priority
+    }
+    pub fn set_priority(&mut self, priority: Priority) {
+        self.priority = priority;
+    }
+    pub const fn with_sync(self, sync: SubmissionSync) -> Self {
+        Self {
+            sync,
+            .. self
+        }
+    }
+    pub const fn sync(&self) -> SubmissionSync {
+        self.sync
+    }
+    pub fn set_sync(&mut self, sync: SubmissionSync) {
+        self.sync = sync;
+    }
+}
+
+pub struct UnsafeSubmissionContext {
+    #[cfg(feature = "buffer_pool")]
+    guard: Option<crate::memory::CommandFutureGuard>,
+
+    context: SubmissionContext,
 }
 
 /// A handle to the reactor, used for creating futures.

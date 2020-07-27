@@ -1,16 +1,19 @@
+use std::borrow::{Borrow, BorrowMut};
 use std::convert::{TryFrom, TryInto};
+use std::mem::MaybeUninit;
 use std::sync::{Arc, Weak};
+use std::{mem, ops, slice};
 
 use syscall::data::Map as Mmap;
-use syscall::error::EOVERFLOW;
+use syscall::error::{EADDRINUSE, ENOMEM};
 use syscall::error::{Error, Result};
 use syscall::flag::MapFlags;
 use syscall::io_uring::v1::operation::DupFlags;
-use syscall::io_uring::v1::Priority;
+use syscall::io_uring::v1::{PoolFdEntry, Priority};
 
 use parking_lot::Mutex;
 
-use redox_buffer_pool as pool;
+pub use redox_buffer_pool as pool;
 
 use crate::future::{CommandFuture, CommandFutureRepr, State as CommandFutureState};
 use crate::reactor::{Handle, SecondaryRingId};
@@ -74,13 +77,7 @@ impl CommandFuture {
     }
 }
 impl Handle {
-    pub async fn create_buffer_pool<E: Copy>(
-        &self,
-        secondary_instance: SecondaryRingId,
-        _creation_command_priority: Priority,
-        initial_len: u32,
-        initial_extra: E,
-    ) -> Result<pool::BufferPool<BufferPoolHandle, E>> {
+    async fn create_buffer_pool_inner<E: Copy>(&self, secondary_instance: SecondaryRingId, producer: bool) -> Result<pool::BufferPool<BufferPoolHandle, E>> {
         let reactor = self
             .reactor
             .upgrade()
@@ -88,17 +85,24 @@ impl Handle {
 
         assert_eq!(reactor.id(), secondary_instance.reactor);
 
-        let ringfd = reactor
-            .secondary_instances
-            .read()
-            .instances
-            .get(secondary_instance.inner.get() - 1)
-            .expect("invalid secondary ring id")
-            .as_consumer_instance()
-            .expect("ring id represents producer instance")
-            .consumer_instance
-            .read()
-            .ringfd();
+        let ringfd = {
+            let secondary_instances = reactor.secondary_instances.read();
+            let instance = secondary_instances.instances.get(secondary_instance.inner.get() - 1).expect("invalid secondary ring id");
+
+            if producer {
+                instance.as_producer_instance()
+                    .expect("ring id represents consumer instance, but expected a producer instance")
+                    .producer_instance
+                    .read()
+                    .ringfd()
+            } else {
+                instance.as_consumer_instance()
+                    .expect("ring id represents producer instance, but expected a consumer instance")
+                    .consumer_instance
+                    .read()
+                    .ringfd()
+            }
+        };
 
         log::debug!("Running dup");
         let fd = unsafe {
@@ -112,10 +116,28 @@ impl Handle {
         .await?;
         log::debug!("Ran dup");
 
-        let pool = pool::BufferPool::new(Some(BufferPoolHandle {
+        Ok(pool::BufferPool::new(Some(BufferPoolHandle {
             reactor: Some(Handle::clone(self)),
             fd,
-        }));
+        })))
+    }
+    pub async fn create_producer_buffer_pool(
+        &self,
+        secondary_instance: SecondaryRingId,
+        _creation_command_priority: Priority,
+    ) -> Result<pool::BufferPool<BufferPoolHandle, ()>> {
+        let pool = self.create_buffer_pool_inner(secondary_instance, true).await?;
+        import(pool.handle().unwrap(), &pool).await?;
+        Ok(pool)
+    }
+    pub async fn create_buffer_pool<E: Copy>(
+        &self,
+        secondary_instance: SecondaryRingId,
+        _creation_command_priority: Priority,
+        initial_len: u32,
+        initial_extra: E,
+    ) -> Result<pool::BufferPool<BufferPoolHandle, E>> {
+        let pool = self.create_buffer_pool_inner(secondary_instance, false).await?;
 
         let expansion = pool.begin_expand(initial_len)?;
         let pointer = expand(&pool.handle().unwrap(), expansion.offset(), expansion.len()).await?;
@@ -126,9 +148,9 @@ impl Handle {
         Ok(pool)
     }
 }
-async fn expand(handle: &BufferPoolHandle, offset: u32, len: u32) -> Result<*mut u8> {
+pub async fn expand(handle: &BufferPoolHandle, offset: u32, len: u32) -> Result<*mut u8> {
     let map_flags = MapFlags::MAP_SHARED | MapFlags::PROT_READ | MapFlags::PROT_WRITE;
-    let len = usize::try_from(len).or(Err(Error::new(EOVERFLOW)))?;
+    let len = usize::try_from(len)?;
 
     match handle.reactor {
         Some(ref h) => unsafe {
@@ -145,6 +167,61 @@ async fn expand(handle: &BufferPoolHandle, offset: u32, len: u32) -> Result<*mut
         None => unsafe { expand_blocking(handle.fd, offset, len, map_flags) },
     }
 }
+pub async fn import(handle: &BufferPoolHandle, pool: &pool::BufferPool<BufferPoolHandle, ()>) -> Result<u32> {
+    let mut range_list = [PoolFdEntry::default(); 4];
+
+    let mut additional_bytes = 0u32;
+
+    loop {
+        let slice = &mut range_list[..];
+        let byte_slice = unsafe {
+            slice::from_raw_parts_mut(slice.as_mut_ptr() as *mut u8, slice.len() * mem::size_of::<PoolFdEntry>())
+        };
+
+        let bytes_read = match handle.reactor {
+            // TODO
+
+            /*Some(ref h) => unsafe {
+                h.read(
+                    h.reactor().primary_instance(),
+                    handle.fd,
+                    byte_slice,
+                ).await?
+            },*/
+            _ => syscall::read(handle.fd, byte_slice)?,
+        };
+        if bytes_read % mem::size_of::<PoolFdEntry>() != 0 {
+            log::warn!("Somehow the io_uring poolfd read a byte count not divisible by the size of PoolFd. Ignoring extra bytes.");
+        }
+        let structs_read = bytes_read / mem::size_of::<PoolFdEntry>();
+        let structs = &range_list[..structs_read];
+
+        if structs.is_empty() { break }
+
+        // TODO: Use some kind of join!, maybe.
+        for entry in structs {
+            let offset = u32::try_from(entry.offset)?;
+            let len = u32::try_from(entry.size)?;
+
+            match pool.begin_expand(len) {
+                Ok(expansion_handle) => {
+                    let pointer = expand(handle, offset, len).await?;
+                    log::debug!("importing at {} len {} => {:p}", offset, len, pointer);
+                    additional_bytes += len;
+                    unsafe { expansion_handle.initialize(pointer, ()) }
+                }
+                Err(pool::BeginExpandError) => if additional_bytes == 0 {
+                    return Err(Error::new(ENOMEM));
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(additional_bytes)
+
+}
+
 unsafe fn expand_blocking(
     fd: usize,
     offset: u32,
@@ -176,5 +253,134 @@ impl pool::Guard for CommandFutureGuard {
             // Future is not used anymore, we can safely remove the guard now.
             true
         }
+    }
+}
+
+/// A wrapper for types that can be "guarded", meaning that the memory they reference cannot be
+/// safely reclaimed or even moved out, until the guard frees it.
+pub struct Guarded<G: pool::Guard, T: 'static> {
+    inner: MaybeUninit<T>,
+    guard: Option<G>,
+}
+impl<G: pool::Guard, T: 'static> Guarded<G, T> {
+    /// Create a new guard, preventing the inner value from dropping or being moved out safely,
+    /// until the guard releases itself.
+    pub fn new(inner: T) -> Self {
+        Self {
+            inner: MaybeUninit::new(inner),
+            guard: None,
+        }
+    }
+    /// Apply a guard to the wrapper, which will make it impossible for the inner value to be moved
+    /// out (unless using unsafe of course). The memory will be leaked completely if the destructor
+    /// is called when the guard cannot release itself.
+    pub fn guard(&mut self, guard: G) {
+        assert!(self.guard.is_none());
+    }
+    /// Query whether this wrapper possesses an active guard.
+    pub fn has_guard(&self) -> bool {
+        self.guard.is_some()
+    }
+    /// Remove the guard, bypassing any safety guarantees provided by this wrapper.
+    ///
+    /// # Safety
+    ///
+    /// Since this removes the guard, this will allow the memory to be reclaimed when some other
+    /// entity could be using it simultaneously. For this not to lead to UB, the caller must not
+    /// reclaim the memory owned here unless it can absolutely be sure that the guard is no longer
+    /// needed.
+    pub unsafe fn force_unguard(&mut self) -> Option<G> {
+        self.guard.take()
+    }
+
+    /// Try to remove the guard together with the inner value, returning the wrapper if the guard
+    /// was not able to be safely released.
+    pub fn try_into_inner(mut self) -> Result<(T, Option<G>), Self> {
+        match self.try_unguard() {
+            Ok(guard_opt) => Ok({
+                let inner = unsafe { self.uninitialize_inner() };
+                mem::forget(self);
+                (inner, guard_opt)
+            }),
+            Err(_) => Err(self),
+        }
+    }
+    /// Move out the inner of this wrapper, together with the guard if there was one. The guard
+    /// will not be released, and is instead up to the caller.
+    ///
+    /// # Safety
+    ///
+    /// This is unsafe for the same reasons as with [`force_unguard`]; as the guard is left
+    /// untouched, it's completely up to the caller to ensure that the invariants required by the
+    /// guard be upheld.
+    pub unsafe fn force_into_inner(mut self) -> (T, Option<G>) {
+        let guard = self.guard.take();
+        let inner = self.uninitialize_inner();
+        mem::forget(self);
+        (inner, guard)
+    }
+
+    /// Try removing the guard in-place, failing with `EADDRINUSE` if that weren't possible.
+    pub fn try_unguard(&mut self) -> Result<Option<G>> {
+        let guard = match self.guard.as_ref() {
+            Some(g) => g,
+            None => return Ok(None),
+        };
+
+        if guard.try_release() {
+            Ok(unsafe { self.force_unguard() })
+        } else {
+            Err(Error::new(EADDRINUSE))
+        }
+    }
+    unsafe fn uninitialize_inner(&mut self) -> T {
+        mem::replace(&mut self.inner, MaybeUninit::uninit()).assume_init()
+    }
+}
+impl<G: pool::Guard, T: 'static> Drop for Guarded<G, T> {
+    fn drop(&mut self) {
+        match self.try_unguard() {
+            // Drop the inner value if the guard was able to be removed.
+            Ok(_) => drop(unsafe { self.uninitialize_inner() }),
+            // No nothing and leak the value otherwise.
+            Err(_) => (),
+        }
+    }
+}
+impl<G: pool::Guard, T: 'static> ops::Deref for Guarded<G, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.inner.get_ref() }
+    }
+}
+impl<G: pool::Guard, T: 'static> ops::DerefMut for Guarded<G, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { self.inner.get_mut() }
+    }
+}
+impl<G: pool::Guard, T: 'static> Borrow<T> for Guarded<G, T> {
+    fn borrow(&self) -> &T {
+        &*self
+    }
+}
+impl<G: pool::Guard, T: 'static> BorrowMut<T> for Guarded<G, T> {
+    fn borrow_mut(&mut self) -> &mut T {
+        &mut *self
+    }
+}
+impl<G: pool::Guard, T: 'static> AsRef<T> for Guarded<G, T> {
+    fn as_ref(&self) -> &T {
+        &*self
+    }
+}
+impl<G: pool::Guard, T: 'static> AsMut<T> for Guarded<G, T> {
+    fn as_mut(&mut self) -> &mut T {
+        &mut *self
+    }
+}
+impl<G: pool::Guard, T: 'static> From<T> for Guarded<G, T> {
+    fn from(inner: T) -> Self {
+        Self::new(inner)
     }
 }

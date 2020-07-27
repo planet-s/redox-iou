@@ -1,4 +1,5 @@
 #![feature(get_mut_unchecked, option_expect_none, vec_into_raw_parts)]
+#![cfg_attr(feature = "buffer_pool", feature(maybe_uninit_ref))]
 #![cfg_attr(test, feature(slice_fill))]
 // TODO: This lint was probably introduced before const fns even existed, and is completely useless
 // here since it's marked as "perf" while it can reduce performance in some scenarios (for debug
