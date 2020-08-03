@@ -412,18 +412,10 @@ mod consumer_instance {
     }
     impl GenericSender {
         pub fn is_32(&self) -> bool {
-            if let Self::Bits32(_) = self {
-                true
-            } else {
-                false
-            }
+            matches!(self, Self::Bits32(_))
         }
         pub fn is_64(&self) -> bool {
-            if let Self::Bits64(_) = self {
-                true
-            } else {
-                false
-            }
+            matches!(self, Self::Bits64(_))
         }
         pub fn as_32(&self) -> Option<&SpscSender<SqEntry32>> {
             match self {
@@ -458,18 +450,10 @@ mod consumer_instance {
     }
     impl GenericReceiver {
         pub fn is_32(&self) -> bool {
-            if let Self::Bits32(_) = self {
-                true
-            } else {
-                false
-            }
+            matches!(self, Self::Bits32(_))
         }
         pub fn is_64(&self) -> bool {
-            if let Self::Bits64(_) = self {
-                true
-            } else {
-                false
-            }
+            matches!(self, Self::Bits64(_))
         }
         pub fn as_32(&self) -> Option<&SpscReceiver<CqEntry32>> {
             match self {
