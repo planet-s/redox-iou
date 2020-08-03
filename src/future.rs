@@ -251,7 +251,6 @@ pub(crate) enum ProducerSqesState {
         capacity: usize,
         waker: Option<task::Waker>,
     },
-    Cancelled,
     Finished,
 }
 
@@ -284,7 +283,6 @@ impl Stream for ProducerSqes {
                     task::Poll::Pending
                 }
             },
-            ProducerSqesState::Cancelled => task::Poll::Ready(Some(Err(Error::new(ECANCELED)))),
             ProducerSqesState::Finished => task::Poll::Ready(None),
         }
     }

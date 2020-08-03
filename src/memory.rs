@@ -1,12 +1,13 @@
 use std::borrow::{Borrow, BorrowMut};
 use std::convert::{TryFrom, TryInto};
 use std::mem::MaybeUninit;
+use std::ptr::NonNull;
 use std::sync::{Arc, Weak};
 use std::{mem, ops, slice};
 
 use syscall::data::Map as Mmap;
-use syscall::error::{EADDRINUSE, ENOMEM};
 use syscall::error::{Error, Result};
+use syscall::error::{EADDRINUSE, ENOMEM, EOVERFLOW};
 use syscall::flag::MapFlags;
 use syscall::io_uring::v1::operation::DupFlags;
 use syscall::io_uring::v1::{PoolFdEntry, Priority};
@@ -18,9 +19,9 @@ pub use redox_buffer_pool as pool;
 use crate::future::{CommandFuture, CommandFutureRepr, State as CommandFutureState};
 use crate::reactor::{Handle, SecondaryRingId};
 
-pub type BufferPool<H = BufferPoolHandle, E = ()> = pool::BufferPool<H, E>;
-pub type BufferSlice<'a, G = CommandFutureGuard, H = BufferPoolHandle> =
-    pool::BufferSlice<'a, H, G>;
+pub type BufferPool<I = u32, H = BufferPoolHandle, E = ()> = pool::BufferPool<I, H, E>;
+pub type BufferSlice<'a, I, G = CommandFutureGuard, H = BufferPoolHandle> =
+    pool::BufferSlice<'a, I, H, G>;
 
 pub struct BufferPoolHandle {
     fd: usize,
@@ -52,9 +53,9 @@ impl CommandFuture {
     /// Protect a slice with a future guard, preventing the memory from being reclaimed until the
     /// future has completed. This will cause the buffer slice to leak memory if dropped too early,
     /// but prevents undefined behavior.
-    pub fn guard<'a, E: Copy>(
+    pub fn guard<'a, I: pool::Integer, E: Copy>(
         &self,
-        slice: &mut pool::BufferSlice<'a, BufferPoolHandle, E, CommandFutureGuard>,
+        slice: &mut pool::BufferSlice<'a, I, BufferPoolHandle, E, CommandFutureGuard>,
     ) {
         let weak = match self.inner.repr {
             CommandFutureRepr::Direct { ref state, .. } => Arc::downgrade(state),
@@ -77,7 +78,11 @@ impl CommandFuture {
     }
 }
 impl Handle {
-    async fn create_buffer_pool_inner<E: Copy>(&self, secondary_instance: SecondaryRingId, producer: bool) -> Result<pool::BufferPool<BufferPoolHandle, E>> {
+    async fn create_buffer_pool_inner<I: pool::Integer, E: Copy>(
+        &self,
+        secondary_instance: SecondaryRingId,
+        producer: bool,
+    ) -> Result<pool::BufferPool<I, BufferPoolHandle, E>> {
         let reactor = self
             .reactor
             .upgrade()
@@ -87,17 +92,26 @@ impl Handle {
 
         let ringfd = {
             let secondary_instances = reactor.secondary_instances.read();
-            let instance = secondary_instances.instances.get(secondary_instance.inner.get() - 1).expect("invalid secondary ring id");
+            let instance = secondary_instances
+                .instances
+                .get(secondary_instance.inner.get() - 1)
+                .expect("invalid secondary ring id");
 
             if producer {
-                instance.as_producer_instance()
-                    .expect("ring id represents consumer instance, but expected a producer instance")
+                instance
+                    .as_producer_instance()
+                    .expect(
+                        "ring id represents consumer instance, but expected a producer instance",
+                    )
                     .producer_instance
                     .read()
                     .ringfd()
             } else {
-                instance.as_consumer_instance()
-                    .expect("ring id represents producer instance, but expected a consumer instance")
+                instance
+                    .as_consumer_instance()
+                    .expect(
+                        "ring id represents producer instance, but expected a consumer instance",
+                    )
                     .consumer_instance
                     .read()
                     .ringfd()
@@ -121,36 +135,44 @@ impl Handle {
             fd,
         })))
     }
-    pub async fn create_producer_buffer_pool(
+    pub async fn create_producer_buffer_pool<I: pool::Integer + TryFrom<u64> + TryInto<usize>>(
         &self,
         secondary_instance: SecondaryRingId,
         _creation_command_priority: Priority,
-    ) -> Result<pool::BufferPool<BufferPoolHandle, ()>> {
-        let pool = self.create_buffer_pool_inner(secondary_instance, true).await?;
+    ) -> Result<pool::BufferPool<I, BufferPoolHandle, ()>> {
+        let pool = self
+            .create_buffer_pool_inner(secondary_instance, true)
+            .await?;
         import(pool.handle().unwrap(), &pool).await?;
         Ok(pool)
     }
-    pub async fn create_buffer_pool<E: Copy>(
+    pub async fn create_buffer_pool<E: Copy, I: pool::Integer + TryInto<usize> + TryInto<u64>>(
         &self,
         secondary_instance: SecondaryRingId,
         _creation_command_priority: Priority,
-        initial_len: u32,
+        initial_len: I,
         initial_extra: E,
-    ) -> Result<pool::BufferPool<BufferPoolHandle, E>> {
-        let pool = self.create_buffer_pool_inner(secondary_instance, false).await?;
+    ) -> Result<pool::BufferPool<I, BufferPoolHandle, E>> {
+        let pool = self
+            .create_buffer_pool_inner(secondary_instance, false)
+            .await?;
 
         let expansion = pool.begin_expand(initial_len)?;
-        let pointer = expand(&pool.handle().unwrap(), expansion.offset(), expansion.len()).await?;
-        assert_ne!(pointer, std::ptr::null_mut());
+        let len_usize: usize = expansion.len().try_into().or(Err(Error::new(EOVERFLOW)))?;
+        let offset_u64: u64 = expansion
+            .offset()
+            .try_into()
+            .or(Err(Error::new(EOVERFLOW)))?;
+
+        let pointer = expand(&pool.handle().unwrap(), offset_u64, len_usize).await?;
         unsafe {
-            expansion.initialize(pointer, initial_extra);
+            expansion.initialize(NonNull::new(pointer).unwrap(), initial_extra);
         }
         Ok(pool)
     }
 }
-pub async fn expand(handle: &BufferPoolHandle, offset: u32, len: u32) -> Result<*mut u8> {
+pub async fn expand(handle: &BufferPoolHandle, offset: u64, len: usize) -> Result<*mut u8> {
     let map_flags = MapFlags::MAP_SHARED | MapFlags::PROT_READ | MapFlags::PROT_WRITE;
-    let len = usize::try_from(len)?;
 
     match handle.reactor {
         Some(ref h) => unsafe {
@@ -159,7 +181,7 @@ pub async fn expand(handle: &BufferPoolHandle, offset: u32, len: u32) -> Result<
                 handle.fd,
                 map_flags,
                 len,
-                u64::from(offset),
+                offset,
             )
             .await
             .map(|addr| addr as *mut u8)
@@ -167,15 +189,21 @@ pub async fn expand(handle: &BufferPoolHandle, offset: u32, len: u32) -> Result<
         None => unsafe { expand_blocking(handle.fd, offset, len, map_flags) },
     }
 }
-pub async fn import(handle: &BufferPoolHandle, pool: &pool::BufferPool<BufferPoolHandle, ()>) -> Result<u32> {
+pub async fn import<I: pool::Integer + TryFrom<u64> + TryInto<usize>>(
+    handle: &BufferPoolHandle,
+    pool: &pool::BufferPool<I, BufferPoolHandle, ()>,
+) -> Result<I> {
     let mut range_list = [PoolFdEntry::default(); 4];
 
-    let mut additional_bytes = 0u32;
+    let mut additional_bytes = I::zero();
 
     loop {
         let slice = &mut range_list[..];
         let byte_slice = unsafe {
-            slice::from_raw_parts_mut(slice.as_mut_ptr() as *mut u8, slice.len() * mem::size_of::<PoolFdEntry>())
+            slice::from_raw_parts_mut(
+                slice.as_mut_ptr() as *mut u8,
+                slice.len() * mem::size_of::<PoolFdEntry>(),
+            )
         };
 
         let bytes_read = match handle.reactor {
@@ -196,42 +224,47 @@ pub async fn import(handle: &BufferPoolHandle, pool: &pool::BufferPool<BufferPoo
         let structs_read = bytes_read / mem::size_of::<PoolFdEntry>();
         let structs = &range_list[..structs_read];
 
-        if structs.is_empty() { break }
+        if structs.is_empty() {
+            break;
+        }
 
         // TODO: Use some kind of join!, maybe.
         for entry in structs {
-            let offset = u32::try_from(entry.offset)?;
-            let len = u32::try_from(entry.size)?;
+            let offset = u64::try_from(entry.offset).or(Err(Error::new(EOVERFLOW)))?;
+            let len_usize = usize::try_from(entry.size).or(Err(Error::new(EOVERFLOW)))?;
+            let len = I::try_from(entry.size).or(Err(Error::new(EOVERFLOW)))?;
 
             match pool.begin_expand(len) {
                 Ok(expansion_handle) => {
-                    let pointer = expand(handle, offset, len).await?;
+                    let pointer = NonNull::new(expand(handle, offset, len_usize).await?)
+                        .expect("expand yielded a null pointer");
                     log::debug!("importing at {} len {} => {:p}", offset, len, pointer);
                     additional_bytes += len;
                     unsafe { expansion_handle.initialize(pointer, ()) }
                 }
-                Err(pool::BeginExpandError) => if additional_bytes == 0 {
-                    return Err(Error::new(ENOMEM));
-                } else {
-                    break;
+                Err(pool::BeginExpandError) => {
+                    if additional_bytes == I::zero() {
+                        return Err(Error::new(ENOMEM));
+                    } else {
+                        break;
+                    }
                 }
             }
         }
     }
     Ok(additional_bytes)
-
 }
 
-unsafe fn expand_blocking(
+unsafe fn expand_blocking<I: TryInto<usize>>(
     fd: usize,
-    offset: u32,
+    offset: I,
     len: usize,
     map_flags: MapFlags,
 ) -> Result<*mut u8> {
     syscall::fmap(
         fd,
         &Mmap {
-            offset: offset.try_into().expect("why are you using a 16-bit CPU?"),
+            offset: offset.try_into().or(Err(Error::new(EOVERFLOW)))?,
             size: len,
             flags: map_flags,
         },
@@ -276,6 +309,7 @@ impl<G: pool::Guard, T: 'static> Guarded<G, T> {
     /// is called when the guard cannot release itself.
     pub fn guard(&mut self, guard: G) {
         assert!(self.guard.is_none());
+        self.guard = Some(guard);
     }
     /// Query whether this wrapper possesses an active guard.
     pub fn has_guard(&self) -> bool {

@@ -3,7 +3,7 @@ use std::convert::{TryFrom, TryInto};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{self, AtomicBool, AtomicUsize};
 use std::sync::{Arc, Weak};
-use std::{mem, task};
+use std::task;
 
 use syscall::data::IoVec;
 use syscall::error::{Error, Result};
@@ -20,7 +20,8 @@ use crossbeam_queue::ArrayQueue;
 use either::*;
 use once_cell::sync::OnceCell;
 use parking_lot::{
-    MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard,
+    MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard,
+    RwLockWriteGuard,
 };
 
 use crate::future::{
@@ -398,7 +399,13 @@ impl Reactor {
     pub(crate) fn drive_primary(&self, waker: &task::Waker, wait: bool) {
         self.drive(&self.main_instance, waker, wait, true)
     }
-    fn drive(&self, instance: &ConsumerInstanceWrapper, waker: &task::Waker, wait: bool, primary: bool) {
+    fn drive(
+        &self,
+        instance: &ConsumerInstanceWrapper,
+        waker: &task::Waker,
+        wait: bool,
+        primary: bool,
+    ) {
         let a = if wait {
             let read_guard = instance.consumer_instance.read();
             let flags = if unsafe {
@@ -547,7 +554,6 @@ impl Reactor {
                     }
                 }
                 ProducerSqesState::Finished => break,
-                ProducerSqesState::Cancelled => break,
             }
         }
     }
@@ -649,10 +655,7 @@ impl SubmissionContext {
         Self::default()
     }
     pub const fn with_priority(self, priority: Priority) -> Self {
-        Self {
-            priority,
-            .. self
-        }
+        Self { priority, ..self }
     }
     pub const fn priority(&self) -> Priority {
         self.priority
@@ -661,10 +664,7 @@ impl SubmissionContext {
         self.priority = priority;
     }
     pub const fn with_sync(self, sync: SubmissionSync) -> Self {
-        Self {
-            sync,
-            .. self
-        }
+        Self { sync, ..self }
     }
     pub const fn sync(&self) -> SubmissionSync {
         self.sync
@@ -675,9 +675,12 @@ impl SubmissionContext {
 }
 
 pub struct UnsafeSubmissionContext {
+    // TODO: Get the guard trait here regardless of whether the buffer pool feature exists.
     #[cfg(feature = "buffer_pool")]
+    #[allow(dead_code)]
     guard: Option<crate::memory::CommandFutureGuard>,
 
+    #[allow(dead_code)]
     context: SubmissionContext,
 }
 
