@@ -206,6 +206,7 @@ pub async fn import<I: pool::Integer + TryFrom<u64> + TryInto<usize>>(
             )
         };
 
+        #[allow(clippy::all)]
         let bytes_read = match handle.reactor {
             // TODO
 
@@ -230,7 +231,7 @@ pub async fn import<I: pool::Integer + TryFrom<u64> + TryInto<usize>>(
 
         // TODO: Use some kind of join!, maybe.
         for entry in structs {
-            let offset = u64::try_from(entry.offset).or(Err(Error::new(EOVERFLOW)))?;
+            let offset = entry.offset;
             let len_usize = usize::try_from(entry.size).or(Err(Error::new(EOVERFLOW)))?;
             let len = I::try_from(entry.size).or(Err(Error::new(EOVERFLOW)))?;
 
@@ -373,11 +374,11 @@ impl<G: pool::Guard, T: 'static> Guarded<G, T> {
 }
 impl<G: pool::Guard, T: 'static> Drop for Guarded<G, T> {
     fn drop(&mut self) {
-        match self.try_unguard() {
+        if self.try_unguard().is_ok() {
             // Drop the inner value if the guard was able to be removed.
-            Ok(_) => drop(unsafe { self.uninitialize_inner() }),
+            drop(unsafe { self.uninitialize_inner() })
+        } else {
             // No nothing and leak the value otherwise.
-            Err(_) => (),
         }
     }
 }

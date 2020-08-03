@@ -27,9 +27,12 @@ pub struct Executor {
 
     runqueue: Arc<Runqueue>,
 }
+
+type TaggedFutureMap = BTreeMap<usize, Pin<Box<dyn Future<Output = ()> + Send + 'static>>>;
+
 struct Runqueue {
     ready_futures: SegQueue<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
-    pending_futures: Mutex<BTreeMap<usize, Pin<Box<dyn Future<Output = ()> + Send + 'static>>>>,
+    pending_futures: Mutex<TaggedFutureMap>,
     next_pending_tag: AtomicUsize,
 }
 
