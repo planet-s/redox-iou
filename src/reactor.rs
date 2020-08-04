@@ -1203,7 +1203,7 @@ impl Handle {
     ///
     /// Refer to the invariants documented in the [`close`] call.
     ///
-    /// [`close`]: #variant.close
+    /// [`close`]: #method.close
     pub async unsafe fn close_range(
         &self,
         ring: impl Into<RingId>,
