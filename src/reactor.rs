@@ -1108,11 +1108,14 @@ impl Handle {
     /// For this to be safe, the memory range that provides the path, must not be reclaimed until
     /// the future is complete. This means that one must make sure, that between all await yield
     /// points in the future invoking this function, the path cannot be reclaimed and used for
-    /// something else. As a general recommendation, only use this together with a `ManuallyDrop`
-    /// or references which lifetimes you otherwise know will outlive the entire submission.
+    /// something else. As a general recommendation, only use this together with a
+    /// [`std::mem::ManuallyDrop`], or with references which lifetimes you otherwise know will outlive
+    /// the entire submission.
     ///
     /// It is highly recommended that the regular [`open`] call be used instead, which takes care
     /// of guarding the memory until completion.
+    ///
+    /// [`open`]: #method.open
     pub async unsafe fn open_unchecked<B>(
         &self,
         ring: impl Into<RingId>,
@@ -1132,10 +1135,14 @@ impl Handle {
     /// Open a path represented by a byte slice, returning a new file descriptor for the file at
     /// that path.
     ///
-    /// This is the safe version of [`open_raw`], but requires the path type to implement
+    /// This is the safe version of [`open_unchecked`], but requires the path type to implement
     /// [`Guardable`], which only applies for [`Guarded`] types on the heap, or static references.
     /// An optional `at` argument can also be specified, which will base the path on an open file
     /// descriptor of a directory, similar to _openat(2)_.
+    ///
+    /// [`open_unchecked`]: #method.open_unchecked
+    /// [`Guarded`]: ../memory/struct.Guarded.html
+    /// [`Guardable`]: ../memory/trait.Guardable.html
     pub async fn open<G>(
         &self,
         ring: impl Into<RingId>,
@@ -1225,6 +1232,8 @@ impl Handle {
     ///
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
+    ///
+    /// [`read`]: #method.read
     pub async unsafe fn read_unchecked(
         &self,
         ring: impl Into<RingId>,
@@ -1246,6 +1255,8 @@ impl Handle {
     /// Read bytes, returning the number of bytes read, or zero if no more bytes are available.
     ///
     /// This is the safe variant of [`read_unchecked`].
+    ///
+    /// [`read_unchecked`]: #method.read_unchecked
     pub async fn read<G>(
         &self,
         ring: impl Into<RingId>,
@@ -1275,6 +1286,7 @@ impl Handle {
     /// list of buffers, rather than one single buffer.
     ///
     /// # Safety
+    ///
     /// The caller must ensure that the buffers outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
     // TODO: safe wrapper
@@ -1305,6 +1317,8 @@ impl Handle {
     ///
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
+    ///
+    /// [`pread`]: #method.pread
     pub async unsafe fn pread_unchecked(
         &self,
         ring: impl Into<RingId>,
@@ -1327,6 +1341,8 @@ impl Handle {
     /// Read bytes from a specific offset. Does not change the file offset.
     ///
     /// This is the safe variant of [`pread_unchecked`].
+    ///
+    /// [`pread_unchecked`]: #method.pread_unchecked
     pub async fn pread<G>(
         &self,
         ring: impl Into<RingId>,
@@ -1391,6 +1407,8 @@ impl Handle {
     ///
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
+    ///
+    /// [`write`]: #method.write
     pub async unsafe fn write_unchecked(
         &self,
         ring: impl Into<RingId>,
@@ -1413,6 +1431,8 @@ impl Handle {
     /// written.
     ///
     /// This is the safe variant of the [`write_unchecked`] method.
+    ///
+    /// [`write_unchecked`]: #method.write_unchecked
     pub async fn write<G>(
         &self,
         ring: impl Into<RingId>,
@@ -1473,6 +1493,8 @@ impl Handle {
     ///
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
+    ///
+    /// [`pwrite`]: #method.pwrite
     pub async unsafe fn pwrite_unchecked(
         &self,
         ring: impl Into<RingId>,
@@ -1500,6 +1522,8 @@ impl Handle {
     ///
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
+    ///
+    /// [`pwrite_unchecked`]: #method.pwrite_unchecked
     pub async fn pwrite<G>(
         &self,
         ring: impl Into<RingId>,
@@ -1598,6 +1622,10 @@ impl Handle {
     ///
     /// This function is unsafe since it's dealing with the address space of a process, and may
     /// overwrite an existing grant, if [`MAP_FIXED`] is set and [`MAP_FIXED_NOREPLACE`] is not.
+    ///
+    /// [`MAP_FIXED`]: ../../syscall/flag/struct.MapFlags.html#associatedconstant.MAP_FIXED
+    /// [`MAP_FIXED_NOREPLACE`]:
+    /// ../../syscall/flag/struct.MapFlags.html#associatedconstant.MAP_FIXED_NOREPLACE
     #[allow(clippy::too_many_arguments)]
     pub async unsafe fn mmap2(
         &self,
@@ -1648,7 +1676,8 @@ impl Handle {
     /// is shared with another process, that could also lead to data races, however returning a
     /// pointer forwards this invariant to the caller.
     ///
-    /// [`mmap2`]: #variant.mmap2
+    /// [`mmap2`]: #method.mmap2
+    /// [`MAP_FIXED`]: ../../syscall/flag/struct.MapFlags.html#associatedconstant.MAP_FIXED
     pub async unsafe fn mmap(
         &self,
         ring: impl Into<RingId>,

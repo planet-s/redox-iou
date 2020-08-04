@@ -60,9 +60,15 @@ mod consumer_instance {
     }
     impl InstanceBuilder {
         /// Create a new instance builder.
-        pub fn new() -> Self {
+        pub const fn new() -> Self {
             Self {
-                stage: InstanceBuilderStage::Create(InstanceBuilderCreateStageInfo::default()),
+                stage: InstanceBuilderStage::Create(InstanceBuilderCreateStageInfo {
+                    minor: None,
+                    patch: None,
+                    flags: None,
+                    sq_entry_count: None,
+                    cq_entry_count: None,
+                }),
             }
         }
 
@@ -93,6 +99,8 @@ mod consumer_instance {
         /// # Panics
         ///
         /// This method will panic if called after the [`create_instance`] method.
+        ///
+        /// [`create_instance`]: #method.create_instance
         pub fn with_minor_version(mut self, minor: u8) -> Self {
             self.as_create_stage()
                 .expect("cannot set minor version after kernel io_uring instance is created")
@@ -104,6 +112,8 @@ mod consumer_instance {
         /// # Panics
         ///
         /// This method will panic if called after the [`create_instance`] method.
+        ///
+        /// [`create_instance`]: #method.create_instance
         pub fn with_patch_version(mut self, patch: u8) -> Self {
             self.as_create_stage()
                 .expect("cannot set patch version after kernel io_uring instance is created")
@@ -115,6 +125,8 @@ mod consumer_instance {
         /// # Panics
         ///
         /// This method will panic if called after the [`create_instance`] method.
+        ///
+        /// [`create_instance`]: #method.create_instance
         pub fn with_flags(mut self, flags: IoUringCreateFlags) -> Self {
             self.as_create_stage()
                 .expect("cannot set flags after kernel io_uring instance is created")
@@ -127,6 +139,8 @@ mod consumer_instance {
         /// # Panics
         ///
         /// This method will panic if called after the [`create_instance`] method.
+        ///
+        /// [`create_instance`]: #method.create_instance
         pub fn with_submission_entry_count(mut self, sq_entry_count: usize) -> Self {
             self.as_create_stage()
                 .expect("cannot set submission entry count after kernel instance is created")
@@ -139,6 +153,8 @@ mod consumer_instance {
         /// # Panics
         ///
         /// This method will panic if called after the [`create_instance`] method.
+        ///
+        /// [`create_instance`]: #method.create_instance
         pub fn with_recommended_submission_entry_count(self) -> Self {
             self.with_submission_entry_count(256)
         }
@@ -148,6 +164,8 @@ mod consumer_instance {
         /// # Panics
         ///
         /// This method will panic if called after the [`create_instance`] method.
+        ///
+        /// [`create_instance`]: #method.create_instance
         pub fn with_recommended_completion_entry_count(self) -> Self {
             self.with_completion_entry_count(256)
         }
@@ -157,6 +175,8 @@ mod consumer_instance {
         /// # Panics
         ///
         /// This method will panic if called after the [`create_instance`] method.
+        ///
+        /// [`create_instance`]: #method.create_instance
         pub fn with_completion_entry_count(mut self, cq_entry_count: usize) -> Self {
             self.as_create_stage()
                 .expect("cannot set completion entry count after kernel instance is created")
@@ -468,6 +488,9 @@ mod consumer_instance {
         /// # Panics
         ///
         /// This method will panic if the builder is not in the attaching state.
+        ///
+        /// [`attach_to_kernel`]: #method.attach_to_kernel
+        /// [`SYS_RECV_IORING`]: ../../syscall/number/constant.SYS_RECV_IORING.html
         pub fn attach<N: AsRef<[u8]>>(self, scheme_name: N) -> Result<Instance> {
             let init_flags = self.flags();
             let attach_info = self
@@ -628,6 +651,10 @@ mod consumer_instance {
         receiver: GenericReceiver,
     }
     impl Instance {
+        /// Create a new consumer instance builder, that will build this type.
+        pub const fn builder() -> InstanceBuilder {
+            InstanceBuilder::new()
+        }
         fn deinit(&mut self) -> Result<()> {
             syscall::close(self.ringfd)?;
             Ok(())
@@ -795,6 +822,8 @@ mod producer_instance {
 
     /// A wrapper type for producer instances, providing convenient management all the way from the
     /// [`SYS_RECV_IORING`] handler, to deinitialization.
+    ///
+    /// [`SYS_RECV_IORING`]: ../../syscall/number/constant.SYS_RECV_IORING.html
     #[derive(Debug)]
     pub struct Instance {
         sender: GenericSender,
@@ -805,6 +834,8 @@ mod producer_instance {
     impl Instance {
         /// Create a new instance, from the info that was part of the [`SYS_RECV_IORING`] RPC from
         /// the kernel.
+        ///
+        /// [`SYS_RECV_IORING`]: ../../syscall/number/constant.SYS_RECV_IORING.html
         pub fn new(recv_info: &IoUringRecvInfo) -> Result<Self> {
             if recv_info.version.major != 1 {
                 return Err(Error::new(ENOSYS));

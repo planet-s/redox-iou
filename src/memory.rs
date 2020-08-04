@@ -372,6 +372,8 @@ impl<G: pool::Guard, T: 'static> Guarded<G, T> {
     /// This is unsafe for the same reasons as with [`force_unguard`]; as the guard is left
     /// untouched, it's completely up to the caller to ensure that the invariants required by the
     /// guard be upheld.
+    ///
+    /// [`force_unguard`]: #method.force_unguard
     pub unsafe fn force_into_inner(mut self) -> (T, Option<G>) {
         let guard = self.guard.take();
         let inner = self.uninitialize_inner();
@@ -480,8 +482,10 @@ impl<G: pool::Guard, T: 'static> From<T> for Guarded<G, T> {
 ///   before even sending the guard, to that data.
 /// * When dropping, the data _must not_ be reclaimed, until the guard that this type has received,
 ///   is successfully released.
-/// * The inner data must implement Unpin or follow equivalent rules; if this guardable is
+/// * The inner data must implement `std::pin::Unpin` or follow equivalent rules; if this guardable is
 ///   leaked, the data must no longer be accessible (this rules out data on the stack).
+///
+/// [`try_guard`]: #method.try_guard
 pub unsafe trait Guardable<G> {
     /// Attempt to insert a guard into the guardable, if there wasn't already a guard inserted. If
     /// that were the case, error with the guard that wasn't able to be inserted.

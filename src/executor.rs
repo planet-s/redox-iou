@@ -1,10 +1,11 @@
 //! # The `redox-iou` executor.
 //!
-//! This executor simply organizes futures in a runqueue. Futures that return [`Ready`] when
-//! polled, will be kept in the "ready queue", where they are popped, and polled. If the future
-//! instead were to return [`Pending`], it will be assigned a unique internal tag, and stored in
-//! the "pending map". The waker will use this tag to remove the future from the pending map, and
-//! then reinsert it into the "ready queue", and so on.
+//! This executor simply organizes futures in a runqueue. Futures that return
+//! [`std::task::Poll::Ready`] when polled, will be kept in the "ready queue", where they are
+//! popped, and polled. If the future instead were to return [`std::task::Poll::Pending`], it will
+//! be assigned a unique internal tag, and stored in the "pending map". The waker will use this tag
+//! to remove the future from the pending map, and then reinsert it into the "ready queue", and so
+//! on.
 //!
 //! The executor can also by default, have the reactor integrated into it. This will most likely be
 //! more performant if not more lightweight, since the reactor can do its work when all futures
