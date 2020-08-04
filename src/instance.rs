@@ -19,7 +19,7 @@ mod consumer_instance {
 
     use crate::ring::{SpscReceiver, SpscSender};
 
-    #[derive(Default)]
+    #[derive(Debug, Default)]
     struct InstanceBuilderCreateStageInfo {
         minor: Option<u8>,
         patch: Option<u8>,
@@ -27,6 +27,7 @@ mod consumer_instance {
         sq_entry_count: Option<usize>,
         cq_entry_count: Option<usize>,
     }
+    #[derive(Debug)]
     struct InstanceBuilderMmapStageInfo {
         create_info: IoUringCreateInfo,
         ringfd: usize,
@@ -35,6 +36,7 @@ mod consumer_instance {
         cr_virtaddr: Option<usize>,
         ce_virtaddr: Option<usize>,
     }
+    #[derive(Debug)]
     struct InstanceBuilderAttachStageInfo {
         create_info: IoUringCreateInfo,
         ringfd: usize,
@@ -43,15 +45,21 @@ mod consumer_instance {
         cr_virtaddr: usize,
         ce_virtaddr: usize,
     }
+    #[derive(Debug)]
     enum InstanceBuilderStage {
         Create(InstanceBuilderCreateStageInfo),
         Mmap(InstanceBuilderMmapStageInfo),
         Attach(InstanceBuilderAttachStageInfo),
     }
+    /// A builder for consumer instances, that cases care of all necessary initialization steps,
+    /// including retrieval of the ring instance file descriptor, mmaps, and finally the attachment
+    /// to a scheme or kernel.
+    #[derive(Debug)]
     pub struct InstanceBuilder {
         stage: InstanceBuilderStage,
     }
     impl InstanceBuilder {
+        /// Create a new instance builder.
         pub fn new() -> Self {
             Self {
                 stage: InstanceBuilderStage::Create(InstanceBuilderCreateStageInfo::default()),
@@ -80,42 +88,82 @@ mod consumer_instance {
             }
         }
 
+        /// Set the SemVer-compatible minor version of the interface to use.
+        ///
+        /// # Panics
+        ///
+        /// This method will panic if called after the [`create_instance`] method.
         pub fn with_minor_version(mut self, minor: u8) -> Self {
             self.as_create_stage()
                 .expect("cannot set minor version after kernel io_uring instance is created")
                 .minor = Some(minor);
             self
         }
+        /// Set the SemVer-compatible patch version of the interface to use.
+        ///
+        /// # Panics
+        ///
+        /// This method will panic if called after the [`create_instance`] method.
         pub fn with_patch_version(mut self, patch: u8) -> Self {
             self.as_create_stage()
                 .expect("cannot set patch version after kernel io_uring instance is created")
                 .patch = Some(patch);
             self
         }
+        /// Set the flags used when creating the io_uring.
+        ///
+        /// # Panics
+        ///
+        /// This method will panic if called after the [`create_instance`] method.
         pub fn with_flags(mut self, flags: IoUringCreateFlags) -> Self {
             self.as_create_stage()
                 .expect("cannot set flags after kernel io_uring instance is created")
                 .flags = Some(flags);
             self
         }
+        /// Set the submission entry count. Note that it only makes sense for the count, multiplied
+        /// by the entry type (depending on the flags), to be divisible by the page size.
+        ///
+        /// # Panics
+        ///
+        /// This method will panic if called after the [`create_instance`] method.
         pub fn with_submission_entry_count(mut self, sq_entry_count: usize) -> Self {
             self.as_create_stage()
                 .expect("cannot set submission entry count after kernel instance is created")
                 .sq_entry_count = Some(sq_entry_count);
             self
         }
+        /// Use the recommended submission entry count. This may change in the future, but is
+        /// currently 256.
+        ///
+        /// # Panics
+        ///
+        /// This method will panic if called after the [`create_instance`] method.
         pub fn with_recommended_submission_entry_count(self) -> Self {
             self.with_submission_entry_count(256)
         }
+        /// Use the recommended completion entry count. This may change in the future, but is
+        /// currently 256.
+        ///
+        /// # Panics
+        ///
+        /// This method will panic if called after the [`create_instance`] method.
         pub fn with_recommended_completion_entry_count(self) -> Self {
             self.with_completion_entry_count(256)
         }
+        /// Set the completion entry count. Note that it only makes sense for the count, multiplied
+        /// by the entry type (depending on the flags), to be divisible by the page size.
+        ///
+        /// # Panics
+        ///
+        /// This method will panic if called after the [`create_instance`] method.
         pub fn with_completion_entry_count(mut self, cq_entry_count: usize) -> Self {
             self.as_create_stage()
                 .expect("cannot set completion entry count after kernel instance is created")
                 .cq_entry_count = Some(cq_entry_count);
             self
         }
+        /// Get the currently-used version, which is the default version unless overriden.
         pub fn version(&self) -> IoUringVersion {
             match &self.stage {
                 &InstanceBuilderStage::Create(ref info) => IoUringVersion {
@@ -133,6 +181,8 @@ mod consumer_instance {
                 }) => create_info.version,
             }
         }
+        /// Get the currently-specified flags, or an empty set of flags if none have yet been
+        /// specified.
         pub fn flags(&self) -> IoUringCreateFlags {
             match &self.stage {
                 &InstanceBuilderStage::Create(ref info) => {
@@ -149,6 +199,7 @@ mod consumer_instance {
                     .expect("invalid io_uring flag bits"),
             }
         }
+        /// Get the size in bytes, of the submission entry type.
         pub fn submission_entry_size(&self) -> usize {
             if self.flags().contains(IoUringCreateFlags::BITS_32) {
                 mem::size_of::<SqEntry32>()
@@ -156,6 +207,7 @@ mod consumer_instance {
                 mem::size_of::<SqEntry64>()
             }
         }
+        /// Get the size in bytes, of the completion entry type.
         pub fn completion_entry_size(&self) -> usize {
             if self.flags().contains(IoUringCreateFlags::BITS_32) {
                 mem::size_of::<CqEntry32>()
@@ -163,6 +215,7 @@ mod consumer_instance {
                 mem::size_of::<CqEntry64>()
             }
         }
+        /// Get the number of submission entries, currently specified.
         pub fn submission_entry_count(&self) -> usize {
             match &self.stage {
                 InstanceBuilderStage::Create(ref info) => info
@@ -172,6 +225,7 @@ mod consumer_instance {
                 InstanceBuilderStage::Attach(ref info) => info.create_info.sq_entry_count,
             }
         }
+        /// Get the number of completion entries, currently specified.
         pub fn completion_entry_count(&self) -> usize {
             match &self.stage {
                 InstanceBuilderStage::Create(ref info) => info
@@ -181,16 +235,22 @@ mod consumer_instance {
                 InstanceBuilderStage::Attach(ref info) => info.create_info.cq_entry_count,
             }
         }
+        /// Get the size in bytes, that the ring header ([`Ring`]), will occupy. This is always
+        /// rounded up to the page size.
         pub fn ring_header_size(&self) -> usize {
             // TODO: Bring PAGE_SIZE to syscall
             4096
         }
+        /// Get the number of bytes that will be occupied for storing the submission entries.
         pub fn submission_entries_bytesize(&self) -> usize {
             (self.submission_entry_count() * self.submission_entry_size() + 4095) / 4096 * 4096
         }
+        /// Get the number of bytes that will be occupied for storing the completion entries.
         pub fn completion_entries_bytesize(&self) -> usize {
             (self.submission_entry_count() * self.submission_entry_size() + 4095) / 4096 * 4096
         }
+        /// Get the create info that has been used or is going to be used during instance creation,
+        /// depending on the current builder stage.
         pub fn create_info(&self) -> IoUringCreateInfo {
             match self.stage {
                 InstanceBuilderStage::Create(_) => IoUringCreateInfo {
@@ -205,6 +265,8 @@ mod consumer_instance {
                 InstanceBuilderStage::Attach(ref info) => info.create_info,
             }
         }
+        /// Create an instance based on the current options, transitioning the stage of this
+        /// builder from the creating stage, into the mmapping stage.
         pub fn create_instance(mut self) -> Result<Self> {
             let ringfd = syscall::open("io_uring:instance", O_CREAT | O_CLOEXEC | O_RDWR)?;
             let create_info = self.create_info();
@@ -280,6 +342,11 @@ mod consumer_instance {
 
             Ok(self)
         }
+        /// Map the submission ring header into memory.
+        ///
+        /// # Panics
+        ///
+        /// This will panic if the builder is not currently in the mmapping stage.
         pub fn map_submission_ring_header(self) -> Result<Self> {
             let len = self.ring_header_size();
             self.mmap(
@@ -297,6 +364,11 @@ mod consumer_instance {
                 },
             )
         }
+        /// Map the completion ring header into memory.
+        ///
+        /// # Panics
+        ///
+        /// This will panic if the builder is not currently in the mmapping stage.
         pub fn map_completion_ring_header(self) -> Result<Self> {
             let len = self.ring_header_size();
             self.mmap(
@@ -314,6 +386,11 @@ mod consumer_instance {
                 },
             )
         }
+        /// Map the submission entries into memory.
+        ///
+        /// # Panics
+        ///
+        /// This will panic if the builder is not currently in the mmapping stage.
         pub fn map_submission_entries(self) -> Result<Self> {
             let len = self.submission_entries_bytesize();
             self.mmap(
@@ -331,6 +408,11 @@ mod consumer_instance {
                 },
             )
         }
+        /// Map the completion entries into memory.
+        ///
+        /// # Panics
+        ///
+        /// This will panic if the builder is not currently in the mmapping stage.
         pub fn map_completion_entries(self) -> Result<Self> {
             let len = self.completion_entries_bytesize();
             self.mmap(
@@ -348,19 +430,45 @@ mod consumer_instance {
                 },
             )
         }
+        /// Map all the necessary memory locations; this includes the submission ring header, the
+        /// submission entries, the completion ring header, and the completion entries.
+        ///
+        /// When all these are mmapped (which can also be accomplished by mmapping them
+        /// separately), the builder will transition from the mmapping stage, into the attaching
+        /// state.
+        ///
+        /// # Panics
+        ///
+        /// This will panic if the builder is not currently in the mmapping stage.
         pub fn map_all(self) -> Result<Self> {
             self.map_submission_ring_header()?
                 .map_submission_entries()?
                 .map_completion_ring_header()?
                 .map_completion_entries()
         }
-        pub fn attach<N: AsRef<str>>(self, scheme_name: N) -> Result<Instance> {
-            self.attach_raw(scheme_name.as_ref().as_bytes())
-        }
+        /// Attach the ring to a kernel, effectively creating a userspace-to-kernel ring.
+        ///
+        /// When this method is complete, the builder transitions from the attaching state into its
+        /// finished state, yielding a ready-to-use consumer instance.
+        ///
+        /// # Panics
+        ///
+        /// This method will panic if the builder is not in the attaching state.
         pub fn attach_to_kernel(self) -> Result<Instance> {
-            self.attach_raw(b":")
+            self.attach(b":")
         }
-        pub fn attach_raw<N: AsRef<[u8]>>(self, scheme_name: N) -> Result<Instance> {
+        /// Attach the ring to a userspace scheme, or the kernel with the scheme name ":" (in which
+        /// case [`attach_to_kernel`] is preferred). If this attaches to a userspace scheme, the
+        /// kernel will RPC into that process, with the [`SYS_RECV_IORING`] scheme handler,
+        /// creating a userspace-to-userspace ring.
+        ///
+        /// When this method is complete, the builder transitions from the attaching state into its
+        /// finished state, yielding a ready-to-use consumer instance.
+        ///
+        /// # Panics
+        ///
+        /// This method will panic if the builder is not in the attaching state.
+        pub fn attach<N: AsRef<[u8]>>(self, scheme_name: N) -> Result<Instance> {
             let init_flags = self.flags();
             let attach_info = self
                 .consume_attach_state()
@@ -405,36 +513,51 @@ mod consumer_instance {
             Self::new()
         }
     }
+    /// The possible different types of senders (which for consumers, are always submission rings),
+    /// with either 32-bit or 64-bit entry types.
     #[derive(Debug)]
     pub enum GenericSender {
+        /// A sender using [`SqEntry32`], which is uncommon, but lightweight.
         Bits32(SpscSender<SqEntry32>),
+        /// A sender using [`SqEntry64`], which is the recommended as it is more versatile, and
+        /// allows larger parameters, but is heavier to use.
         Bits64(SpscSender<SqEntry64>),
     }
     impl GenericSender {
+        /// Check whether the 32-bit entry type is used.
         pub fn is_32(&self) -> bool {
             matches!(self, Self::Bits32(_))
         }
+        /// Check whether the 64-bit entry type is used.
         pub fn is_64(&self) -> bool {
             matches!(self, Self::Bits64(_))
         }
+        /// Cast this into a sender with the 32-bit entry type, if it had that type, by an
+        /// immutable reference.
         pub fn as_32(&self) -> Option<&SpscSender<SqEntry32>> {
             match self {
                 Self::Bits32(ref s) => Some(s),
                 _ => None,
             }
         }
+        /// Cast this into a sender with the 64-bit entry type, if it had that type, by an
+        /// immutable reference.
         pub fn as_64(&self) -> Option<&SpscSender<SqEntry64>> {
             match self {
                 Self::Bits64(ref s) => Some(s),
                 _ => None,
             }
         }
+        /// Cast this into a sender with the 32-bit entry type, if it had that type, by a mutable
+        /// reference.
         pub fn as_32_mut(&mut self) -> Option<&mut SpscSender<SqEntry32>> {
             match self {
                 Self::Bits32(ref mut s) => Some(s),
                 _ => None,
             }
         }
+        /// Cast this into a sender with the 64-bit entry type, if it had that type, by a mutable
+        /// reference.
         pub fn as_64_mut(&mut self) -> Option<&mut SpscSender<SqEntry64>> {
             match self {
                 Self::Bits64(ref mut s) => Some(s),
@@ -443,36 +566,51 @@ mod consumer_instance {
         }
     }
 
+    /// The possible entry types that a consumer instance can use, for the receiver of a completion
+    /// ring.
     #[derive(Debug)]
     pub enum GenericReceiver {
+        /// A receiver with [`CqEntry32`], which is uncommon, but lightweight.
         Bits32(SpscReceiver<CqEntry32>),
+        /// A receiver with [`CqEntry64`], which is more versatile and allows larger parameters,
+        /// but is heavier and takes up more space.
         Bits64(SpscReceiver<CqEntry64>),
     }
     impl GenericReceiver {
+        /// Check whether the the receiver uses the 32-bit entry type.
         pub fn is_32(&self) -> bool {
             matches!(self, Self::Bits32(_))
         }
+        /// Check whether the the receiver uses the 64-bit entry type.
         pub fn is_64(&self) -> bool {
             matches!(self, Self::Bits64(_))
         }
+        /// Cast this entry type into a sender with the 32-bit entry type, if it had that type, by
+        /// an immutable reference.
         pub fn as_32(&self) -> Option<&SpscReceiver<CqEntry32>> {
             match self {
                 Self::Bits32(ref s) => Some(s),
                 _ => None,
             }
         }
+        /// Cast this entry type into a sender with the 64-bit entry type, if it had that type, by
+        /// an immutable reference.
         pub fn as_64(&self) -> Option<&SpscReceiver<CqEntry64>> {
             match self {
                 Self::Bits64(ref s) => Some(s),
                 _ => None,
             }
         }
+        /// Cast this entry type into a sender with the 32-bit entry type, if it had that type, by
+        /// a mutable reference.
         pub fn as_32_mut(&mut self) -> Option<&mut SpscReceiver<CqEntry32>> {
             match self {
                 Self::Bits32(ref mut s) => Some(s),
                 _ => None,
             }
         }
+        /// Cast this entry type into a sender with the 64-bit entry type, if it had that type, by
+        /// a mutable reference.
         pub fn as_64_mut(&mut self) -> Option<&mut SpscReceiver<CqEntry64>> {
             match self {
                 Self::Bits64(ref mut s) => Some(s),
@@ -481,6 +619,7 @@ mod consumer_instance {
         }
     }
 
+    /// A wrapper for consumer instances, that provides convenient setup and management.
     #[derive(Debug)]
     pub struct Instance {
         ringfd: usize,
@@ -493,23 +632,31 @@ mod consumer_instance {
             syscall::close(self.ringfd)?;
             Ok(())
         }
+        /// Take the sender for the submission ring, immutably.
         pub fn sender_mut(&mut self) -> &mut GenericSender {
             &mut self.sender
         }
+        /// Take the receiver for the completion ring, mutably.
         pub fn receiver_mut(&mut self) -> &mut GenericReceiver {
             &mut self.receiver
         }
+        /// Take the sender for the submission ring, immutably.
         pub fn sender(&self) -> &GenericSender {
             &self.sender
         }
+        /// Take the receiver for the completion ring, immutably.
         pub fn receiver(&self) -> &GenericReceiver {
             &self.receiver
         }
+        /// Close the instance, causing the kernel to shut down the ring if it wasn't already. This
+        /// is equivalent to the Drop handler, but is recommended in lieu, as it allows getting a
+        /// potential error code rather than silently dropping the error.
         pub fn close(mut self) -> Result<()> {
             self.deinit()?;
             mem::forget(self);
             Ok(())
         }
+        /// Get the file descriptor that represents the io_uring instance by the kernel.
         pub fn ringfd(&self) -> usize {
             self.ringfd
         }
@@ -549,12 +696,19 @@ mod producer_instance {
 
     use crate::ring::{SpscReceiver, SpscSender};
 
+    /// The possible different types of senders (which for producers, are always completion rings)
+    /// for producer instances, with either 32-bit or 64-bit completion entries.
     #[derive(Debug)]
     pub enum GenericSender {
+        /// A sender using [`CqEntry32`], which is uncommon but lightweight (16 bytes).
         Bits32(SpscSender<CqEntry32>),
+        /// A sender using [`CqEntry64`], which is more versatile and the recommended, but heavier
+        /// (32 bytes).
         Bits64(SpscSender<CqEntry64>),
     }
     impl GenericSender {
+        /// Cast this enum into the 32-bit variant, if it currently has that value, by a shared
+        /// reference.
         pub fn as_32(&self) -> Option<&SpscSender<CqEntry32>> {
             if let Self::Bits32(ref recv) = self {
                 Some(recv)
@@ -562,6 +716,8 @@ mod producer_instance {
                 None
             }
         }
+        /// Cast this enum into the 32-bit variant, if it currently has that value, by an exclusive
+        /// reference.
         pub fn as_32_mut(&mut self) -> Option<&mut SpscSender<CqEntry32>> {
             if let Self::Bits32(ref mut recv) = self {
                 Some(recv)
@@ -569,6 +725,8 @@ mod producer_instance {
                 None
             }
         }
+        /// Cast this enum into the 64-bit variant, if it currently has that value, by a shared
+        /// reference.
         pub fn as_64(&self) -> Option<&SpscSender<CqEntry64>> {
             if let Self::Bits64(ref recv) = self {
                 Some(recv)
@@ -576,6 +734,8 @@ mod producer_instance {
                 None
             }
         }
+        /// Cast this enum into the 64-bit variant, if it currently has that value, by an exclusive
+        /// reference.
         pub fn as_64_mut(&mut self) -> Option<&mut SpscSender<CqEntry64>> {
             if let Self::Bits64(ref mut recv) = self {
                 Some(recv)
@@ -584,12 +744,19 @@ mod producer_instance {
             }
         }
     }
+    /// The possible different types of receives (which for producers, are always submission
+    /// rings), for producers.
     #[derive(Debug)]
     pub enum GenericReceiver {
+        /// A receiver using [`SqEntry32`], which is uncommon but lightweight.
         Bits32(SpscReceiver<SqEntry32>),
+        /// A receiver using [`SqEntry64`], which is more versatile (accepts 64-bit pointers more
+        /// often, for instance), but heavier.
         Bits64(SpscReceiver<SqEntry64>),
     }
     impl GenericReceiver {
+        /// Cast this enum into the 32-bit variant, if it currently has that value, by a shared
+        /// reference.
         pub fn as_32(&self) -> Option<&SpscReceiver<SqEntry32>> {
             if let Self::Bits32(ref recv) = self {
                 Some(recv)
@@ -597,6 +764,8 @@ mod producer_instance {
                 None
             }
         }
+        /// Cast this enum into the 32-bit variant, if it currently has that value, by an exclusive
+        /// reference.
         pub fn as_32_mut(&mut self) -> Option<&mut SpscReceiver<SqEntry32>> {
             if let Self::Bits32(ref mut recv) = self {
                 Some(recv)
@@ -604,6 +773,8 @@ mod producer_instance {
                 None
             }
         }
+        /// Cast this enum into the 64-bit variant, if it currently has that value, by a shared
+        /// reference.
         pub fn as_64(&self) -> Option<&SpscReceiver<SqEntry64>> {
             if let Self::Bits64(ref recv) = self {
                 Some(recv)
@@ -611,6 +782,8 @@ mod producer_instance {
                 None
             }
         }
+        /// Cast this enum into the 64-bit variant, if it currently has that value, by an exclusive
+        /// reference.
         pub fn as_64_mut(&mut self) -> Option<&mut SpscReceiver<SqEntry64>> {
             if let Self::Bits64(ref mut recv) = self {
                 Some(recv)
@@ -620,6 +793,8 @@ mod producer_instance {
         }
     }
 
+    /// A wrapper type for producer instances, providing convenient management all the way from the
+    /// [`SYS_RECV_IORING`] handler, to deinitialization.
     #[derive(Debug)]
     pub struct Instance {
         sender: GenericSender,
@@ -628,6 +803,8 @@ mod producer_instance {
     }
 
     impl Instance {
+        /// Create a new instance, from the info that was part of the [`SYS_RECV_IORING`] RPC from
+        /// the kernel.
         pub fn new(recv_info: &IoUringRecvInfo) -> Result<Self> {
             if recv_info.version.major != 1 {
                 return Err(Error::new(ENOSYS));
@@ -665,18 +842,23 @@ mod producer_instance {
                 ringfd: recv_info.producerfd,
             })
         }
+        /// Take the sender of the completion ring, mutably.
         pub fn sender_mut(&mut self) -> &mut GenericSender {
             &mut self.sender
         }
+        /// Take the sender of the completion ring, immutably.
         pub fn sender(&self) -> &GenericSender {
             &self.sender
         }
+        /// Take the receiver of the submission ring, mutably.
         pub fn receiver_mut(&mut self) -> &mut GenericReceiver {
             &mut self.receiver
         }
+        /// Take the receiver of the submission ring, immutably.
         pub fn receiver(&self) -> &GenericReceiver {
             &self.receiver
         }
+        /// Get the file descriptor that is tied to the instance and the rings, by the kernel.
         pub fn ringfd(&self) -> usize {
             self.ringfd
         }

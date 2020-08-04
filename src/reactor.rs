@@ -1,3 +1,15 @@
+/// # The `redox-iou` reactor.
+///
+/// This reactor is based on one or more `io_uring`s; either, a userspace-to-userspace ring is
+/// used, or a userspace-to-kernel ring is used, together with zero or more additional secondary
+/// userspace-to-userspace or kernel-to-userspace rings.
+///
+/// The reactor will poll the rings by trying to pop entries from it. If there are no available
+/// entries to pop, it will invoke `SYS_ENTER_IORING` on the main ring file descriptor, causing the
+/// current thread to halt, until the kernel wakes it up when new entries have been pushed, or when
+/// a previously full ring has had entries popped from it. Other threads can also wake up the
+/// reactor, and hence the executor in case the reactor is integrated, by incrementing the epoch
+/// count of the main ring, followed by a `SYS_ENTER_IORING` syscall.
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::{TryFrom, TryInto};
 use std::num::NonZeroUsize;
@@ -29,8 +41,15 @@ use crate::future::{
     ProducerSqesState, State, Tag,
 };
 use crate::instance::{ConsumerInstance, ProducerInstance};
+use crate::memory::Guardable;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub use redox_buffer_pool::NoGuard;
+
+/// A unique ID that every reactor gets upon initialization.
+///
+/// This type implements various traits that allow the ID to be checked against other IDs, compared
+/// (reactors created later will have larger IDs), and hashed.
+#[derive(Clone, Copy, Debug, Hash, Ord, Eq, PartialEq, PartialOrd)]
 pub struct ReactorId {
     inner: usize,
 }
@@ -133,6 +152,8 @@ pub(crate) struct SecondaryInstancesWrapper {
     fds_backref: BTreeMap<usize, usize>,
 }
 
+/// An ID that can uniquely identify the reactor that uses a ring, as well as the ring within that
+/// reactor itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RingId {
     pub(crate) reactor: ReactorId,
@@ -140,33 +161,41 @@ pub struct RingId {
     // vec, plus 1.
     pub(crate) inner: usize,
 }
+/// A ring ID that is guaranteed to be a secondary ring of a reactor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SecondaryRingId {
     pub(crate) reactor: ReactorId,
     // the index into the secondary array, plus 1
     pub(crate) inner: NonZeroUsize,
 }
+/// A ring ID that is guaranteed to be the primary ring of a reactor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrimaryRingId {
     pub(crate) reactor: ReactorId,
 }
 impl PrimaryRingId {
+    /// Get the unique reactor ID using this ring.
     pub fn reactor(&self) -> ReactorId {
         self.reactor
     }
 }
 impl SecondaryRingId {
+    /// Get the unique reactor ID using this ring.
     pub fn reactor(&self) -> ReactorId {
         self.reactor
     }
 }
 impl RingId {
+    /// Get an ID that can uniquely identify the reactor that uses this ring.
     pub fn reactor(&self) -> ReactorId {
         self.reactor
     }
+    /// Check whether the ring is the primary ring.
     pub fn is_primary(&self) -> bool {
         self.inner == 0
     }
+    /// Check whether the ring is a secondary ring (a userspace-to-userspace or kernel-to-userspace
+    /// ring, controlled by the main userspace-to-kernel ring), or false if it's the primary ring.
     pub fn is_secondary(&self) -> bool {
         self.inner > 0
     }
@@ -210,6 +239,7 @@ impl From<SecondaryRingId> for RingId {
 }
 
 /// A builder that configures the reactor.
+#[derive(Debug)]
 pub struct ReactorBuilder {
     trusted_instance: bool,
     primary_instance: Option<ConsumerInstance>,
@@ -303,10 +333,13 @@ impl Reactor {
         }
         reactor_arc
     }
+    /// Retrieve the ring ID of the primary instance, which must be a userspace-to-kernel ring if
+    /// there are more than one rings in the reactor.
     pub fn primary_instance(&self) -> PrimaryRingId {
         PrimaryRingId { reactor: self.id }
     }
-    /// Obtain a handle to this reactor, capable of creating futures that use it.
+    /// Obtain a handle to this reactor, capable of creating futures that use it. The handle will
+    /// be weakly owned, and panic on regular operations if this reactor is dropped.
     pub fn handle(&self) -> Handle {
         Handle {
             reactor: Weak::clone(self.weak_ref.get().unwrap()),
@@ -377,6 +410,9 @@ impl Reactor {
             inner: NonZeroUsize::new(guard.instances.len()).unwrap(),
         })
     }
+    /// Add a producer instance (the producer of a userspace-to-userspace or kernel-to-userspace
+    /// instance). This will use the main ring to register interest in file updates on the file
+    /// descriptor of this ring.
     pub fn add_producer_instance(
         &self,
         instance: ProducerInstance,
@@ -393,6 +429,7 @@ impl Reactor {
             priority,
         )
     }
+    /// Retrieve the unique ID of this reactor.
     pub fn id(&self) -> ReactorId {
         self.id
     }
@@ -633,56 +670,95 @@ impl Reactor {
     }
 }
 
+/// The type of synchronization needed prior to handling a submission queue entry, if any.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SubmissionSync {
+    /// Do not synchronize this SQE; instead, allow SQE reordering between both preceding and
+    /// succeeding SQEs.
     NoSync,
+    /// Do a full pipeline barrier, requiring _every_ SQE prior to this SQE to complete (i.e. have
+    /// its CQE pushed), before this SQE can be handled.
     Drain,
+    /// Do a partial pipeline barrier, by requiring the SQE before this SQE to complete prior to
+    /// handling this SQE.
     Chain,
+    // TODO: Add support for speculative (I hope I don't make io_uring Turing-complete and
+    // vulnerable to Spectre) execution of subsequent SQEs, so long as they don't affect or are
+    // affected by the results of submissions on the other side of the barrier.
 }
+
+impl SubmissionSync {
+    /// Get the SQE flags that would be used for an SQE that has the same synchronization options
+    /// as specified here. Note that the flags here only change the how the SQE is synchronized, so
+    /// one might need to OR these flags with some other flags.
+    pub fn sqe_flags(self) -> IoUringSqeFlags {
+        match self {
+            Self::NoSync => IoUringSqeFlags::empty(),
+            Self::Drain => IoUringSqeFlags::DRAIN,
+            Self::Chain => IoUringSqeFlags::CHAIN,
+        }
+    }
+}
+
 impl Default for SubmissionSync {
     fn default() -> Self {
         Self::NoSync
     }
 }
 
+/// The context for a submission, containing information such as priority, synchronization, and the
+/// guard that is set once the actual future gets constructed.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct SubmissionContext {
     priority: Priority,
     sync: SubmissionSync,
 }
 impl SubmissionContext {
+    /// Create a new submission context, using a non-specified priority and with no explicit
+    /// synchronization.
     pub fn new() -> Self {
         Self::default()
     }
-    pub const fn with_priority(self, priority: Priority) -> Self {
+    /// Set the priority of this submission, taking self by value.
+    pub fn with_priority(self, priority: Priority) -> Self {
         Self { priority, ..self }
     }
+    /// Get the priority of this submission.
     pub const fn priority(&self) -> Priority {
         self.priority
     }
+    /// Set the priority of this submission, by reference.
     pub fn set_priority(&mut self, priority: Priority) {
         self.priority = priority;
     }
-    pub const fn with_sync(self, sync: SubmissionSync) -> Self {
+    /// Set the synchronization mode of this submission, taking self by value.
+    pub fn with_sync(self, sync: SubmissionSync) -> Self {
         Self { sync, ..self }
     }
+    /// Retrieve the synchronization of this submission.
     pub const fn sync(&self) -> SubmissionSync {
         self.sync
     }
+    /// Set the synchronization mode of this submission, taking self by reference.
     pub fn set_sync(&mut self, sync: SubmissionSync) {
         self.sync = sync;
     }
 }
 
-pub struct UnsafeSubmissionContext {
-    // TODO: Get the guard trait here regardless of whether the buffer pool feature exists.
-    #[cfg(feature = "buffer_pool")]
-    #[allow(dead_code)]
-    guard: Option<crate::memory::CommandFutureGuard>,
+pub use crate::memory::CommandFutureGuard as DefaultSubmissionGuard;
 
-    #[allow(dead_code)]
-    context: SubmissionContext,
+mod private {
+    pub trait Sealed {}
 }
+
+/// A trait for allowed submission guard types, restricted to either `NoGuard` and
+/// [`DefaultSubmissionGuard`].
+pub trait SubmissionGuard: private::Sealed + redox_buffer_pool::Guard {}
+
+impl private::Sealed for redox_buffer_pool::NoGuard {}
+impl private::Sealed for DefaultSubmissionGuard {}
+impl SubmissionGuard for redox_buffer_pool::NoGuard {}
+impl SubmissionGuard for DefaultSubmissionGuard {}
 
 /// A handle to the reactor, used for creating futures.
 #[derive(Clone, Debug)]
@@ -702,7 +778,6 @@ impl Handle {
             .expect("couldn't retrieve reactor from Handle: reactor is dead")
     }
 
-    ///
     /// Get a future which represents submitting a command, and then waiting for it to complete. If
     /// this executor was built with `assume_trusted_instance`, the user data field of the sqe will
     /// be overridden, so that it can store the pointer to the state.
@@ -715,7 +790,6 @@ impl Handle {
     ///
     /// Additionally, the buffers used may point to invalid locations on the stack or heap, which
     /// is UB.
-    ///
     pub unsafe fn send(&self, ring: impl Into<RingId>, sqe: SqEntry64) -> CommandFuture {
         self.send_inner(ring, sqe, false)
             .left()
@@ -805,6 +879,8 @@ impl Handle {
             Left(inner.into())
         }
     }
+    /// Send a Completion Queue Entry to the consumer, waking it up when the reactor enters the
+    /// io_uring again.
     pub fn send_producer_cqe(
         &self,
         instance: SecondaryRingId,
@@ -846,6 +922,18 @@ impl Handle {
             }
         }
     }
+    /// Create a futures-compatible stream that yields the SQEs sent by the consumer, to this
+    /// producer. The capacity field will specify the number of SQEs in the internal queue of the
+    /// stream. A low capacity will cause the ring to be polled more often, while a higher capacity
+    /// will prevent congestion control to some extent, by popping the submission ring more often,
+    /// allowing the consumer to push more entries before it must block.
+    ///
+    /// TODO: Poll the ring directly from the future instead.
+    ///
+    /// # Panics
+    ///
+    /// This method will panic if the reactor has been dropped, if the secondary ring ID is
+    /// invalid, or if the capacity is zero.
     pub fn producer_sqes(&self, ring_id: SecondaryRingId, capacity: usize) -> ProducerSqes {
         let reactor = self
             .reactor
@@ -941,93 +1029,132 @@ impl Handle {
             }
         }
     }
-    async unsafe fn rw_io<F>(&self, ring: impl Into<RingId>, fd: usize, f: F) -> Result<usize>
+    async unsafe fn rw_io<F, B, G>(
+        &self,
+        ring: impl Into<RingId>,
+        context: SubmissionContext,
+        fd: usize,
+        f: F,
+        mut buf: Either<B, G>,
+    ) -> Result<(usize, Option<G>)>
     where
-        F: FnOnce(SqEntry64, u64) -> SqEntry64,
+        F: FnOnce(SqEntry64, u64, Either<&mut B, &mut G>) -> SqEntry64,
+        G: crate::memory::Guardable<DefaultSubmissionGuard>,
     {
         let fd: u64 = fd.try_into().or(Err(Error::new(EOVERFLOW)))?;
 
         let base_sqe = SqEntry64::new(
-            IoUringSqeFlags::empty(),
-            Priority::default(),
+            context.sync().sqe_flags(),
+            context.priority(),
             (-1i64) as u64,
         );
-        let sqe = f(base_sqe, fd);
+        let sqe = f(base_sqe, fd, buf.as_mut());
 
-        let cqe = self.send(ring, sqe).await?;
-        Self::completion_as_rw_io_result(cqe)
+        let fut = self.send(ring, sqe);
+
+        if let Right(guardable) = buf.as_mut() {
+            fut.guard(guardable);
+        }
+
+        let cqe = fut.await?;
+        let result = Self::completion_as_rw_io_result(cqe)?;
+
+        Ok((result, buf.right()))
+    }
+    async unsafe fn open_raw_unchecked_inner<B, G>(
+        &self,
+        ring: impl Into<RingId>,
+        ctx: SubmissionContext,
+        path: Either<&B, G>,
+        flags: u64,
+        at: Option<usize>,
+    ) -> Result<(usize, Option<G>)>
+    where
+        B: AsRef<[u8]> + ?Sized,
+        G: Guardable<DefaultSubmissionGuard> + AsRef<[u8]>,
+    {
+        let mut guardable = None;
+
+        let reference = match path {
+            Left(r) => r.as_ref(),
+            Right(r) => {
+                guardable = Some(r);
+                guardable.as_ref().unwrap().as_ref()
+            }
+        };
+        let sqe_base = SqEntry64::new(ctx.sync().sqe_flags(), ctx.priority(), (-1i64) as u64);
+        let sqe = if let Some(at_fd) = at {
+            let fd64 = u64::try_from(at_fd)?;
+            sqe_base.open_at(fd64, reference, flags)
+        } else {
+            sqe_base.open(reference, flags)
+        };
+
+        let fut = self.send(ring, sqe);
+        if let Some(ref mut guardable) = guardable {
+            fut.guard(guardable);
+        }
+        let cqe = fut.await?;
+
+        let fd = Self::completion_as_rw_io_result(cqe)?;
+        Ok((fd, guardable))
     }
 
-    /// Open a path represented by a UTF-8 byte slice, returning a new file descriptor for the file
-    /// specified by that path.
+    /// Open a path represented by a byte slice, returning a new file descriptor for the file
+    /// at by that path. This is the unsafe version of [`open`].
     ///
     /// # Safety
     ///
-    /// Refer to [`open`] for invariants that must be upheld.
+    /// For this to be safe, the memory range that provides the path, must not be reclaimed until
+    /// the future is complete. This means that one must make sure, that between all await yield
+    /// points in the future invoking this function, the path cannot be reclaimed and used for
+    /// something else. As a general recommendation, only use this together with a `ManuallyDrop`
+    /// or references which lifetimes you otherwise know will outlive the entire submission.
     ///
-    /// [`open`]: #variant.open
-    pub async unsafe fn open_raw<B: AsRef<[u8]> + ?Sized>(
+    /// It is highly recommended that the regular [`open`] call be used instead, which takes care
+    /// of guarding the memory until completion.
+    pub async unsafe fn open_unchecked<B>(
         &self,
         ring: impl Into<RingId>,
+        ctx: SubmissionContext,
         path: &B,
         flags: u64,
-    ) -> Result<usize> {
-        let sqe = SqEntry64::new(
-            IoUringSqeFlags::empty(),
-            Priority::default(),
-            (-1i64) as u64,
-        )
-        .open(path.as_ref(), flags);
-        let cqe = self.send(ring, sqe).await?;
-        Self::completion_as_rw_io_result(cqe)
+        at: Option<usize>,
+    ) -> Result<usize>
+    where
+        B: AsRef<[u8]> + ?Sized,
+    {
+        let (fd, _) = self
+            .open_raw_unchecked_inner(ring, ctx, Either::<&B, [u8; 0]>::Left(path), flags, at)
+            .await?;
+        Ok(fd)
     }
-    pub async fn open_raw_static<B: AsRef<[u8]> + ?Sized + 'static>(
-        &self,
-        ring: impl Into<RingId>,
-        path: &'static B,
-        flags: u64,
-    ) -> Result<usize> {
-        unsafe { self.open_raw(ring, path, flags) }.await
-    }
-    pub async fn open_raw_move_buf(
-        &self,
-        ring: impl Into<RingId>,
-        path: Vec<u8>,
-        flags: u64,
-    ) -> Result<(usize, Vec<u8>)> {
-        let fd = unsafe { self.open_raw(ring, &*path, flags) }.await?;
-        Ok((fd, path))
-    }
-    /// Open a path, returning a new file descriptor for the file specified by that path.
+    /// Open a path represented by a byte slice, returning a new file descriptor for the file at
+    /// that path.
     ///
-    /// # Safety
-    ///
-    /// For this to be safe, the path buffer that is used by the path, _must_ outlive the execution
-    /// of this future, and the buffer must not be reclaimed until completion or cancellation.
-    pub async unsafe fn open<S: AsRef<str> + ?Sized>(
+    /// This is the safe version of [`open_raw`], but requires the path type to implement
+    /// [`Guardable`], which only applies for [`Guarded`] types on the heap, or static references.
+    /// An optional `at` argument can also be specified, which will base the path on an open file
+    /// descriptor of a directory, similar to _openat(2)_.
+    pub async fn open<G>(
         &self,
         ring: impl Into<RingId>,
-        path: &S,
+        ctx: SubmissionContext,
+        path: G,
         flags: u64,
-    ) -> Result<usize> {
-        self.open_raw(ring, path.as_ref().as_bytes(), flags).await
-    }
-    pub async fn open_static<S: AsRef<str> + ?Sized + 'static>(
-        &self,
-        ring: impl Into<RingId>,
-        path: &'static S,
-        flags: u64,
-    ) -> Result<usize> {
-        unsafe { self.open_raw(ring, path.as_ref().as_bytes(), flags) }.await
-    }
-    pub async fn open_move_buf(
-        &self,
-        ring: impl Into<RingId>,
-        path: String,
-        flags: u64,
-    ) -> Result<(usize, String)> {
-        let fd = unsafe { self.open_raw(ring, path.as_str().as_bytes(), flags) }.await?;
-        Ok((fd, path))
+        at: Option<usize>,
+    ) -> Result<(usize, G)>
+    where
+        G: Guardable<DefaultSubmissionGuard> + AsRef<[u8]>,
+    {
+        let (fd, guard_opt) = unsafe {
+            self.open_raw_unchecked_inner(ring, ctx, Either::<&[u8; 0], G>::Right(path), flags, at)
+        }
+        .await?;
+        let guard = guard_opt.expect(
+            "expected returned guard to be present returning from open_raw_unchecked_inner",
+        );
+        Ok((fd, guard))
     }
 
     /// Close a file descriptor, optionally flushing it if necessary. This will only complete when
@@ -1048,15 +1175,12 @@ impl Handle {
     pub async unsafe fn close(
         &self,
         ring: impl Into<RingId>,
+        ctx: SubmissionContext,
         fd: usize,
         flush: bool,
     ) -> Result<()> {
-        let sqe = SqEntry64::new(
-            IoUringSqeFlags::empty(),
-            Priority::default(),
-            (-1i64) as u64,
-        )
-        .close(fd.try_into().or(Err(Error::new(EOVERFLOW)))?, flush);
+        let sqe = SqEntry64::new(ctx.sync().sqe_flags(), ctx.priority(), (-1i64) as u64)
+            .close(fd.try_into().or(Err(Error::new(EOVERFLOW)))?, flush);
         let cqe = self.send(ring, sqe).await?;
 
         Self::completion_as_rw_io_result(cqe)?;
@@ -1076,6 +1200,7 @@ impl Handle {
     pub async unsafe fn close_range(
         &self,
         ring: impl Into<RingId>,
+        ctx: SubmissionContext,
         range: std::ops::Range<usize>,
         flush: bool,
     ) -> Result<()> {
@@ -1083,12 +1208,8 @@ impl Handle {
         let end: u64 = range.end.try_into().or(Err(Error::new(EOVERFLOW)))?;
         let count = end.checked_sub(start).ok_or(Error::new(EINVAL))?;
 
-        let sqe = SqEntry64::new(
-            IoUringSqeFlags::empty(),
-            Priority::default(),
-            (-1i64) as u64,
-        )
-        .close_many(start, count, flush);
+        let sqe = SqEntry64::new(ctx.sync.sqe_flags(), ctx.priority(), (-1i64) as u64)
+            .close_many(start, count, flush);
         let cqe = self.send(ring, sqe).await?;
 
         Self::completion_as_rw_io_result(cqe)?;
@@ -1096,127 +1217,345 @@ impl Handle {
         Ok(())
     }
 
-    /// Read bytes.
+    /// Read bytes, returning the number of bytes read, or zero if no more bytes are available.
+    ///
+    /// This is the unsafe variant of [`read`].
     ///
     /// # Safety
+    ///
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn read(
+    pub async unsafe fn read_unchecked(
         &self,
         ring: impl Into<RingId>,
+        ctx: SubmissionContext,
         fd: usize,
         buf: &mut [u8],
     ) -> Result<usize> {
-        self.rw_io(ring, fd, |sqe, fd| sqe.read(fd, buf)).await
+        let (bytes_read, _) = self
+            .rw_io(
+                ring,
+                ctx,
+                fd,
+                |sqe, fd, buf| sqe.read(fd, buf.left().unwrap()),
+                Either::<_, ()>::Left(buf),
+            )
+            .await?;
+        Ok(bytes_read)
+    }
+    /// Read bytes, returning the number of bytes read, or zero if no more bytes are available.
+    ///
+    /// This is the safe variant of [`read_unchecked`].
+    pub async fn read<G>(
+        &self,
+        ring: impl Into<RingId>,
+        ctx: SubmissionContext,
+        fd: usize,
+        buf: G,
+    ) -> Result<(usize, G)>
+    where
+        G: Guardable<DefaultSubmissionGuard> + AsMut<[u8]>,
+    {
+        let (bytes_read, guard_opt) = unsafe {
+            self.rw_io(
+                ring,
+                ctx,
+                fd,
+                |sqe, fd, buf| sqe.read(fd, buf.right().unwrap().as_mut()),
+                Either::<(), _>::Right(buf),
+            )
+            .await?
+        };
+        let guard = guard_opt.unwrap();
+        Ok((bytes_read, guard))
     }
     /// Read bytes, vectored.
+    ///
+    /// At the moment there is no safe counterpart for this unchecked method, since this passes a
+    /// list of buffers, rather than one single buffer.
     ///
     /// # Safety
     /// The caller must ensure that the buffers outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn readv(
+    // TODO: safe wrapper
+    pub async unsafe fn readv_unchecked(
         &self,
         ring: impl Into<RingId>,
+        ctx: SubmissionContext,
         fd: usize,
         bufs: &[IoVec],
     ) -> Result<usize> {
-        self.rw_io(ring, fd, |sqe, fd| sqe.readv(fd, bufs)).await
+        let (bytes_read, _) = self
+            .rw_io(
+                ring,
+                ctx,
+                fd,
+                |sqe, fd, bufs| sqe.readv(fd, bufs.left().unwrap()),
+                Either::<_, ()>::Left(bufs),
+            )
+            .await?;
+        Ok(bytes_read)
     }
 
     /// Read bytes from a specific offset. Does not change the file offset.
     ///
+    /// This is the unsafe variant of [`pread`].
+    ///
     /// # Safety
+    ///
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn pread(
+    pub async unsafe fn pread_unchecked(
         &self,
         ring: impl Into<RingId>,
+        ctx: SubmissionContext,
         fd: usize,
         buf: &mut [u8],
         offset: u64,
     ) -> Result<usize> {
-        self.rw_io(ring, fd, |sqe, fd| sqe.pread(fd, buf, offset))
-            .await
+        let (bytes_read, _) = self
+            .rw_io(
+                ring,
+                ctx,
+                fd,
+                |sqe, fd, buf| sqe.pread(fd, buf.left().unwrap(), offset),
+                Either::<_, ()>::Left(buf),
+            )
+            .await?;
+        Ok(bytes_read)
+    }
+    /// Read bytes from a specific offset. Does not change the file offset.
+    ///
+    /// This is the safe variant of [`pread_unchecked`].
+    pub async fn pread<G>(
+        &self,
+        ring: impl Into<RingId>,
+        ctx: SubmissionContext,
+        fd: usize,
+        buf: G,
+        offset: u64,
+    ) -> Result<(usize, G)>
+    where
+        G: Guardable<DefaultSubmissionGuard> + AsMut<[u8]>,
+    {
+        // TODO: Maybe replace Either with simply the type?
+        let (bytes_read, guard_opt) = unsafe {
+            self.rw_io(
+                ring,
+                ctx,
+                fd,
+                |sqe, fd, buf| sqe.pread(fd, buf.right().unwrap().as_mut(), offset),
+                Either::<(), _>::Right(buf),
+            )
+            .await?
+        };
+        let guard = guard_opt.unwrap();
+        Ok((bytes_read, guard))
     }
 
     /// Read bytes from a specific offset, vectored. Does not change the file offset.
     ///
+    /// At the moment there is no safe counterpart for this unchecked method, since this passes a
+    /// list of buffers, rather than one single buffer.
+    ///
     /// # Safety
+    ///
     /// The caller must ensure that the buffers outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn preadv(
+    pub async unsafe fn preadv_unchecked(
         &self,
         ring: impl Into<RingId>,
+        ctx: SubmissionContext,
         fd: usize,
         bufs: &[IoVec],
         offset: u64,
     ) -> Result<usize> {
-        self.rw_io(ring, fd, |sqe, fd| sqe.preadv(fd, bufs, offset))
-            .await
+        let (bytes_read, _) = self
+            .rw_io(
+                ring,
+                ctx,
+                fd,
+                |sqe, fd, bufs| sqe.preadv(fd, bufs.left().unwrap(), offset),
+                Either::<_, ()>::Left(bufs),
+            )
+            .await?;
+        Ok(bytes_read)
     }
 
-    /// Write bytes.
+    /// Write bytes. Returns the number of bytes written, or zero if no more bytes could be
+    /// written.
+    ///
+    /// This is the unsafe variant of the [`write`] method.
     ///
     /// # Safety
+    ///
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn write(
+    pub async unsafe fn write_unchecked(
         &self,
         ring: impl Into<RingId>,
+        ctx: SubmissionContext,
         fd: usize,
         buf: &[u8],
     ) -> Result<usize> {
-        self.rw_io(ring, fd, |sqe, fd| sqe.write(fd, buf)).await
+        let (bytes_written, _) = self
+            .rw_io(
+                ring,
+                ctx,
+                fd,
+                |sqe, fd, buf| sqe.write(fd, buf.left().unwrap()),
+                Either::<_, ()>::Left(buf),
+            )
+            .await?;
+        Ok(bytes_written)
+    }
+    /// Write bytes. Returns the number of bytes written, or zero if no more bytes could be
+    /// written.
+    ///
+    /// This is the safe variant of the [`write_unchecked`] method.
+    pub async fn write<G>(
+        &self,
+        ring: impl Into<RingId>,
+        ctx: SubmissionContext,
+        fd: usize,
+        buf: G,
+    ) -> Result<(usize, G)>
+    where
+        G: Guardable<DefaultSubmissionGuard> + AsRef<[u8]>,
+    {
+        let (bytes_written, guard_opt) = unsafe {
+            self.rw_io(
+                ring,
+                ctx,
+                fd,
+                |sqe, fd, buf| sqe.write(fd, buf.right().unwrap().as_ref()),
+                Either::<(), _>::Right(buf),
+            )
+            .await?
+        };
+        let guard = guard_opt.unwrap();
+        Ok((bytes_written, guard))
     }
 
     /// Write bytes, vectored.
     ///
+    /// At the moment there is no safe counterpart for this unchecked method, since this passes a
+    /// list of buffers, rather than one single buffer.
+    ///
     /// # Safety
+    ///
     /// The caller must ensure that the buffers outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
     pub async unsafe fn writev(
         &self,
         ring: impl Into<RingId>,
+        ctx: SubmissionContext,
         fd: usize,
         bufs: &[IoVec],
     ) -> Result<usize> {
-        self.rw_io(ring, fd, |sqe, fd| sqe.writev(fd, bufs)).await
+        let (bytes_written, _) = self
+            .rw_io(
+                ring,
+                ctx,
+                fd,
+                |sqe, fd, bufs| sqe.writev(fd, bufs.left().unwrap()),
+                Either::<_, ()>::Left(bufs),
+            )
+            .await?;
+        Ok(bytes_written)
     }
 
     /// Write bytes to a specific offset. Does not change the file offset.
     ///
+    /// This is the unsafe variant of the [`pwrite`] method.
+    ///
     /// # Safety
+    ///
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn pwrite(
+    pub async unsafe fn pwrite_unchecked(
         &self,
         ring: impl Into<RingId>,
+        ctx: SubmissionContext,
         fd: usize,
         buf: &[u8],
         offset: u64,
     ) -> Result<usize> {
-        self.rw_io(ring, fd, |sqe, fd| sqe.pwrite(fd, buf, offset))
-            .await
+        let (bytes_written, _) = self
+            .rw_io(
+                ring,
+                ctx,
+                fd,
+                |sqe, fd, buf| sqe.pwrite(fd, buf.left().unwrap(), offset),
+                Either::<_, ()>::Left(buf),
+            )
+            .await?;
+        Ok(bytes_written)
+    }
+    /// Write bytes to a specific offset. Does not change the file offset.
+    ///
+    /// This is the safe variant of the [`pwrite_unchecked`] method.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
+    /// not reclaimed until the command is either complete or cancelled.
+    pub async fn pwrite<G>(
+        &self,
+        ring: impl Into<RingId>,
+        ctx: SubmissionContext,
+        fd: usize,
+        buf: G,
+        offset: u64,
+    ) -> Result<usize>
+    where
+        G: Guardable<DefaultSubmissionGuard> + AsRef<[u8]>,
+    {
+        let (bytes_written, _) = unsafe {
+            self.rw_io(
+                ring,
+                ctx,
+                fd,
+                |sqe, fd, buf| sqe.pwrite(fd, buf.right().unwrap().as_ref(), offset),
+                Either::<(), _>::Right(buf),
+            )
+        }
+        .await?;
+        Ok(bytes_written)
     }
     /// Write bytes to a specific offset, vectored. Does not change the file offset.
     ///
+    /// At the moment there is no safe counterpart for this unchecked method, since this passes a
+    /// list of buffers, rather than one single buffer.
+    ///
     /// # Safety
+    ///
     /// The caller must ensure that the buffers outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    pub async unsafe fn pwritev(
+    pub async unsafe fn pwritev_unchecked(
         &self,
         ring: impl Into<RingId>,
+        ctx: SubmissionContext,
         fd: usize,
         bufs: &[IoVec],
         offset: u64,
     ) -> Result<usize> {
-        self.rw_io(ring, fd, |sqe, fd| sqe.pwritev(fd, bufs, offset))
-            .await
+        let (bytes_written, _) = self
+            .rw_io(
+                ring,
+                ctx,
+                fd,
+                |sqe, fd, bufs| sqe.pwritev(fd, bufs.left().unwrap(), offset),
+                Either::<_, ()>::Left(bufs),
+            )
+            .await?;
+        Ok(bytes_written)
     }
 
     /// "Duplicate" a file descriptor, returning a new one based on the old one.
     ///
     /// # Panics
+    ///
     /// This function will panic if the parameter is set, but the flags don't contain
     /// [`DupFlags::PARAM`].
     ///
@@ -1229,6 +1568,7 @@ impl Handle {
     pub async unsafe fn dup(
         &self,
         ring: impl Into<RingId>,
+        ctx: SubmissionContext,
         fd: usize,
         flags: DupFlags,
         param: Option<&[u8]>,
@@ -1238,12 +1578,8 @@ impl Handle {
         let cqe = self
             .send(
                 ring,
-                SqEntry64::new(
-                    IoUringSqeFlags::empty(),
-                    Priority::default(),
-                    (-1i64) as u64,
-                )
-                .dup(fd64, flags, param),
+                SqEntry64::new(ctx.sync().sqe_flags(), ctx.priority(), (-1i64) as u64)
+                    .dup(fd64, flags, param),
             )
             .await?;
 
@@ -1262,9 +1598,11 @@ impl Handle {
     ///
     /// This function is unsafe since it's dealing with the address space of a process, and may
     /// overwrite an existing grant, if [`MAP_FIXED`] is set and [`MAP_FIXED_NOREPLACE`] is not.
+    #[allow(clippy::too_many_arguments)]
     pub async unsafe fn mmap2(
         &self,
         ring: impl Into<RingId>,
+        ctx: SubmissionContext,
         fd: usize,
         flags: MapFlags,
         addr_hint: Option<usize>,
@@ -1283,7 +1621,7 @@ impl Handle {
         let cqe = self
             .send(
                 ring,
-                SqEntry64::new(IoUringSqeFlags::empty(), Priority::default(), 0).mmap(
+                SqEntry64::new(ctx.sync().sqe_flags(), ctx.priority(), (-1i64) as u64).mmap(
                     fd64,
                     flags,
                     addr_hint64,
@@ -1314,12 +1652,13 @@ impl Handle {
     pub async unsafe fn mmap(
         &self,
         ring: impl Into<RingId>,
+        ctx: SubmissionContext,
         fd: usize,
         flags: MapFlags,
         len: usize,
         offset: u64,
     ) -> Result<*const ()> {
         assert!(!flags.contains(MapFlags::MAP_FIXED));
-        self.mmap2(ring, fd, flags, None, len, offset).await
+        self.mmap2(ring, ctx, fd, flags, None, len, offset).await
     }
 }

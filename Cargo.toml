@@ -12,10 +12,6 @@ repository = "https://gitlab.redox-os.org/redox-os/redox-iou"
 readme = "README.md"
 homepage = "https://redox-os.org/"
 
-[features]
-buffer_pool = ["redox-buffer-pool"]
-default = ["buffer_pool"]
-
 [dependencies]
 async-task = "3"
 bitflags = "1.2"
@@ -28,4 +24,4 @@ parking_lot = { version = "0.11", features = ["nightly"] }
 pin-utils = "0.1"
 redox_syscall = { git = "https://gitlab.redox-os.org/4lDO2/syscall.git", branch = "io_uring" }
 
-redox-buffer-pool = { git = "https://gitlab.redox-os.org/redox-os/redox-buffer-pool.git", features = ["redox"], optional = true }
+redox-buffer-pool = { git = "https://gitlab.redox-os.org/redox-os/redox-buffer-pool.git", features = ["redox"] }

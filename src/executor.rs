@@ -1,9 +1,23 @@
+//! # The `redox-iou` executor.
+//!
+//! This executor simply organizes futures in a runqueue. Futures that return [`Ready`] when
+//! polled, will be kept in the "ready queue", where they are popped, and polled. If the future
+//! instead were to return [`Pending`], it will be assigned a unique internal tag, and stored in
+//! the "pending map". The waker will use this tag to remove the future from the pending map, and
+//! then reinsert it into the "ready queue", and so on.
+//!
+//! The executor can also by default, have the reactor integrated into it. This will most likely be
+//! more performant if not more lightweight, since the reactor can do its work when all futures
+//! return pending; the alternative, is to let the reactor run in its separate thread, and wake up
+//! this executor using regular thread parking. That option is also useful when one wants to use
+//! this executor on its own, potentially without the reactor from here at all.
+
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
-use std::{task, thread};
+use std::{fmt, task, thread};
 
 use crossbeam_queue::SegQueue;
 use parking_lot::{Mutex, RwLock};
@@ -11,7 +25,8 @@ use parking_lot::{Mutex, RwLock};
 use crate::instance::ConsumerGenericSender;
 use crate::reactor::{Handle as ReactorHandle, Reactor};
 
-/// A minimal executor, that does not use any thread pool.
+/// A minimal executor, that does not require any thread pool.
+#[derive(Debug)]
 pub struct Executor {
     // a regular waker that will wait for the reactor or whatever completes the future, to wake the
     // executor up.
@@ -25,6 +40,8 @@ pub struct Executor {
     // another thread. the latter is less performant.
     reactor: Option<ReactorWrapper>,
 
+    // the runqueue, storing a queue of ready futures, as well as a map from pending tags, to the
+    // pending futures.
     runqueue: Arc<Runqueue>,
 }
 
@@ -36,6 +53,30 @@ struct Runqueue {
     next_pending_tag: AtomicUsize,
 }
 
+impl fmt::Debug for Runqueue {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        struct PendingFutures<'a>(&'a TaggedFutureMap);
+
+        impl<'a> fmt::Debug for PendingFutures<'a> {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "({} pending futures)", self.0.len())
+            }
+        }
+
+        let pending_futures = self.pending_futures.lock();
+
+        f.debug_struct("Runqueue")
+            .field("ready_futures", &self.ready_futures)
+            .field("pending_futures", &PendingFutures(&*pending_futures))
+            .field(
+                "next_pending_tag",
+                &self.next_pending_tag.load(Ordering::Relaxed),
+            )
+            .finish()
+    }
+}
+
+#[derive(Debug)]
 struct ReactorWrapper {
     // a reference counted reactor, which handles can be obtained from
     reactor: Arc<Reactor>,
@@ -120,6 +161,10 @@ impl Executor {
     ) -> task::Waker {
         let standard_waker_thread = Arc::downgrade(standard_waker_thread);
 
+        // TODO: Use an pointer to a list of futures, where the lower bits that are ignored due to
+        // the alignment, can represent the index or tag of the future. This may cause spurious
+        // wakeup if the wakers are handled incorrectly, but should be much faster than having a
+        // separate allocation (is is what waker_fn does internally), per waker.
         async_task::waker_fn(move || {
             if let Some((runqueue, tag)) = runqueue
                 .as_ref()
@@ -175,6 +220,7 @@ impl Executor {
             }
         }
     }
+    /// Poll the spawned futures directly, in the foreground.
     pub fn poll_spawned_futures(&self) {
         while let Ok(ready_future) = self.runqueue.ready_futures.pop() {
             let mut ready_future = ready_future;
@@ -221,6 +267,7 @@ impl Executor {
     pub fn integrated_reactor(&self) -> Option<&Arc<Reactor>> {
         self.reactor.as_ref().map(|wrapper| &wrapper.reactor)
     }
+    /// Get a handle that can be used for spawning tasks.
     pub fn spawn_handle(&self) -> SpawnHandle {
         SpawnHandle {
             runqueue: Arc::downgrade(&self.runqueue),
@@ -232,11 +279,15 @@ impl Executor {
         }
     }
 }
+/// A handle that is used for spawning futures (tasks) onto the executor.
+#[derive(Debug)]
 pub struct SpawnHandle {
     runqueue: Weak<Runqueue>,
     waker: task::Waker,
 }
 impl SpawnHandle {
+    /// Spawn a future onto the executor. These will be run in the background, after the main
+    /// future returns pending.
     pub fn spawn<F>(&self, future: F)
     where
         F: Future<Output = ()> + Send + 'static,

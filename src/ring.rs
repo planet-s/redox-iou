@@ -37,12 +37,15 @@ impl<T> SpscSender<T> {
     pub unsafe fn from_raw(ring: *const Ring<T>, entries_base: *mut T) -> Self {
         Self { ring, entries_base }
     }
+    /// Attempt to send a new item to the ring, failing if the ring is shut down, or if the ring is
+    /// full.
     pub fn try_send(&mut self, item: T) -> Result<(), RingPushError<T>> {
         unsafe {
             let ring = self.ring_header();
             ring.push_back_spsc(self.entries_base, item)
         }
     }
+    /// Busy-wait for the ring to no longer be full.
     pub fn spin_on_send(&mut self, mut item: T) -> Result<(), RingSendError<T>> {
         loop {
             match self.try_send(item) {
@@ -56,6 +59,7 @@ impl<T> SpscSender<T> {
             }
         }
     }
+    /// Deallocate and shut down the ring, freeing the underlying memory.
     pub fn deallocate(self) -> Result<()> {
         unsafe {
             // the entries_base pointer is coupled to the ring itself. hence, when the ring is
@@ -64,6 +68,9 @@ impl<T> SpscSender<T> {
             mem::forget(self);
 
             let ring = &*ring;
+            let _ = ring
+                .sts
+                .fetch_or(RingStatus::DROP.bits(), Ordering::Relaxed);
 
             syscall::funmap(ring as *const _ as usize)?;
             syscall::funmap(entries_base as usize)?;
@@ -73,6 +80,7 @@ impl<T> SpscSender<T> {
     /// Retrieve the ring header, which stores head and tail pointers, and epochs.
     ///
     /// # Safety
+    ///
     /// This is unsafe because it allows arbitrarily changing the head and tail pointers
     /// (indices). While the only allowed entries thus far have a valid repr, and thus allow
     /// any bytes to be reinterpreted, this can produce invalid commands that may corrupt the
@@ -132,16 +140,18 @@ impl<T> SpscReceiver<T> {
     ///
     /// # Safety
     ///
-    /// The same exact same invariants as with [`SpscSender::from_raw`] apply here as well.
+    /// Exactly the same invariants as with [`SpscSender::from_raw`] apply here as well.
     pub unsafe fn from_raw(ring: *const Ring<T>, entries_base: *const T) -> Self {
         Self { ring, entries_base }
     }
+    /// Try to receive a new item from the ring, failing immediately if the ring was empty.
     pub fn try_recv(&mut self) -> Result<T, RingPopError> {
         unsafe {
             let ring = &*self.ring;
             ring.pop_front_spsc(self.entries_base)
         }
     }
+    /// Busy-wait while trying to receive a new item from the ring, or until shutdown.
     pub fn spin_on_recv(&mut self) -> Result<T, RingRecvError> {
         loop {
             match self.try_recv() {
@@ -154,10 +164,12 @@ impl<T> SpscReceiver<T> {
             }
         }
     }
+    /// Create an iterator over the currently available items, that does not block.
     pub fn try_iter(&mut self) -> impl Iterator<Item = T> + '_ {
         core::iter::from_fn(move || self.try_recv().ok())
     }
 
+    /// Deallocate the receiver, unmapping the memory used by it, together with a shutdown.
     pub fn deallocate(self) -> Result<()> {
         unsafe {
             // the entries_base pointer is coupled to the ring itself. hence, when the ring is
@@ -167,6 +179,10 @@ impl<T> SpscReceiver<T> {
 
             let ring = &*ring;
 
+            let _ = ring
+                .sts
+                .fetch_or(RingStatus::DROP.bits(), Ordering::Relaxed);
+
             syscall::funmap(ring as *const _ as usize)?;
             syscall::funmap(entries_base as usize)?;
             Ok(())
@@ -175,6 +191,7 @@ impl<T> SpscReceiver<T> {
     /// Retrieve the ring header, which stores head and tail pointers, and epochs.
     ///
     /// # Safety
+    ///
     /// Unsafe for the same reasons as with [`SpscSender`].
     ///
     /// [`SpscSender`]: ./enum.SpscSender.html
@@ -200,8 +217,13 @@ impl<T> fmt::Debug for SpscReceiver<T> {
     }
 }
 
+/// An error that can occur when sending to a ring.
 #[derive(Debug, Eq, PartialEq)]
 pub enum RingSendError<T> {
+    /// Pushing a new entry to the ring was impossible, due to a shutdown, most likely due to ring
+    /// deinitialization.
+    ///
+    /// The value from the send attempt is preserved here, for reusage purposes.
     Shutdown(T),
 }
 impl<T> From<RingSendError<T>> for Error {
@@ -219,8 +241,11 @@ impl<T> core::fmt::Display for RingSendError<T> {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+/// An error that can occur when receiving from the ring.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RingRecvError {
+    /// Popping from the ring was impossible, since the ring had been shutdown from the other side,
+    /// most likely due to ring deinitialization.
     Shutdown,
 }
 impl From<RingRecvError> for Error {

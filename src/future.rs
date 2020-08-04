@@ -25,6 +25,10 @@ pub(crate) struct CommandFutureInner {
     pub(crate) repr: CommandFutureRepr,
     pub(crate) reactor: Weak<Reactor>,
 }
+/// A future representing a submission that is being handled by the producer. This future
+/// implements [`Unpin`], and is safe to drop or forget at any time (since the guard, if present,
+/// will never release the guardee until completion).
+#[derive(Debug)]
 pub struct CommandFuture {
     pub(crate) inner: CommandFutureInner,
 }
@@ -228,6 +232,7 @@ impl Future for CommandFuture {
     }
 }
 
+/// A stream that yields CQEs representing events, using system event queues under the hood.
 #[derive(Debug)]
 pub struct FdUpdates {
     inner: CommandFutureInner,
@@ -254,6 +259,7 @@ pub(crate) enum ProducerSqesState {
     Finished,
 }
 
+/// A stream that yields the SQEs sent to a producer instance.
 #[derive(Debug)]
 pub struct ProducerSqes {
     pub(crate) state: Arc<Mutex<ProducerSqesState>>,
