@@ -604,10 +604,11 @@ where
     }
 }
 
-unsafe impl<G, T> Guardable<G> for Guarded<G, T>
+unsafe impl<G, T, U> Guardable<G> for Guarded<G, T>
 where
     G: pool::Guard,
-    T: StableDeref + 'static,
+    T: StableDeref + 'static + ops::Deref<Target = U>,
+    U: ?Sized,
 {
     fn try_guard(&mut self, guard: G) -> Result<(), G> {
         if self.has_guard() {
