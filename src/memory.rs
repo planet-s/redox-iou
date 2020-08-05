@@ -1,4 +1,3 @@
-use std::borrow::{Borrow, BorrowMut};
 use std::convert::{TryFrom, TryInto};
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
@@ -13,6 +12,7 @@ use syscall::io_uring::v1::operation::DupFlags;
 use syscall::io_uring::v1::{PoolFdEntry, Priority};
 
 use parking_lot::Mutex;
+use stable_deref_trait::StableDeref;
 
 pub use redox_buffer_pool as pool;
 
@@ -316,11 +316,42 @@ impl pool::Guard for CommandFutureGuard {
 
 /// A wrapper for types that can be "guarded", meaning that the memory they reference cannot be
 /// safely reclaimed or even moved out, until the guard frees it.
-pub struct Guarded<G: pool::Guard, T: 'static> {
+///
+/// This wrapper is in a way similar to [`std::pin::Pin`], in the sense that the inner value cannot
+/// be moved out. The difference with this wrapper type, is that unlike Pin, which guarantees that
+/// the address be stable until Drop, this type guarantees that the address be stable until the
+/// guard can be released.
+///
+/// Thus, rather than allowing arbitrary type to be guarded as with Pin (even though anyone can
+/// trivially implement Deref for a type that doesn't have a fixed location, like simply taking the
+/// address of self), Guarded will also add additional restrictions:
+///
+/// * First, the data must be static, because the data must not be removed even if the guard is
+/// leaked. A leaked borrow is the same as a dropped borrow, but without the destructor run, and
+/// even if the destructor were run, the data couldn't be leaked since it was borrowed from
+/// somewhere else. Note that static references are allowed here though, since they are never ever
+/// dropped.
+/// * Secondly, the data must implement [`std::ops::Deref`], since it doesn't make sense for
+/// non-pointers to be guarded. Sure, I could Pin a `[u8; 1024]` wrapper that simply `Deref`ed by
+/// borrowing the on-stack data. Deref forces the type to be a smart pointer, and to work around
+/// the aforementioned limitation of Deref, [`StableDeref`] is also required.
+///
+/// Just like with `Pin`, `Guarded` will not allow access to the pointer, but only to the pointee.
+/// This is to prevent collections like `Vec` from reallocating (which is really easy if one
+/// retrieves a mutable reference to a Vec), where the address can freely change. However, unlike
+/// Pin that only allows the address to change after the destructor is run, this wrapper will
+/// allow the pointer to be moved out dynamically, provided that the guard can ensure the data is
+/// no longer shared.
+pub struct Guarded<G: pool::Guard, T: StableDeref + 'static> {
     inner: MaybeUninit<T>,
     guard: Option<G>,
 }
-impl<G: pool::Guard, T: 'static> Guarded<G, T> {
+impl<G, T, U> Guarded<G, T>
+where
+    G: pool::Guard,
+    T: StableDeref + 'static + ops::Deref<Target = U>,
+    U: ?Sized,
+{
     /// Create a new guard, preventing the inner value from dropping or being moved out safely,
     /// until the guard releases itself.
     pub fn new(inner: T) -> Self {
@@ -397,8 +428,59 @@ impl<G: pool::Guard, T: 'static> Guarded<G, T> {
     unsafe fn uninitialize_inner(&mut self) -> T {
         mem::replace(&mut self.inner, MaybeUninit::uninit()).assume_init()
     }
+    /// Obtain a reference to the pointee of the value protected by this guard.
+    ///
+    /// The address of this reference is guaranteed to be the same so long as the pointer stay
+    /// within the guard. While this contract is true for the reference of the pointee itself, it
+    /// is _not_ true for the pointee of the pointee in case the pointee of this guard is itself a
+    /// pointer. So while you can safely have a `Guarded<Box<Vec<u8>>>`, only the `&Vec<u8>`
+    /// reference will be valid, not the data within the vec.
+    pub fn get_ref(&self) -> &<T as ops::Deref>::Target {
+        unsafe { self.get_pointer_ref() }.deref()
+    }
+
+    /// Unsafely obtain a reference to the pointer encapsulated by this wrapper.
+    ///
+    /// # Safety
+    ///
+    /// This method is unsafe because even though the type implements `StableDeref`, it's not safe
+    /// since a pointer that can change its address atomically for example, will not satisfy the
+    /// stable deref constraint.
+    // TODO: The StableDeref docs are a bit vague when it comes to mutating the address itself. The
+    // trait seems to be implemented for `Vec`, which obviously can change its address at any time,
+    // when mutated.
+    pub unsafe fn get_pointer_ref(&self) -> &T {
+        self.inner.get_ref()
+    }
+    /// Unsafely obtain a mutable reference to the pointer encapsulated by this wrapper.
+    ///
+    /// # Safety
+    ///
+    /// This method is unsafe because it allows the pointer to trivially change its inner address,
+    /// for example when Vec reallocates its space to expand the collection, thus violating the
+    /// `StableDeref` contract.
+    pub unsafe fn get_pointer_mut(&mut self) -> &mut T {
+        self.inner.get_mut()
+    }
 }
-impl<G: pool::Guard, T: 'static + fmt::Debug> fmt::Debug for Guarded<G, T> {
+impl<G, T, U> Guarded<G, T>
+where
+    G: pool::Guard,
+    T: StableDeref + 'static + ops::Deref<Target = U> + ops::DerefMut,
+    U: ?Sized,
+{
+    /// Obtain a mutable reference to the pointee of the value protected by this guard.
+    ///
+    /// See [`get_ref`] for a more detailed explanation of the guarantees of this method.
+    pub fn get_mut(&mut self) -> &mut <T as ops::Deref>::Target {
+        unsafe { self.get_pointer_mut() }.deref_mut()
+    }
+}
+impl<G, T> fmt::Debug for Guarded<G, T>
+where
+    G: pool::Guard,
+    T: StableDeref + 'static + fmt::Debug,
+{
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         struct GuardDbg<'a, H>(Option<&'a H>);
 
@@ -407,7 +489,7 @@ impl<G: pool::Guard, T: 'static + fmt::Debug> fmt::Debug for Guarded<G, T> {
                 match self.0 {
                     Some(_) => write!(
                         f,
-                        "[guarded using guard type {}]",
+                        "[guarded using guard type `{}`]",
                         std::any::type_name::<H>()
                     ),
                     None => write!(f, "[no guard]"),
@@ -421,7 +503,11 @@ impl<G: pool::Guard, T: 'static + fmt::Debug> fmt::Debug for Guarded<G, T> {
             .finish()
     }
 }
-impl<G: pool::Guard, T: 'static> Drop for Guarded<G, T> {
+impl<G, T> Drop for Guarded<G, T>
+where
+    G: pool::Guard,
+    T: StableDeref + 'static,
+{
     fn drop(&mut self) {
         if self.try_unguard().is_ok() {
             // Drop the inner value if the guard was able to be removed.
@@ -431,39 +517,51 @@ impl<G: pool::Guard, T: 'static> Drop for Guarded<G, T> {
         }
     }
 }
-impl<G: pool::Guard, T: 'static> ops::Deref for Guarded<G, T> {
-    type Target = T;
+impl<G, T, U> ops::Deref for Guarded<G, T>
+where
+    G: pool::Guard,
+    T: StableDeref + 'static + ops::Deref<Target = U>,
+    U: ?Sized,
+{
+    type Target = U;
 
     fn deref(&self) -> &Self::Target {
         unsafe { self.inner.get_ref() }
     }
 }
-impl<G: pool::Guard, T: 'static> ops::DerefMut for Guarded<G, T> {
+impl<G, T, U> ops::DerefMut for Guarded<G, T>
+where
+    G: pool::Guard,
+    T: StableDeref + 'static + ops::Deref<Target = U> + ops::DerefMut,
+    U: ?Sized,
+{
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { self.inner.get_mut() }
     }
 }
-impl<G: pool::Guard, T: 'static> Borrow<T> for Guarded<G, T> {
-    fn borrow(&self) -> &T {
+impl<G, T, U> AsRef<U> for Guarded<G, T>
+where
+    G: pool::Guard,
+    T: StableDeref + 'static + ops::Deref<Target = U>,
+{
+    fn as_ref(&self) -> &U {
         &*self
     }
 }
-impl<G: pool::Guard, T: 'static> BorrowMut<T> for Guarded<G, T> {
-    fn borrow_mut(&mut self) -> &mut T {
+impl<G, T, U> AsMut<U> for Guarded<G, T>
+where
+    G: pool::Guard,
+    T: StableDeref + 'static + ops::Deref<Target = U> + ops::DerefMut,
+{
+    fn as_mut(&mut self) -> &mut U {
         &mut *self
     }
 }
-impl<G: pool::Guard, T: 'static> AsRef<T> for Guarded<G, T> {
-    fn as_ref(&self) -> &T {
-        &*self
-    }
-}
-impl<G: pool::Guard, T: 'static> AsMut<T> for Guarded<G, T> {
-    fn as_mut(&mut self) -> &mut T {
-        &mut *self
-    }
-}
-impl<G: pool::Guard, T: 'static> From<T> for Guarded<G, T> {
+impl<G, T> From<T> for Guarded<G, T>
+where
+    G: pool::Guard,
+    T: StableDeref + 'static,
+{
     fn from(inner: T) -> Self {
         Self::new(inner)
     }
@@ -509,6 +607,7 @@ where
 unsafe impl<G, T> Guardable<G> for Guarded<G, T>
 where
     G: pool::Guard,
+    T: StableDeref + 'static,
 {
     fn try_guard(&mut self, guard: G) -> Result<(), G> {
         if self.has_guard() {
