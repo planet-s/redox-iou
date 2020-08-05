@@ -543,6 +543,7 @@ impl<G, T, U> AsRef<U> for Guarded<G, T>
 where
     G: pool::Guard,
     T: StableDeref + 'static + ops::Deref<Target = U>,
+    U: ?Sized,
 {
     fn as_ref(&self) -> &U {
         &*self
@@ -552,6 +553,7 @@ impl<G, T, U> AsMut<U> for Guarded<G, T>
 where
     G: pool::Guard,
     T: StableDeref + 'static + ops::Deref<Target = U> + ops::DerefMut,
+    U: ?Sized,
 {
     fn as_mut(&mut self) -> &mut U {
         &mut *self
