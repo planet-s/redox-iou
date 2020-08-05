@@ -181,7 +181,7 @@ impl Handle {
             .create_buffer_pool_inner(secondary_instance, false)
             .await?;
 
-        let expansion = pool.begin_expand(initial_len)?;
+        let expansion = pool.begin_expand(initial_len).or(Err(Error::new(ENOMEM)))?;
         let len_usize: usize = expansion.len().try_into().or(Err(Error::new(EOVERFLOW)))?;
         let offset_u64: u64 = expansion
             .offset()

@@ -28,8 +28,6 @@
 pub extern crate syscall as redox_syscall;
 pub use redox_syscall::io_uring as interface;
 
-pub use futures::io::AsyncBufRead;
-
 /// An executor, capable of spawning tasks and organizing futures in a runqueue.
 pub mod executor;
 /// Future types used by the reactor, that indirectly represent pending entries from rings.

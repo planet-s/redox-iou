@@ -10,7 +10,7 @@ use syscall::error::{Error, Result};
 use syscall::error::{ECANCELED, EFAULT, ESHUTDOWN};
 use syscall::io_uring::{CqEntry64, IoUringCqeFlags, RingPushError, SqEntry64};
 
-use futures::Stream;
+use futures_core::Stream;
 use parking_lot::Mutex;
 
 use crate::instance::ConsumerInstance;

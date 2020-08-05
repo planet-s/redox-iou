@@ -30,7 +30,6 @@ use syscall::io_uring::IoUringEnterFlags;
 
 use crossbeam_queue::ArrayQueue;
 use either::*;
-use once_cell::sync::OnceCell;
 use parking_lot::{
     MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard,
     RwLockWriteGuard,
@@ -103,7 +102,7 @@ pub struct Reactor {
     // this is lazily initialized to make things work at initialization, but one should always
     // assume that the reactor holds a weak reference to itself, to make it easier to obtain a
     // handle.
-    weak_ref: OnceCell<Weak<Reactor>>,
+    weak_ref: Option<Weak<Reactor>>,
 }
 
 #[derive(Debug)]
@@ -311,7 +310,7 @@ impl Reactor {
             dropped: AtomicBool::new(false),
         };
 
-        let reactor_arc = Arc::new(Reactor {
+        let mut reactor_arc = Arc::new(Reactor {
             id: ReactorId {
                 inner: LAST_REACTOR_ID.fetch_add(1, atomic::Ordering::Relaxed),
             },
@@ -325,11 +324,16 @@ impl Reactor {
             tag_map: RwLock::new(BTreeMap::new()),
             next_tag: AtomicTag::new(1),
             reusable_tags: ArrayQueue::new(512),
-            weak_ref: OnceCell::new(),
+            weak_ref: None,
         });
-        let res = reactor_arc.weak_ref.set(Arc::downgrade(&reactor_arc));
-        if res.is_err() {
-            unreachable!();
+        let reactor_weak = Arc::downgrade(&reactor_arc);
+        {
+            // SAFETY: This is safe because we know that the only reference to the reactor apart
+            // from the reference we're unsafely upgrading, is the weak reference we are inserting.
+            // Since that reference is only upgraded after the scope in which this unsafe mutable
+            // borrow exists, nothing will happen.
+            let reactor_mut = unsafe { Arc::get_mut_unchecked(&mut reactor_arc) };
+            reactor_mut.weak_ref = Some(reactor_weak);
         }
         reactor_arc
     }
@@ -342,7 +346,7 @@ impl Reactor {
     /// be weakly owned, and panic on regular operations if this reactor is dropped.
     pub fn handle(&self) -> Handle {
         Handle {
-            reactor: Weak::clone(self.weak_ref.get().unwrap()),
+            reactor: Weak::clone(self.weak_ref.as_ref().unwrap()),
         }
     }
     /// Add an additional secondary instance to the reactor, waking up the executor to include it
