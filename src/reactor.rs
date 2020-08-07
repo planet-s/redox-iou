@@ -1122,10 +1122,16 @@ impl Handle {
         let mut guardable = None;
 
         let reference = match path {
-            Left(r) => r.as_generic_slice(ring.is_primary()).ok_or(Error::new(EFAULT))?,
+            Left(r) => r
+                .as_generic_slice(ring.is_primary())
+                .ok_or(Error::new(EFAULT))?,
             Right(r) => {
                 guardable = Some(r);
-                guardable.as_ref().unwrap().as_generic_slice(ring.is_primary()).ok_or(Error::new(EFAULT))?
+                guardable
+                    .as_ref()
+                    .unwrap()
+                    .as_generic_slice(ring.is_primary())
+                    .ok_or(Error::new(EFAULT))?
             }
         };
         let sqe_base = SqEntry64::new(ctx.sync().sqe_flags(), ctx.priority(), (-1i64) as u64);
@@ -1296,7 +1302,15 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, buf| Ok(sqe.read(fd, buf.left().unwrap().as_generic_slice_mut(ring.is_primary()).ok_or(Error::new(EFAULT))?)),
+                |sqe, fd, buf| {
+                    Ok(sqe.read(
+                        fd,
+                        buf.left()
+                            .unwrap()
+                            .as_generic_slice_mut(ring.is_primary())
+                            .ok_or(Error::new(EFAULT))?,
+                    ))
+                },
                 Either::<_, ()>::Left(buf),
             )
             .await?;
@@ -1324,7 +1338,16 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, buf| Ok(sqe.read(fd, buf.right().unwrap().as_mut().as_generic_slice_mut(ring.is_primary()).ok_or(Error::new(EFAULT))?)),
+                |sqe, fd, buf| {
+                    Ok(sqe.read(
+                        fd,
+                        buf.right()
+                            .unwrap()
+                            .as_mut()
+                            .as_generic_slice_mut(ring.is_primary())
+                            .ok_or(Error::new(EFAULT))?,
+                    ))
+                },
                 Either::<(), _>::Right(buf),
             )
             .await?
@@ -1388,7 +1411,16 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, buf| Ok(sqe.pread(fd, buf.left().unwrap().as_generic_slice_mut(ring.is_primary()).ok_or(Error::new(EFAULT))?, offset)),
+                |sqe, fd, buf| {
+                    Ok(sqe.pread(
+                        fd,
+                        buf.left()
+                            .unwrap()
+                            .as_generic_slice_mut(ring.is_primary())
+                            .ok_or(Error::new(EFAULT))?,
+                        offset,
+                    ))
+                },
                 Either::<_, ()>::Left(buf),
             )
             .await?;
@@ -1417,7 +1449,17 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, buf| Ok(sqe.pread(fd, buf.right().unwrap().as_mut().as_generic_slice_mut(ring.is_primary()).ok_or(Error::new(EFAULT))?, offset)),
+                |sqe, fd, buf| {
+                    Ok(sqe.pread(
+                        fd,
+                        buf.right()
+                            .unwrap()
+                            .as_mut()
+                            .as_generic_slice_mut(ring.is_primary())
+                            .ok_or(Error::new(EFAULT))?,
+                        offset,
+                    ))
+                },
                 Either::<(), _>::Right(buf),
             )
             .await?
@@ -1480,7 +1522,15 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, buf| Ok(sqe.write(fd, buf.left().unwrap().as_generic_slice(ring.is_primary()).ok_or(Error::new(EFAULT))?)),
+                |sqe, fd, buf| {
+                    Ok(sqe.write(
+                        fd,
+                        buf.left()
+                            .unwrap()
+                            .as_generic_slice(ring.is_primary())
+                            .ok_or(Error::new(EFAULT))?,
+                    ))
+                },
                 Either::<_, ()>::Left(buf),
             )
             .await?;
@@ -1509,7 +1559,16 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, buf| Ok(sqe.write(fd, buf.right().unwrap().as_ref().as_generic_slice(ring.is_primary()).ok_or(Error::new(EFAULT))?)),
+                |sqe, fd, buf| {
+                    Ok(sqe.write(
+                        fd,
+                        buf.right()
+                            .unwrap()
+                            .as_ref()
+                            .as_generic_slice(ring.is_primary())
+                            .ok_or(Error::new(EFAULT))?,
+                    ))
+                },
                 Either::<(), _>::Right(buf),
             )
             .await?
@@ -1571,7 +1630,16 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, buf| Ok(sqe.pwrite(fd, buf.left().unwrap().as_generic_slice(ring.is_primary()).ok_or(Error::new(EFAULT))?, offset)),
+                |sqe, fd, buf| {
+                    Ok(sqe.pwrite(
+                        fd,
+                        buf.left()
+                            .unwrap()
+                            .as_generic_slice(ring.is_primary())
+                            .ok_or(Error::new(EFAULT))?,
+                        offset,
+                    ))
+                },
                 Either::<_, ()>::Left(buf),
             )
             .await?;
@@ -1605,7 +1673,17 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, buf| Ok(sqe.pwrite(fd, buf.right().unwrap().as_ref().as_generic_slice(ring.is_primary()).ok_or(Error::new(EFAULT))?, offset)),
+                |sqe, fd, buf| {
+                    Ok(sqe.pwrite(
+                        fd,
+                        buf.right()
+                            .unwrap()
+                            .as_ref()
+                            .as_generic_slice(ring.is_primary())
+                            .ok_or(Error::new(EFAULT))?,
+                        offset,
+                    ))
+                },
                 Either::<(), _>::Right(buf),
             )
         }
@@ -1665,7 +1743,9 @@ impl Handle {
     where
         P: AsOffsetLen,
     {
-        let (fd, _) = self.dup_unchecked_inner(ring, ctx, fd, flags, param.map(Either::<_, [u8; 0]>::Left)).await?;
+        let (fd, _) = self
+            .dup_unchecked_inner(ring, ctx, fd, flags, param.map(Either::<_, [u8; 0]>::Left))
+            .await?;
         Ok(fd)
     }
     /// "Duplicate" a file descriptor, returning a new one based on the old one.
@@ -1688,7 +1768,10 @@ impl Handle {
     where
         G: Guardable<DefaultSubmissionGuard> + AsOffsetLen,
     {
-        unsafe { self.dup_unchecked_inner(id, ctx, fd, flags, param.map(Either::<[u8; 0], _>::Right)).await }
+        unsafe {
+            self.dup_unchecked_inner(id, ctx, fd, flags, param.map(Either::<[u8; 0], _>::Right))
+                .await
+        }
     }
     /// "Duplicate" a file descriptor, returning a new one based on the old one.
     ///
@@ -1705,7 +1788,15 @@ impl Handle {
         fd: usize,
         flags: DupFlags,
     ) -> Result<usize> {
-        let (fd, _) = self.dup(id.into(), ctx, fd, flags, Option::<crate::memory::Guarded<DefaultSubmissionGuard, Vec<u8>>>::None).await?;
+        let (fd, _) = self
+            .dup(
+                id.into(),
+                ctx,
+                fd,
+                flags,
+                Option::<crate::memory::Guarded<DefaultSubmissionGuard, Vec<u8>>>::None,
+            )
+            .await?;
         Ok(fd)
     }
     async unsafe fn dup_unchecked_inner<P, G>(
@@ -1726,24 +1817,29 @@ impl Handle {
 
         let slice = match param {
             Some(Left(ref direct)) => Some(if ring.is_primary() {
-                direct.as_pointer_generic_slice().ok_or(Error::new(EFAULT))?
+                direct
+                    .as_pointer_generic_slice()
+                    .ok_or(Error::new(EFAULT))?
             } else {
                 direct.as_offset_generic_slice().ok_or(Error::new(EFAULT))?
             }),
             Some(Right(ref guardable)) => Some(if ring.is_primary() {
-                guardable.as_pointer_generic_slice().ok_or(Error::new(EFAULT))?
+                guardable
+                    .as_pointer_generic_slice()
+                    .ok_or(Error::new(EFAULT))?
             } else {
-                guardable.as_offset_generic_slice().ok_or(Error::new(EFAULT))?
+                guardable
+                    .as_offset_generic_slice()
+                    .ok_or(Error::new(EFAULT))?
             }),
             None => None,
         };
 
-        let fut = self
-            .send(
-                ring,
-                SqEntry64::new(ctx.sync().sqe_flags(), ctx.priority(), (-1i64) as u64)
-                    .dup(fd64, flags, slice),
-            );
+        let fut = self.send(
+            ring,
+            SqEntry64::new(ctx.sync().sqe_flags(), ctx.priority(), (-1i64) as u64)
+                .dup(fd64, flags, slice),
+        );
         if let Some(Right(ref mut guardable)) = param {
             fut.guard(guardable);
         }
@@ -1908,7 +2004,10 @@ trait AsOffsetLenExt: AsOffsetLen + private2::Sealed {
         Some(GenericSlice::from_offset_len(self.offset(), self.len()?))
     }
     fn as_pointer_generic_slice(&self) -> Option<GenericSlice<'_>> {
-        Some(GenericSlice::from_offset_len(self.addr().try_into().ok()?, self.len()?))
+        Some(GenericSlice::from_offset_len(
+            self.addr().try_into().ok()?,
+            self.len()?,
+        ))
     }
     fn as_generic_slice(&self, is_primary: bool) -> Option<GenericSlice<'_>> {
         if is_primary {
@@ -1920,10 +2019,16 @@ trait AsOffsetLenExt: AsOffsetLen + private2::Sealed {
 }
 trait AsOffsetLenMutExt: AsOffsetLenMut + private2::Sealed {
     fn as_offset_generic_slice_mut(&mut self) -> Option<GenericSliceMut<'_>> {
-        Some(GenericSliceMut::from_offset_len(self.offset_mut(), self.len_mut()?))
+        Some(GenericSliceMut::from_offset_len(
+            self.offset_mut(),
+            self.len_mut()?,
+        ))
     }
     fn as_pointer_generic_slice_mut(&mut self) -> Option<GenericSliceMut<'_>> {
-        Some(GenericSliceMut::from_offset_len(self.addr_mut().try_into().ok()?, self.len_mut()?))
+        Some(GenericSliceMut::from_offset_len(
+            self.addr_mut().try_into().ok()?,
+            self.len_mut()?,
+        ))
     }
     fn as_generic_slice_mut(&mut self, is_primary: bool) -> Option<GenericSliceMut<'_>> {
         if is_primary {

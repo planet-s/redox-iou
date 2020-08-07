@@ -137,14 +137,15 @@ impl Handle {
         };
 
         log::debug!("Running dup");
-        let (fd, _) = self.dup(
-            reactor.primary_instance(),
-            SubmissionContext::default(),
-            ringfd,
-            DupFlags::PARAM,
-            Some(&b"pool"[..]),
-        )
-        .await?;
+        let (fd, _) = self
+            .dup(
+                reactor.primary_instance(),
+                SubmissionContext::default(),
+                ringfd,
+                DupFlags::PARAM,
+                Some(&b"pool"[..]),
+            )
+            .await?;
         log::debug!("Ran dup");
 
         Ok(pool::BufferPool::new(Some(BufferPoolHandle {
