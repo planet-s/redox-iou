@@ -137,15 +137,13 @@ impl Handle {
         };
 
         log::debug!("Running dup");
-        let fd = unsafe {
-            self.dup(
-                reactor.primary_instance(),
-                SubmissionContext::default(),
-                ringfd,
-                DupFlags::PARAM,
-                Some(b"pool"),
-            )
-        }
+        let (fd, _) = self.dup(
+            reactor.primary_instance(),
+            SubmissionContext::default(),
+            ringfd,
+            DupFlags::PARAM,
+            Some(&b"pool"[..]),
+        )
         .await?;
         log::debug!("Ran dup");
 
@@ -624,7 +622,7 @@ where
 // cannot be dropped at all.
 unsafe impl<G, T> Guardable<G> for &'static T
 where
-    T: 'static,
+    T: 'static + ?Sized,
 {
     fn try_guard(&mut self, _guard: G) -> Result<(), G> {
         Ok(())
@@ -632,7 +630,7 @@ where
 }
 unsafe impl<G, T> Guardable<G> for &'static mut T
 where
-    T: 'static,
+    T: 'static + ?Sized,
 {
     fn try_guard(&mut self, _guard: G) -> Result<(), G> {
         Ok(())

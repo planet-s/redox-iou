@@ -475,7 +475,7 @@ mod consumer_instance {
         ///
         /// This method will panic if the builder is not in the attaching state.
         pub fn attach_to_kernel(self) -> Result<Instance> {
-            self.attach(b":")
+            self.attach_inner(b":")
         }
         /// Attach the ring to a userspace scheme, or the kernel with the scheme name ":" (in which
         /// case [`attach_to_kernel`] is preferred). If this attaches to a userspace scheme, the
@@ -492,6 +492,11 @@ mod consumer_instance {
         /// [`attach_to_kernel`]: #method.attach_to_kernel
         /// [`SYS_RECV_IORING`]: ../../syscall/number/constant.SYS_RECV_IORING.html
         pub fn attach<N: AsRef<[u8]>>(self, scheme_name: N) -> Result<Instance> {
+            self.attach_inner(scheme_name.as_ref())
+        }
+        fn attach_inner(self, scheme_name: &[u8]) -> Result<Instance> {
+            let kernel = scheme_name == b":";
+
             let init_flags = self.flags();
             let attach_info = self
                 .consume_attach_state()
@@ -517,6 +522,7 @@ mod consumer_instance {
             }
 
             Ok(Instance {
+                with_kernel: kernel,
                 ringfd: attach_info.ringfd,
                 sender: if init_flags.contains(IoUringCreateFlags::BITS_32) {
                     GenericSender::Bits32(init_sender(&attach_info))
@@ -649,6 +655,7 @@ mod consumer_instance {
         // TODO: Add finer-grained locks here, when lock_api can be used in the kernel.
         sender: GenericSender,
         receiver: GenericReceiver,
+        with_kernel: bool,
     }
     impl Instance {
         /// Create a new consumer instance builder, that will build this type.
@@ -695,6 +702,11 @@ mod consumer_instance {
         /// `min_complete`.
         pub fn wait(&self, min_complete: usize, flags: IoUringEnterFlags) -> Result<usize> {
             syscall::enter_iouring(self.ringfd, min_complete, flags)
+        }
+        /// Check if the instance is attached to the kernel, or to a userspace process.
+        pub fn is_attached_to_kernel(&self) -> bool {
+            // TODO: Add this functionality to producers too.
+            self.with_kernel
         }
     }
     impl Drop for Instance {

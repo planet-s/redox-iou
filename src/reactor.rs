@@ -15,18 +15,18 @@ use std::convert::{TryFrom, TryInto};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{self, AtomicBool, AtomicUsize};
 use std::sync::{Arc, Weak};
-use std::task;
+use std::{ops, task};
 
 use syscall::data::IoVec;
 use syscall::error::{Error, Result};
-use syscall::error::{E2BIG, EBADF, ECANCELED, EINVAL, EOPNOTSUPP, EOVERFLOW};
+use syscall::error::{E2BIG, EBADF, ECANCELED, EFAULT, EINVAL, EOPNOTSUPP, EOVERFLOW};
 use syscall::flag::{EventFlags, MapFlags};
 use syscall::io_uring::operation::{DupFlags, FilesUpdateFlags};
 use syscall::io_uring::v1::{
     CqEntry64, IoUringCqeFlags, IoUringSqeFlags, Priority, RingPopError, RingPushError, SqEntry64,
     StandardOpcode,
 };
-use syscall::io_uring::IoUringEnterFlags;
+use syscall::io_uring::{GenericSlice, GenericSliceMut, IoUringEnterFlags};
 
 use crossbeam_queue::ArrayQueue;
 use either::*;
@@ -40,7 +40,7 @@ use crate::future::{
     ProducerSqesState, State, Tag,
 };
 use crate::instance::{ConsumerInstance, ProducerInstance};
-use crate::memory::Guardable;
+use crate::memory::{Guardable, Guarded};
 
 pub use redox_buffer_pool::NoGuard;
 
@@ -198,6 +198,23 @@ impl RingId {
     pub fn is_secondary(&self) -> bool {
         self.inner > 0
     }
+    /// Attempt to convert this generic ring ID into a primary ring ID, if it represents one.
+    pub fn try_into_primary(&self) -> Option<PrimaryRingId> {
+        if self.inner == 0 {
+            Some(PrimaryRingId {
+                reactor: self.reactor,
+            })
+        } else {
+            None
+        }
+    }
+    /// Attempt to convert this generic ring ID into a secondary ring ID, if it represents one.
+    pub fn try_into_secondary(&self) -> Option<SecondaryRingId> {
+        NonZeroUsize::new(self.inner).map(|inner| SecondaryRingId {
+            inner,
+            reactor: self.reactor,
+        })
+    }
 }
 
 impl PartialEq<RingId> for PrimaryRingId {
@@ -233,6 +250,29 @@ impl From<SecondaryRingId> for RingId {
         Self {
             reactor: secondary.reactor,
             inner: secondary.inner.get(),
+        }
+    }
+}
+pub(crate) enum RingIdKind {
+    Primary(PrimaryRingId),
+    Secondary(SecondaryRingId),
+}
+impl From<RingId> for RingIdKind {
+    fn from(id: RingId) -> Self {
+        if let Some(primary) = id.try_into_primary() {
+            Self::Primary(primary)
+        } else if let Some(secondary) = id.try_into_secondary() {
+            Self::Secondary(secondary)
+        } else {
+            unreachable!()
+        }
+    }
+}
+impl From<RingIdKind> for RingId {
+    fn from(id_kind: RingIdKind) -> Self {
+        match id_kind {
+            RingIdKind::Primary(p) => p.into(),
+            RingIdKind::Secondary(s) => s.into(),
         }
     }
 }
@@ -1042,7 +1082,7 @@ impl Handle {
         mut buf: Either<B, G>,
     ) -> Result<(usize, Option<G>)>
     where
-        F: FnOnce(SqEntry64, u64, Either<&mut B, &mut G>) -> SqEntry64,
+        F: FnOnce(SqEntry64, u64, Either<&mut B, &mut G>) -> Result<SqEntry64>,
         G: crate::memory::Guardable<DefaultSubmissionGuard>,
     {
         let fd: u64 = fd.try_into().or(Err(Error::new(EOVERFLOW)))?;
@@ -1052,7 +1092,7 @@ impl Handle {
             context.priority(),
             (-1i64) as u64,
         );
-        let sqe = f(base_sqe, fd, buf.as_mut());
+        let sqe = f(base_sqe, fd, buf.as_mut())?;
 
         let fut = self.send(ring, sqe);
 
@@ -1074,16 +1114,18 @@ impl Handle {
         at: Option<usize>,
     ) -> Result<(usize, Option<G>)>
     where
-        B: AsRef<[u8]> + ?Sized,
-        G: Guardable<DefaultSubmissionGuard> + AsRef<[u8]>,
+        B: AsOffsetLen + ?Sized,
+        G: Guardable<DefaultSubmissionGuard> + AsOffsetLen,
     {
+        let ring = ring.into();
+
         let mut guardable = None;
 
         let reference = match path {
-            Left(r) => r.as_ref(),
+            Left(r) => r.as_generic_slice(ring.is_primary()).ok_or(Error::new(EFAULT))?,
             Right(r) => {
                 guardable = Some(r);
-                guardable.as_ref().unwrap().as_ref()
+                guardable.as_ref().unwrap().as_generic_slice(ring.is_primary()).ok_or(Error::new(EFAULT))?
             }
         };
         let sqe_base = SqEntry64::new(ctx.sync().sqe_flags(), ctx.priority(), (-1i64) as u64);
@@ -1129,8 +1171,10 @@ impl Handle {
         at: Option<usize>,
     ) -> Result<usize>
     where
-        B: AsRef<[u8]> + ?Sized,
+        B: AsOffsetLen + ?Sized,
     {
+        let ring = ring.into();
+
         let (fd, _) = self
             .open_raw_unchecked_inner(ring, ctx, Either::<&B, [u8; 0]>::Left(path), flags, at)
             .await?;
@@ -1156,7 +1200,7 @@ impl Handle {
         at: Option<usize>,
     ) -> Result<(usize, G)>
     where
-        G: Guardable<DefaultSubmissionGuard> + AsRef<[u8]>,
+        G: Guardable<DefaultSubmissionGuard> + AsOffsetLen,
     {
         let (fd, guard_opt) = unsafe {
             self.open_raw_unchecked_inner(ring, ctx, Either::<&[u8; 0], G>::Right(path), flags, at)
@@ -1245,12 +1289,14 @@ impl Handle {
         fd: usize,
         buf: &mut [u8],
     ) -> Result<usize> {
+        let ring = ring.into();
+
         let (bytes_read, _) = self
             .rw_io(
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, buf| sqe.read(fd, buf.left().unwrap()),
+                |sqe, fd, buf| Ok(sqe.read(fd, buf.left().unwrap().as_generic_slice_mut(ring.is_primary()).ok_or(Error::new(EFAULT))?)),
                 Either::<_, ()>::Left(buf),
             )
             .await?;
@@ -1271,12 +1317,14 @@ impl Handle {
     where
         G: Guardable<DefaultSubmissionGuard> + AsMut<[u8]>,
     {
+        let ring = ring.into();
+
         let (bytes_read, guard_opt) = unsafe {
             self.rw_io(
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, buf| sqe.read(fd, buf.right().unwrap().as_mut()),
+                |sqe, fd, buf| Ok(sqe.read(fd, buf.right().unwrap().as_mut().as_generic_slice_mut(ring.is_primary()).ok_or(Error::new(EFAULT))?)),
                 Either::<(), _>::Right(buf),
             )
             .await?
@@ -1301,12 +1349,14 @@ impl Handle {
         fd: usize,
         bufs: &[IoVec],
     ) -> Result<usize> {
+        let ring = ring.into();
+
         let (bytes_read, _) = self
             .rw_io(
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, bufs| sqe.readv(fd, bufs.left().unwrap()),
+                |sqe, fd, bufs| Ok(sqe.readv(fd, bufs.left().unwrap())),
                 Either::<_, ()>::Left(bufs),
             )
             .await?;
@@ -1331,12 +1381,14 @@ impl Handle {
         buf: &mut [u8],
         offset: u64,
     ) -> Result<usize> {
+        let ring = ring.into();
+
         let (bytes_read, _) = self
             .rw_io(
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, buf| sqe.pread(fd, buf.left().unwrap(), offset),
+                |sqe, fd, buf| Ok(sqe.pread(fd, buf.left().unwrap().as_generic_slice_mut(ring.is_primary()).ok_or(Error::new(EFAULT))?, offset)),
                 Either::<_, ()>::Left(buf),
             )
             .await?;
@@ -1358,13 +1410,14 @@ impl Handle {
     where
         G: Guardable<DefaultSubmissionGuard> + AsMut<[u8]>,
     {
-        // TODO: Maybe replace Either with simply the type?
+        let ring = ring.into();
+
         let (bytes_read, guard_opt) = unsafe {
             self.rw_io(
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, buf| sqe.pread(fd, buf.right().unwrap().as_mut(), offset),
+                |sqe, fd, buf| Ok(sqe.pread(fd, buf.right().unwrap().as_mut().as_generic_slice_mut(ring.is_primary()).ok_or(Error::new(EFAULT))?, offset)),
                 Either::<(), _>::Right(buf),
             )
             .await?
@@ -1395,7 +1448,7 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, bufs| sqe.preadv(fd, bufs.left().unwrap(), offset),
+                |sqe, fd, bufs| Ok(sqe.preadv(fd, bufs.left().unwrap(), offset)),
                 Either::<_, ()>::Left(bufs),
             )
             .await?;
@@ -1420,12 +1473,14 @@ impl Handle {
         fd: usize,
         buf: &[u8],
     ) -> Result<usize> {
+        let ring = ring.into();
+
         let (bytes_written, _) = self
             .rw_io(
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, buf| sqe.write(fd, buf.left().unwrap()),
+                |sqe, fd, buf| Ok(sqe.write(fd, buf.left().unwrap().as_generic_slice(ring.is_primary()).ok_or(Error::new(EFAULT))?)),
                 Either::<_, ()>::Left(buf),
             )
             .await?;
@@ -1447,12 +1502,14 @@ impl Handle {
     where
         G: Guardable<DefaultSubmissionGuard> + AsRef<[u8]>,
     {
+        let ring = ring.into();
+
         let (bytes_written, guard_opt) = unsafe {
             self.rw_io(
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, buf| sqe.write(fd, buf.right().unwrap().as_ref()),
+                |sqe, fd, buf| Ok(sqe.write(fd, buf.right().unwrap().as_ref().as_generic_slice(ring.is_primary()).ok_or(Error::new(EFAULT))?)),
                 Either::<(), _>::Right(buf),
             )
             .await?
@@ -1482,7 +1539,7 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, bufs| sqe.writev(fd, bufs.left().unwrap()),
+                |sqe, fd, bufs| Ok(sqe.writev(fd, bufs.left().unwrap())),
                 Either::<_, ()>::Left(bufs),
             )
             .await?;
@@ -1507,12 +1564,14 @@ impl Handle {
         buf: &[u8],
         offset: u64,
     ) -> Result<usize> {
+        let ring = ring.into();
+
         let (bytes_written, _) = self
             .rw_io(
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, buf| sqe.pwrite(fd, buf.left().unwrap(), offset),
+                |sqe, fd, buf| Ok(sqe.pwrite(fd, buf.left().unwrap().as_generic_slice(ring.is_primary()).ok_or(Error::new(EFAULT))?, offset)),
                 Either::<_, ()>::Left(buf),
             )
             .await?;
@@ -1539,12 +1598,14 @@ impl Handle {
     where
         G: Guardable<DefaultSubmissionGuard> + AsRef<[u8]>,
     {
+        let ring = ring.into();
+
         let (bytes_written, _) = unsafe {
             self.rw_io(
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, buf| sqe.pwrite(fd, buf.right().unwrap().as_ref(), offset),
+                |sqe, fd, buf| Ok(sqe.pwrite(fd, buf.right().unwrap().as_ref().as_generic_slice(ring.is_primary()).ok_or(Error::new(EFAULT))?, offset)),
                 Either::<(), _>::Right(buf),
             )
         }
@@ -1573,7 +1634,7 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, bufs| sqe.pwritev(fd, bufs.left().unwrap(), offset),
+                |sqe, fd, bufs| Ok(sqe.pwritev(fd, bufs.left().unwrap(), offset)),
                 Either::<_, ()>::Left(bufs),
             )
             .await?;
@@ -1593,28 +1654,105 @@ impl Handle {
     /// Additionally, that slice must also outlive the lifetime of this future, and if the future
     /// is dropped or forgotten, the slice must not be used afterwards, since that would lead to a
     /// data race.
-    pub async unsafe fn dup(
+    pub async unsafe fn dup_unchecked<Id, P>(
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
         fd: usize,
         flags: DupFlags,
-        param: Option<&[u8]>,
+        param: Option<P>,
+    ) -> Result<usize>
+    where
+        P: AsOffsetLen,
+    {
+        let (fd, _) = self.dup_unchecked_inner(ring, ctx, fd, flags, param.map(Either::<_, [u8; 0]>::Left)).await?;
+        Ok(fd)
+    }
+    /// "Duplicate" a file descriptor, returning a new one based on the old one.
+    ///
+    /// This is the safe version of [`dup_unchecked`], that uses an owned guarded buffer for the
+    /// parameter, if present. To work around issues with the generic guard type, prefer
+    /// [`dup_parameterless`] instead, when the parameter isn't used.
+    ///
+    /// # Panics
+    ///
+    /// This will panic if param is some, and the [`DupFlags::PARAM`] isn't set, or vice versa.
+    pub async fn dup<G>(
+        &self,
+        id: impl Into<RingId>,
+        ctx: SubmissionContext,
+        fd: usize,
+        flags: DupFlags,
+        param: Option<G>,
+    ) -> Result<(usize, Option<G>)>
+    where
+        G: Guardable<DefaultSubmissionGuard> + AsOffsetLen,
+    {
+        unsafe { self.dup_unchecked_inner(id, ctx, fd, flags, param.map(Either::<[u8; 0], _>::Right)).await }
+    }
+    /// "Duplicate" a file descriptor, returning a new one based on the old one.
+    ///
+    /// This function is the same as [`dup`], but without the requirement of specifying a guard
+    /// type when it isn't used.
+    ///
+    /// # Panics
+    ///
+    /// Since this doesn't pass a parameter, it'll panic if the flags contain [`DupFlags::PARAM`].
+    pub async fn dup_parameterless(
+        &self,
+        id: impl Into<RingId>,
+        ctx: SubmissionContext,
+        fd: usize,
+        flags: DupFlags,
     ) -> Result<usize> {
+        let (fd, _) = self.dup(id.into(), ctx, fd, flags, Option::<crate::memory::Guarded<DefaultSubmissionGuard, Vec<u8>>>::None).await?;
+        Ok(fd)
+    }
+    async unsafe fn dup_unchecked_inner<P, G>(
+        &self,
+        ring: impl Into<RingId>,
+        ctx: SubmissionContext,
+        fd: usize,
+        flags: DupFlags,
+        mut param: Option<Either<P, G>>,
+    ) -> Result<(usize, Option<G>)>
+    where
+        P: AsOffsetLen,
+        G: Guardable<DefaultSubmissionGuard> + AsOffsetLen,
+    {
+        let ring = ring.into();
+
         let fd64 = u64::try_from(fd).or(Err(Error::new(EBADF)))?;
 
-        let cqe = self
+        let slice = match param {
+            Some(Left(ref direct)) => Some(if ring.is_primary() {
+                direct.as_pointer_generic_slice().ok_or(Error::new(EFAULT))?
+            } else {
+                direct.as_offset_generic_slice().ok_or(Error::new(EFAULT))?
+            }),
+            Some(Right(ref guardable)) => Some(if ring.is_primary() {
+                guardable.as_pointer_generic_slice().ok_or(Error::new(EFAULT))?
+            } else {
+                guardable.as_offset_generic_slice().ok_or(Error::new(EFAULT))?
+            }),
+            None => None,
+        };
+
+        let fut = self
             .send(
                 ring,
                 SqEntry64::new(ctx.sync().sqe_flags(), ctx.priority(), (-1i64) as u64)
-                    .dup(fd64, flags, param),
-            )
-            .await?;
+                    .dup(fd64, flags, slice),
+            );
+        if let Some(Right(ref mut guardable)) = param {
+            fut.guard(guardable);
+        }
+        let cqe = fut.await?;
 
         let res_fd = Error::demux64(cqe.status)?;
         let res_fd = usize::try_from(res_fd).or(Err(Error::new(EOVERFLOW)))?;
 
-        Ok(res_fd)
+        Ok((res_fd, param.map_or(None, |p| p.right())))
     }
 
     /// Create a memory map from an offset+len pair inside a file descriptor, with an optional hint
@@ -1693,5 +1831,189 @@ impl Handle {
     ) -> Result<*const ()> {
         assert!(!flags.contains(MapFlags::MAP_FIXED));
         self.mmap2(ring, ctx, fd, flags, None, len, offset).await
+    }
+}
+
+/// An unsafe trait that abstract slices over offset-based addresses, and pointer-based
+///
+/// This happens as part of a buffer pool; two processes can obviously not share addresses safely,
+/// without making sure that their address spaces look similar), and pointer-based addresses (when
+/// communicating with the kernel.
+pub unsafe trait AsOffsetLen {
+    /// Get the offset within a buffer pool that the consumer and producer shares. This is never
+    /// called for userspace-to-kernel instances.
+    fn offset(&self) -> u64;
+    /// Get the length of the slice. This method works for both types. The reason this returns an
+    /// Option, is because the type may not be convertible, in which cause `EFAULT` will be
+    /// returned.
+    fn len(&self) -> Option<u64>;
+    /// Get the pointer-based address. This will never be called for userspace-to-userspace rings.
+    fn addr(&self) -> usize;
+}
+/// An unsafe trait that abstract slices over offset-based addresses, and pointer based, mutably.
+///
+/// Refer to [`AsOffsetLen`].
+pub unsafe trait AsOffsetLenMut: AsOffsetLen {
+    /// Same as [`offset`], but different since the default AsMut impl may point to a different
+    /// slice.
+    fn offset_mut(&mut self) -> u64;
+    /// Same as [`len`], but different since the default AsMut impl may point to a different slice.
+    fn len_mut(&mut self) -> Option<u64>;
+    /// Same as [`addr`], but different since the default AsMut impl may point to a different
+    /// slice.
+    fn addr_mut(&mut self) -> usize;
+}
+
+unsafe impl<'a, I, H, E, G> AsOffsetLen for crate::memory::BufferSlice<'a, I, E, G, H>
+where
+    I: redox_buffer_pool::Integer + Into<u64>,
+    H: redox_buffer_pool::Handle,
+    E: Copy,
+    G: redox_buffer_pool::Guard,
+{
+    fn offset(&self) -> u64 {
+        redox_buffer_pool::BufferSlice::offset(self).into()
+    }
+    fn len(&self) -> Option<u64> {
+        Some(redox_buffer_pool::BufferSlice::len(self).into())
+    }
+    fn addr(&self) -> usize {
+        redox_buffer_pool::BufferSlice::as_slice(self).as_ptr() as usize
+    }
+}
+unsafe impl<'a, I, H, E, G> AsOffsetLenMut for crate::memory::BufferSlice<'a, I, E, G, H>
+where
+    I: redox_buffer_pool::Integer + Into<u64>,
+    H: redox_buffer_pool::Handle,
+    E: Copy,
+    G: redox_buffer_pool::Guard,
+{
+    fn offset_mut(&mut self) -> u64 {
+        redox_buffer_pool::BufferSlice::offset(self).into()
+    }
+    fn len_mut(&mut self) -> Option<u64> {
+        Some(redox_buffer_pool::BufferSlice::len(self).into())
+    }
+    fn addr_mut(&mut self) -> usize {
+        redox_buffer_pool::BufferSlice::as_slice_mut(self).as_mut_ptr() as usize
+    }
+}
+mod private2 {
+    pub trait Sealed {}
+}
+impl<T> private2::Sealed for T where T: AsOffsetLen + ?Sized {}
+
+trait AsOffsetLenExt: AsOffsetLen + private2::Sealed {
+    fn as_offset_generic_slice(&self) -> Option<GenericSlice<'_>> {
+        Some(GenericSlice::from_offset_len(self.offset(), self.len()?))
+    }
+    fn as_pointer_generic_slice(&self) -> Option<GenericSlice<'_>> {
+        Some(GenericSlice::from_offset_len(self.addr().try_into().ok()?, self.len()?))
+    }
+    fn as_generic_slice(&self, is_primary: bool) -> Option<GenericSlice<'_>> {
+        if is_primary {
+            self.as_pointer_generic_slice()
+        } else {
+            self.as_offset_generic_slice()
+        }
+    }
+}
+trait AsOffsetLenMutExt: AsOffsetLenMut + private2::Sealed {
+    fn as_offset_generic_slice_mut(&mut self) -> Option<GenericSliceMut<'_>> {
+        Some(GenericSliceMut::from_offset_len(self.offset_mut(), self.len_mut()?))
+    }
+    fn as_pointer_generic_slice_mut(&mut self) -> Option<GenericSliceMut<'_>> {
+        Some(GenericSliceMut::from_offset_len(self.addr_mut().try_into().ok()?, self.len_mut()?))
+    }
+    fn as_generic_slice_mut(&mut self, is_primary: bool) -> Option<GenericSliceMut<'_>> {
+        if is_primary {
+            self.as_pointer_generic_slice_mut()
+        } else {
+            self.as_offset_generic_slice_mut()
+        }
+    }
+}
+impl<T> AsOffsetLenExt for T where T: AsOffsetLen + ?Sized {}
+impl<T> AsOffsetLenMutExt for T where T: AsOffsetLenMut + ?Sized {}
+
+macro_rules! slice_like(
+    ($type:ty) => {
+        unsafe impl AsOffsetLen for $type {
+            fn offset(&self) -> u64 {
+                panic!("cannot use regular slices for secondary io_urings")
+            }
+            fn len(&self) -> Option<u64> {
+                <[u8]>::len(::core::convert::AsRef::<[u8]>::as_ref(self)).try_into().ok()
+            }
+            fn addr(&self) -> usize {
+                ::core::convert::AsRef::<[u8]>::as_ref(self).as_ptr() as usize
+            }
+        }
+    }
+);
+macro_rules! slice_like_mut(
+    ($type:ty) => {
+        unsafe impl AsOffsetLenMut for $type {
+            fn offset_mut(&mut self) -> u64 {
+                unreachable!()
+            }
+            fn len_mut(&mut self) -> Option<u64> {
+                <[u8]>::len(::core::convert::AsMut::<[u8]>::as_mut(self)).try_into().ok()
+            }
+            fn addr_mut(&mut self) -> usize {
+                ::core::convert::AsMut::<[u8]>::as_mut(self).as_ptr() as usize
+            }
+        }
+    }
+);
+slice_like!([u8]);
+slice_like!(&[u8]);
+slice_like!(::std::vec::Vec<u8>);
+slice_like!(::std::boxed::Box<[u8]>);
+slice_like!(::std::sync::Arc<[u8]>);
+slice_like!(::std::rc::Rc<[u8]>);
+slice_like!(::std::borrow::Cow<'_, [u8]>);
+slice_like!(::std::string::String);
+slice_like!(str);
+slice_like!([u8; 0]);
+
+slice_like_mut!([u8]);
+slice_like_mut!(::std::vec::Vec<u8>);
+slice_like_mut!(::std::boxed::Box<[u8]>);
+slice_like_mut!([u8; 0]);
+// (`Arc` is never mutable)
+// (`Rc` is never mutable)
+// (`Cow` is mutable, but it won't work here)
+// (`String` is AsMut, but not for [u8] (due to UTF-8))
+// (`str` is AsMut, but not for [u8] (due to UTF-8))
+
+unsafe impl<G, T> AsOffsetLen for Guarded<G, T>
+where
+    G: redox_buffer_pool::Guard,
+    T: stable_deref_trait::StableDeref + ops::Deref<Target = [u8]>,
+{
+    fn addr(&self) -> usize {
+        self.get_ref().addr()
+    }
+    fn len(&self) -> Option<u64> {
+        self.get_ref().len().try_into().ok()
+    }
+    fn offset(&self) -> u64 {
+        unreachable!("the Guarded wrapper only works on primary rings")
+    }
+}
+unsafe impl<G, T> AsOffsetLenMut for Guarded<G, T>
+where
+    G: redox_buffer_pool::Guard,
+    T: stable_deref_trait::StableDeref + AsOffsetLenMut + ops::DerefMut<Target = [u8]>,
+{
+    fn addr_mut(&mut self) -> usize {
+        self.get_mut().addr()
+    }
+    fn len_mut(&mut self) -> Option<u64> {
+        self.get_mut().len().try_into().ok()
+    }
+    fn offset_mut(&mut self) -> u64 {
+        unreachable!("the Guarded wrapper only works on primary rings")
     }
 }
