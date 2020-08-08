@@ -21,7 +21,7 @@ futures-core = "0.3"
 log = "0.4"
 parking_lot = { version = "0.11", features = ["nightly"] }
 redox_syscall = { git = "https://gitlab.redox-os.org/4lDO2/syscall.git", branch = "io_uring" }
-redox-buffer-pool = { version = "0.1", features = ["redox"] }
+redox-buffer-pool = { version = "0.2", features = ["redox"] }
 stable_deref_trait = "1.2"
 
 [dev-dependencies]

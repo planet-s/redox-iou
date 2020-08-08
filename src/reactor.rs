@@ -1960,12 +1960,13 @@ pub unsafe trait AsOffsetLenMut: AsOffsetLen {
     fn addr_mut(&mut self) -> usize;
 }
 
-unsafe impl<'a, I, H, E, G> AsOffsetLen for crate::memory::BufferSlice<'a, I, E, G, H>
+unsafe impl<'a, I, H, E, G, C> AsOffsetLen for crate::memory::BufferSlice<'a, I, E, G, H, C>
 where
     I: redox_buffer_pool::Integer + Into<u64>,
-    H: redox_buffer_pool::Handle,
+    H: redox_buffer_pool::Handle<I, E>,
     E: Copy,
     G: redox_buffer_pool::Guard,
+    C: redox_buffer_pool::AsBufferPool<I, H, E>,
 {
     fn offset(&self) -> u64 {
         redox_buffer_pool::BufferSlice::offset(self).into()
@@ -1977,12 +1978,13 @@ where
         redox_buffer_pool::BufferSlice::as_slice(self).as_ptr() as usize
     }
 }
-unsafe impl<'a, I, H, E, G> AsOffsetLenMut for crate::memory::BufferSlice<'a, I, E, G, H>
+unsafe impl<'a, I, H, E, G, C> AsOffsetLenMut for crate::memory::BufferSlice<'a, I, E, G, H, C>
 where
     I: redox_buffer_pool::Integer + Into<u64>,
-    H: redox_buffer_pool::Handle,
+    H: redox_buffer_pool::Handle<I, E>,
     E: Copy,
     G: redox_buffer_pool::Guard,
+    C: redox_buffer_pool::AsBufferPool<I, H, E>,
 {
     fn offset_mut(&mut self) -> u64 {
         redox_buffer_pool::BufferSlice::offset(self).into()

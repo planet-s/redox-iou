@@ -6,7 +6,7 @@ use std::{fmt, mem, ops, slice};
 
 use syscall::data::Map as Mmap;
 use syscall::error::{Error, Result};
-use syscall::error::{EADDRINUSE, ENOMEM, EOVERFLOW};
+use syscall::error::{EADDRINUSE, EFAULT, ENOMEM, EOVERFLOW};
 use syscall::flag::MapFlags;
 use syscall::io_uring::v1::operation::DupFlags;
 use syscall::io_uring::v1::{PoolFdEntry, Priority};
@@ -28,7 +28,8 @@ pub type BufferSlice<
     E = BufferPoolHandle,
     G = CommandFutureGuard,
     H = BufferPoolHandle,
-> = pool::BufferSlice<'pool, I, H, E, G>;
+    C = BufferPool<I, H, E>,
+> = pool::BufferSlice<'pool, I, H, E, G, C>;
 
 /// The handle type managing the raw allocations in use by the buffer pool. This particular one
 /// uses io_uring mmaps.
@@ -37,9 +38,21 @@ pub struct BufferPoolHandle {
     fd: usize,
     reactor: Option<Handle>,
 }
-impl pool::Handle for BufferPoolHandle {
-    fn close(self) -> Result<(), pool::CloseError<()>> {
-        let _ = syscall::close(self.fd);
+impl<I, E> pool::Handle<I, E> for BufferPoolHandle
+where
+    I: pool::Integer + TryInto<usize>,
+    E: Copy,
+{
+    type Error = Error;
+
+    fn close_all(self, _mmap_entries: pool::MmapEntries<I, E>) -> Result<(), Self::Error> {
+        let _ = syscall::close(self.fd)?;
+        Ok(())
+    }
+    fn close(&mut self, mmap_entries: pool::MmapEntries<I, E>) -> Result<(), Self::Error> {
+        for entry in mmap_entries {
+            unsafe { syscall::funmap2(entry.pointer.as_ptr() as usize, entry.size.try_into().or(Err(Error::new(EFAULT)))?)? };
+        }
         Ok(())
     }
 }
@@ -96,11 +109,15 @@ impl CommandFuture {
     }
 }
 impl Handle {
-    async fn create_buffer_pool_inner<I: pool::Integer, E: Copy>(
+    async fn create_buffer_pool_inner<I, E>(
         &self,
         secondary_instance: SecondaryRingId,
         producer: bool,
-    ) -> Result<pool::BufferPool<I, BufferPoolHandle, E>> {
+    ) -> Result<pool::BufferPool<I, BufferPoolHandle, E>>
+    where
+        I: pool::Integer + TryInto<usize>,
+        E: Copy,
+    {
         let reactor = self
             .reactor
             .upgrade()
@@ -590,12 +607,13 @@ pub unsafe trait Guardable<G> {
     /// that were the case, error with the guard that wasn't able to be inserted.
     fn try_guard(&mut self, guard: G) -> Result<(), G>;
 }
-unsafe impl<'pool, I, E, G, H> Guardable<G> for BufferSlice<'pool, I, E, G, H>
+unsafe impl<'pool, I, E, G, H, C> Guardable<G> for BufferSlice<'pool, I, E, G, H, C>
 where
     I: pool::Integer,
-    H: pool::Handle,
+    H: pool::Handle<I, E>,
     E: Copy,
     G: pool::Guard,
+    C: pool::AsBufferPool<I, H, E>,
 {
     fn try_guard(&mut self, guard: G) -> Result<(), G> {
         match self.guard(guard) {
