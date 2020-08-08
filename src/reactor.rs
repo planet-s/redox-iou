@@ -1848,7 +1848,7 @@ impl Handle {
         let res_fd = Error::demux64(cqe.status)?;
         let res_fd = usize::try_from(res_fd).or(Err(Error::new(EOVERFLOW)))?;
 
-        Ok((res_fd, param.map_or(None, |p| p.right())))
+        Ok((res_fd, param.and_then(|p| p.right())))
     }
 
     /// Create a memory map from an offset+len pair inside a file descriptor, with an optional hint
@@ -1945,6 +1945,11 @@ pub unsafe trait AsOffsetLen {
     fn len(&self) -> Option<u64>;
     /// Get the pointer-based address. This will never be called for userspace-to-userspace rings.
     fn addr(&self) -> usize;
+
+    /// Check whether the slice is empty.
+    fn is_empty(&self) -> bool {
+        self.len() == Some(0)
+    }
 }
 /// An unsafe trait that abstract slices over offset-based addresses, and pointer based, mutably.
 ///
@@ -1958,6 +1963,12 @@ pub unsafe trait AsOffsetLenMut: AsOffsetLen {
     /// Same as [`addr`], but different since the default AsMut impl may point to a different
     /// slice.
     fn addr_mut(&mut self) -> usize;
+
+    /// Same as [`is_empty`], but different since the default AsMut impl may point to a different
+    /// slice.
+    fn is_empty_mut(&mut self) -> bool {
+        self.len_mut() == Some(0)
+    }
 }
 
 unsafe impl<'a, I, H, E, G, C> AsOffsetLen for crate::memory::BufferSlice<'a, I, E, G, H, C>

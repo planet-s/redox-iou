@@ -502,7 +502,7 @@ mod consumer_instance {
                 .consume_attach_state()
                 .expect("attaching an io_uring before the builder was in its attach stage");
 
-            syscall::attach_iouring(attach_info.ringfd, scheme_name.as_ref())?;
+            syscall::attach_iouring(attach_info.ringfd, scheme_name)?;
 
             fn init_sender<S>(info: &InstanceBuilderAttachStageInfo) -> SpscSender<S> {
                 unsafe {
