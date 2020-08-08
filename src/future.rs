@@ -10,6 +10,7 @@ use syscall::error::{Error, Result};
 use syscall::error::{ECANCELED, EFAULT, ESHUTDOWN};
 use syscall::io_uring::{CqEntry64, IoUringCqeFlags, RingPushError, SqEntry64};
 
+use either::*;
 use futures_core::Stream;
 use parking_lot::Mutex;
 
@@ -85,16 +86,15 @@ fn try_submit(
     state: &mut State,
     cx: &mut task::Context<'_>,
     sqe: SqEntry64,
-    state_weak: Option<Weak<Mutex<State>>>,
+    user_data: Either<Weak<Mutex<State>>, Tag>,
     is_stream: bool,
 ) -> task::Poll<Option<Result<CqEntry64>>> {
-    let sqe = if let Some(state_weak) = state_weak {
-        match (Weak::into_raw(state_weak) as usize).try_into() {
+    let sqe = match user_data {
+        Left(state_weak) => match (Weak::into_raw(state_weak) as usize).try_into() {
             Ok(ptr64) => sqe.with_user_data(ptr64),
             Err(_) => return task::Poll::Ready(Some(Err(Error::new(EFAULT)))),
-        }
-    } else {
-        sqe
+        },
+        Right(tag) => sqe.with_user_data(tag),
     };
     log::debug!("Sending SQE {:?}", sqe);
 
@@ -138,7 +138,7 @@ impl CommandFutureInner {
         let tags_guard;
         let mut initial_sqe;
 
-        let (state_lock, mut init_sqe, is_direct) = match self.repr {
+        let (state_lock, mut init_sqe, is_direct, tag) = match self.repr {
             CommandFutureRepr::Tagged {
                 tag,
                 ref mut initial_sqe,
@@ -148,14 +148,14 @@ impl CommandFutureInner {
                     .get(&tag)
                     .expect("CommandFuture::poll error: tag used by future has been removed");
 
-                (state_lock, initial_sqe, false)
+                (state_lock, initial_sqe, false, Some(tag))
             }
             CommandFutureRepr::Direct {
                 ref state,
                 initial_sqe: sqe,
             } => {
                 initial_sqe = Some(sqe);
-                (state, &mut initial_sqe, true)
+                (state, &mut initial_sqe, true, None)
             }
         };
 
@@ -178,9 +178,9 @@ impl CommandFutureInner {
                 cx,
                 init_sqe.expect("expected an initial SQE when submitting command"),
                 if is_direct {
-                    Some(Arc::downgrade(&state_lock))
+                    Left(Arc::downgrade(&state_lock))
                 } else {
-                    None
+                    Right(tag.expect("expected tagged future to have a tag available"))
                 },
                 is_stream,
             ),
