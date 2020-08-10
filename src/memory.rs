@@ -16,8 +16,8 @@ use stable_deref_trait::StableDeref;
 
 pub use redox_buffer_pool as pool;
 
-use crate::future::{CommandFuture, CommandFutureRepr, State as CommandFutureState};
-use crate::reactor::{Handle, SecondaryRingId, SubmissionContext, SubmissionSync};
+use crate::future::{CommandFuture, CommandFutureRepr, State as CommandFutureState, StateInner as CommandFutureStateInner, Tag};
+use crate::reactor::{Handle, Reactor, SecondaryRingId, SubmissionContext, SubmissionSync};
 
 /// A buffer pool, with the default options for use by userspace-to-userspace rings.
 pub type BufferPool<I = u32, H = BufferPoolHandle, E = ()> = pool::BufferPool<I, H, E>;
@@ -93,7 +93,7 @@ impl CommandFuture {
     where
         G: Guardable<CommandFutureGuard>,
     {
-        let arc = match self.inner.repr {
+        let guard_inner = match self.inner.repr {
             CommandFutureRepr::Direct { ref state, .. } => Arc::clone(state),
             CommandFutureRepr::Tagged { tag, .. } => {
                 if let Some(reactor) = self.inner.reactor.upgrade() {
@@ -107,7 +107,8 @@ impl CommandFuture {
                 }
             }
         };
-        let guard = CommandFutureGuard { inner: arc };
+        let epoch = guard_inner.lock().epoch;
+        let guard = CommandFutureGuard { inner: guard_inner, epoch };
         slice
             .try_guard(guard)
             .expect("cannot guard using future: another guard already present");
@@ -326,12 +327,16 @@ unsafe fn expand_blocking<I: TryInto<usize>>(
 #[derive(Debug)]
 pub struct CommandFutureGuard {
     inner: Arc<Mutex<CommandFutureState>>,
+    epoch: usize,
 }
 impl pool::Guard for CommandFutureGuard {
     fn try_release(&self) -> bool {
+        let state_guard = self.inner.lock();
+
         // Only allow reclaiming buffer slices when their guarded future has actually
-        // completed.
-        matches!(&*self.inner.lock(), CommandFutureState::Cancelled | CommandFutureState::Completed(_))
+        // completed, or if the epoch has been increment, meaning that the reactor has started
+        // using the state for something else.
+        state_guard.epoch != self.epoch || matches!(state_guard.inner, CommandFutureStateInner::Cancelled | CommandFutureStateInner::Completed(_))
     }
 }
 

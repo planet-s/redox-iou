@@ -37,7 +37,7 @@ use parking_lot::{
 
 use crate::future::{
     AtomicTag, CommandFuture, CommandFutureInner, CommandFutureRepr, FdUpdates, ProducerSqes,
-    ProducerSqesState, State, Tag,
+    ProducerSqesState, State, StateInner, Tag,
 };
 use crate::instance::{ConsumerInstance, ProducerInstance};
 use crate::memory::{Guardable, Guarded};
@@ -658,25 +658,25 @@ impl Reactor {
         };
 
         let mut state = state_lock.lock();
-        match &mut *state {
+        match &mut state.inner {
             // invalid state after having received a completion
-            State::Initial | State::Submitting(_, _) | State::Completed(_) | State::Cancelled => {
+            StateInner::Initial | StateInner::Submitting(_, _) | StateInner::Completed(_) | StateInner::Cancelled => {
                 return None
             }
 
-            State::Completing(waker) => {
+            StateInner::Completing(waker) => {
                 // Wake other executors which have futures using this reactor.
                 if !waker.will_wake(driving_waker) {
                     waker.wake_by_ref();
                 }
 
-                *state = if cancelled {
-                    State::Cancelled
+                state.inner = if cancelled {
+                    StateInner::Cancelled
                 } else {
-                    State::Completed(cqe)
+                    StateInner::Completed(cqe)
                 };
             }
-            State::ReceivingMulti(ref mut pending_cqes, waker) => {
+            StateInner::ReceivingMulti(ref mut pending_cqes, waker) => {
                 if !waker.will_wake(driving_waker) {
                     waker.wake_by_ref();
                 }
@@ -858,7 +858,7 @@ impl Handle {
             // try getting a reusable tag to minimize unnecessary allocations
             Ok((n, state)) => {
                 assert!(
-                    matches!(&*state.lock(), &State::Initial),
+                    matches!(state.lock().inner, StateInner::Initial),
                     "reusable tag was not in the reclaimed state"
                 );
                 assert_eq!(
@@ -886,11 +886,20 @@ impl Handle {
             }
             // if no reusable tag was present, create a new tag
             Err(crossbeam_queue::PopError) => {
-                let state_arc = Arc::new(Mutex::new(State::Initial));
+                let state_arc = Arc::new(Mutex::new(State { inner: StateInner::Initial, epoch: 0 }));
 
                 let n = reactor
                     .next_tag
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                if n.checked_add(1).is_none() {
+                    // FIXME: Find some way to handle this, if it ever were to become a problem. We
+                    // cannot really reuse tags, unless we really want to traverse the B-tree again
+                    // to find unused tags (which would be fairly simple; given that tags are
+                    // initialized and deinitialized in the same tempo, there should be a large
+                    // range of unused tags at the start).
+                    panic!("redox-iou tag overflow");
+                }
 
                 if reactor.trusted_main_instance && ring.is_primary() {
                     (None, Some(state_arc))

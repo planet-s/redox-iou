@@ -34,9 +34,15 @@ pub struct CommandFuture {
     pub(crate) inner: CommandFutureInner,
 }
 
+#[derive(Debug)]
+pub(crate) struct State {
+    pub(crate) inner: StateInner,
+    pub(crate) epoch: usize,
+}
+
 // the internal state of the pending command.
 #[derive(Debug)]
-pub(crate) enum State {
+pub(crate) enum StateInner {
     // the future has been initiated, but nothing has happened to it yet
     Initial,
 
@@ -107,15 +113,15 @@ fn try_submit(
         Ok(()) => {
             if is_stream {
                 log::debug!("Successfully sent stream command, awaiting CQEs.");
-                *state = State::ReceivingMulti(VecDeque::new(), cx.waker().clone());
+                state.inner = StateInner::ReceivingMulti(VecDeque::new(), cx.waker().clone());
             } else {
                 log::debug!("Successfully sent command, awaiting CQE.");
-                *state = State::Completing(cx.waker().clone());
+                state.inner = StateInner::Completing(cx.waker().clone());
             }
             task::Poll::Pending
         }
         Err(RingPushError::Full(sqe)) => {
-            *state = State::Submitting(sqe, cx.waker().clone());
+            state.inner = StateInner::Submitting(sqe, cx.waker().clone());
             log::debug!("Submission ring is full");
             task::Poll::Pending
         }
@@ -163,7 +169,7 @@ impl CommandFutureInner {
 
         let mut in_state_sqe;
 
-        if let State::Submitting(sqe, _) = *state_guard {
+        if let StateInner::Submitting(sqe, _) = state_guard.inner {
             in_state_sqe = Some(sqe);
             init_sqe = &mut in_state_sqe;
         }
@@ -171,8 +177,8 @@ impl CommandFutureInner {
         let instance_lock = &*instance_lock_either
             .expect("cannot poll CommandFuture: instance is a producer instance");
 
-        match &mut *state_guard {
-            &mut State::Initial | &mut State::Submitting(_, _) => try_submit(
+        match &mut state_guard.inner {
+            &mut StateInner::Initial | &mut StateInner::Submitting(_, _) => try_submit(
                 &mut *instance_lock.write(),
                 &mut *state_guard,
                 cx,
@@ -184,8 +190,8 @@ impl CommandFutureInner {
                 },
                 is_stream,
             ),
-            &mut State::Completing(_) => task::Poll::Pending,
-            &mut State::ReceivingMulti(ref mut received, ref mut waker) => {
+            &mut StateInner::Completing(_) => task::Poll::Pending,
+            &mut StateInner::ReceivingMulti(ref mut received, ref mut waker) => {
                 if !waker.will_wake(cx.waker()) {
                     *waker = cx.waker().clone();
                 }
@@ -205,15 +211,47 @@ impl CommandFutureInner {
                 }
             }
 
-            &mut State::Completed(cqe) => {
-                *state_guard = State::Initial;
+            &mut StateInner::Completed(cqe) => {
+                state_guard.inner = StateInner::Initial;
+                state_guard.epoch += 1;
                 task::Poll::Ready(Some(Ok(cqe)))
             }
-            &mut State::Cancelled => {
-                *state_guard = State::Initial;
+            &mut StateInner::Cancelled => {
+                state_guard.inner = StateInner::Initial;
+                state_guard.epoch += 1;
                 task::Poll::Ready(Some(Err(Error::new(ECANCELED))))
             }
         }
+    }
+}
+
+impl Drop for CommandFuture {
+    fn drop(&mut self) {
+        // TODO: Implement cancellation.
+        let this = &*self;
+        let arc;
+        let state = match this.inner.repr {
+            CommandFutureRepr::Direct { ref state, .. } => &*state,
+            CommandFutureRepr::Tagged { tag, .. } => {
+                let state_opt = this
+                    .inner
+                    .reactor
+                    .upgrade()
+                    .and_then(|reactor| Some(Arc::clone(reactor.tag_map.read().get(&tag)?)));
+
+                match state_opt {
+                    Some(state) => {
+                        arc = state;
+                        &*arc
+                    }
+                    None => {
+                        log::debug!("Dropping future: {:?}, state: (reactor dead)", this);
+                        return;
+                    }
+                }
+            }
+        };
+        log::debug!("Future when dropped: {:?}, state: {:?}", this, state);
     }
 }
 
