@@ -633,9 +633,28 @@ where
     C: pool::AsBufferPool<I, H, E>,
 {
     fn try_guard(&mut self, guard: G) -> Result<(), G> {
+        // TODO: Add something like try_release to the public API of redox-buffer-pool.
+
         match self.guard(guard) {
             Ok(()) => Ok(()),
-            Err(pool::WithGuardError { this }) => Err(this),
+            Err(pool::WithGuardError { this: new_guard }) => unsafe {
+                let existing_guard = self.unguard().expect(
+                    "expected a BufferSlice not to contain a guard, if the guard method failed",
+                );
+
+                if existing_guard.try_release() {
+                    self.guard(new_guard).expect(
+                        "expected no guard to exist in BufferSlice, if it just was released",
+                    );
+
+                    Ok(())
+                } else {
+                    self.guard(existing_guard).expect(
+                        "expected no guard to exist in BufferSlice, if it just was released",
+                    );
+                    Err(new_guard)
+                }
+            },
         }
     }
 }
