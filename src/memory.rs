@@ -16,8 +16,11 @@ use stable_deref_trait::StableDeref;
 
 pub use redox_buffer_pool as pool;
 
-use crate::future::{CommandFuture, CommandFutureRepr, State as CommandFutureState, StateInner as CommandFutureStateInner, Tag};
-use crate::reactor::{Handle, Reactor, SecondaryRingId, SubmissionContext, SubmissionSync};
+use crate::future::{
+    CommandFuture, CommandFutureRepr, State as CommandFutureState,
+    StateInner as CommandFutureStateInner,
+};
+use crate::reactor::{Handle, SecondaryRingId, SubmissionContext, SubmissionSync};
 
 /// A buffer pool, with the default options for use by userspace-to-userspace rings.
 pub type BufferPool<I = u32, H = BufferPoolHandle, E = ()> = pool::BufferPool<I, H, E>;
@@ -108,7 +111,10 @@ impl CommandFuture {
             }
         };
         let epoch = guard_inner.lock().epoch;
-        let guard = CommandFutureGuard { inner: guard_inner, epoch };
+        let guard = CommandFutureGuard {
+            inner: guard_inner,
+            epoch,
+        };
         slice
             .try_guard(guard)
             .expect("cannot guard using future: another guard already present");
@@ -336,7 +342,8 @@ impl pool::Guard for CommandFutureGuard {
         // Only allow reclaiming buffer slices when their guarded future has actually
         // completed, or if the epoch has been increment, meaning that the reactor has started
         // using the state for something else.
-        state_guard.epoch != self.epoch || matches!(state_guard.inner, CommandFutureStateInner::Cancelled | CommandFutureStateInner::Completed(_))
+        state_guard.epoch != self.epoch
+            || matches!(state_guard.inner, CommandFutureStateInner::Cancelled | CommandFutureStateInner::Completed(_))
     }
 }
 

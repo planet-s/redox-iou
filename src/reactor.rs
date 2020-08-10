@@ -660,9 +660,10 @@ impl Reactor {
         let mut state = state_lock.lock();
         match &mut state.inner {
             // invalid state after having received a completion
-            StateInner::Initial | StateInner::Submitting(_, _) | StateInner::Completed(_) | StateInner::Cancelled => {
-                return None
-            }
+            StateInner::Initial
+            | StateInner::Submitting(_, _)
+            | StateInner::Completed(_)
+            | StateInner::Cancelled => return None,
 
             StateInner::Completing(waker) => {
                 // Wake other executors which have futures using this reactor.
@@ -886,7 +887,10 @@ impl Handle {
             }
             // if no reusable tag was present, create a new tag
             Err(crossbeam_queue::PopError) => {
-                let state_arc = Arc::new(Mutex::new(State { inner: StateInner::Initial, epoch: 0 }));
+                let state_arc = Arc::new(Mutex::new(State {
+                    inner: StateInner::Initial,
+                    epoch: 0,
+                }));
 
                 let n = reactor
                     .next_tag
