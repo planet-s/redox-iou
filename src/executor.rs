@@ -154,6 +154,9 @@ impl Executor {
                 ConsumerGenericSender::Bits32(ref sender32) => sender32.notify(),
                 ConsumerGenericSender::Bits64(ref sender64) => sender64.notify(),
             }
+            instance_guard
+                .enter_for_notification()
+                .expect("failed to wake up executor: entering the io_uring failed");
         })
     }
     fn standard_waker(

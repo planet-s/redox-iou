@@ -700,8 +700,14 @@ mod consumer_instance {
         ///
         /// Allows giving a minimum of completion events before notification, through
         /// `min_complete`.
-        pub fn wait(&self, min_complete: usize, flags: IoUringEnterFlags) -> Result<usize> {
+        pub fn enter(&self, min_complete: usize, flags: IoUringEnterFlags) -> Result<usize> {
             syscall::enter_iouring(self.ringfd, min_complete, flags)
+        }
+        /// Call `SYS_ENTER_IORING` just like [`enter`] does, but with the `ONLY_NOTIFY` flag. This
+        /// will not cause the syscall to block (even though it may take some time), but only
+        /// notify the waiting context.
+        pub fn enter_for_notification(&self) -> Result<usize> {
+            self.enter(0, IoUringEnterFlags::ONLY_NOTIFY)
         }
         /// Check if the instance is attached to the kernel, or to a userspace process.
         pub fn is_attached_to_kernel(&self) -> bool {

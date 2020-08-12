@@ -34,6 +34,9 @@ impl<T> SpscSender<T> {
     /// these pointers, without any validations whatsoever. While there is no practial necessity
     /// for the ring header and entries to come directly from an mmap for the `io_uring:` scheme,
     /// they still have to safely dereferencable.
+    ///
+    /// Since munmap is called in the destructor, the sender must either be dropped differently, or
+    /// be allocated using mmap.
     pub unsafe fn from_raw(ring: *const Ring<T>, entries_base: *mut T) -> Self {
         Self { ring, entries_base }
     }

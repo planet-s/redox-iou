@@ -506,7 +506,7 @@ impl Reactor {
             log::debug!("Entering io_uring");
             Some(
                 read_guard
-                    .wait(0, flags)
+                    .enter(0, flags)
                     .expect("redox_iou: failed to enter io_uring"),
             )
         } else {
