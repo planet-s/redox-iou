@@ -20,6 +20,14 @@ pub struct SpscSender<T> {
 
     /// A pointer to the entries of the ring, must also be mmapped.
     pub(crate) entries_base: *mut T,
+
+    /// Size of the ring header, in bytes.
+    pub(crate) ring_size: usize,
+
+    /// The size in bytes of the entries array.
+    // TODO: Entry count but with an unsafe invariant that there must be no overflow when
+    // multiplying with the entry size?
+    pub(crate) entries_size: usize,
 }
 
 unsafe impl<T: Send> Send for SpscSender<T> {}
@@ -37,8 +45,8 @@ impl<T> SpscSender<T> {
     ///
     /// Since munmap is called in the destructor, the sender must either be dropped differently, or
     /// be allocated using mmap.
-    pub unsafe fn from_raw(ring: *const Ring<T>, entries_base: *mut T) -> Self {
-        Self { ring, entries_base }
+    pub unsafe fn from_raw(ring: *const Ring<T>, ring_size: usize, entries_base: *mut T, entries_size: usize) -> Self {
+        Self { ring, entries_base, ring_size, entries_size }
     }
     /// Attempt to send a new item to the ring, failing if the ring is shut down, or if the ring is
     /// full.
@@ -67,7 +75,7 @@ impl<T> SpscSender<T> {
         unsafe {
             // the entries_base pointer is coupled to the ring itself. hence, when the ring is
             // deallocated, so will the entries.
-            let Self { ring, entries_base } = self;
+            let Self { ring, entries_base, ring_size, entries_size } = self;
             mem::forget(self);
 
             let ring = &*ring;
@@ -75,8 +83,8 @@ impl<T> SpscSender<T> {
                 .sts
                 .fetch_or(RingStatus::DROP.bits(), Ordering::Relaxed);
 
-            syscall::funmap(ring as *const _ as usize)?;
-            syscall::funmap(entries_base as usize)?;
+            syscall::funmap(ring as *const _ as usize, ring_size)?;
+            syscall::funmap(entries_base as usize, entries_size)?;
             Ok(())
         }
     }
@@ -108,8 +116,8 @@ impl<T> Drop for SpscSender<T> {
             ring.sts
                 .fetch_or(RingStatus::DROP.bits(), Ordering::Release);
 
-            let _ = syscall::funmap(self.ring as *const _ as usize);
-            let _ = syscall::funmap(self.entries_base as usize);
+            let _ = syscall::funmap(self.ring as *const _ as usize, self.ring_size);
+            let _ = syscall::funmap(self.entries_base as usize, self.entries_size);
         }
     }
 }
@@ -134,6 +142,8 @@ impl<T> fmt::Debug for SpscSender<T> {
 pub struct SpscReceiver<T> {
     ring: *const Ring<T>,
     entries_base: *const T,
+    ring_size: usize,
+    entries_size: usize,
 }
 unsafe impl<T: Send> Send for SpscReceiver<T> {}
 unsafe impl<T: Send> Sync for SpscReceiver<T> {}
@@ -144,8 +154,8 @@ impl<T> SpscReceiver<T> {
     /// # Safety
     ///
     /// Exactly the same invariants as with [`SpscSender::from_raw`] apply here as well.
-    pub unsafe fn from_raw(ring: *const Ring<T>, entries_base: *const T) -> Self {
-        Self { ring, entries_base }
+    pub unsafe fn from_raw(ring: *const Ring<T>, ring_size: usize, entries_base: *const T, entries_size: usize) -> Self {
+        Self { ring, entries_base, ring_size, entries_size }
     }
     /// Try to receive a new item from the ring, failing immediately if the ring was empty.
     pub fn try_recv(&mut self) -> Result<T, RingPopError> {
@@ -177,7 +187,7 @@ impl<T> SpscReceiver<T> {
         unsafe {
             // the entries_base pointer is coupled to the ring itself. hence, when the ring is
             // deallocated, so will the entries.
-            let Self { ring, entries_base } = self;
+            let Self { ring, entries_base, entries_size, ring_size } = self;
             mem::forget(self);
 
             let ring = &*ring;
@@ -186,8 +196,8 @@ impl<T> SpscReceiver<T> {
                 .sts
                 .fetch_or(RingStatus::DROP.bits(), Ordering::Relaxed);
 
-            syscall::funmap(ring as *const _ as usize)?;
-            syscall::funmap(entries_base as usize)?;
+            syscall::funmap(ring as *const _ as usize, ring_size)?;
+            syscall::funmap(entries_base as usize, entries_size)?;
             Ok(())
         }
     }
@@ -205,8 +215,8 @@ impl<T> SpscReceiver<T> {
 impl<T> Drop for SpscReceiver<T> {
     fn drop(&mut self) {
         unsafe {
-            let _ = syscall::funmap(self.ring as *const _ as usize);
-            let _ = syscall::funmap(self.entries_base as usize);
+            let _ = syscall::funmap(self.ring as *const _ as usize, self.ring_size);
+            let _ = syscall::funmap(self.entries_base as usize, self.entries_size);
         }
     }
 }
@@ -278,12 +288,15 @@ mod tests {
     use std::{mem, sync::atomic::AtomicUsize};
     use syscall::io_uring::v1::{CachePadded, CqEntry64, Ring, RingPopError, RingPushError};
 
-    fn setup_ring(count: usize) -> (Ring<CqEntry64>, *mut CqEntry64) {
+    fn setup_ring(count: usize) -> (Ring<CqEntry64>, *mut CqEntry64, usize, usize) {
         use std::alloc::{alloc, Layout};
+
+        let base_size = count.checked_mul(mem::size_of::<CqEntry64>()).unwrap();
+
         let base = unsafe {
             alloc(
                 Layout::from_size_align(
-                    count * mem::size_of::<CqEntry64>(),
+                    base_size,
                     mem::align_of::<CqEntry64>(),
                 )
                 .unwrap(),
@@ -303,6 +316,8 @@ mod tests {
                 _marker: core::marker::PhantomData,
             },
             base,
+            4096,
+            base_size,
         )
     }
 
@@ -361,10 +376,10 @@ mod tests {
 
     #[test]
     fn multithreaded_spsc() {
-        let (ring, entries_base) = setup_ring(64);
+        let (ring, entries_base, ring_size, entries_size) = setup_ring(64);
         let ring = &ring;
-        let mut sender = SpscSender { ring, entries_base };
-        let mut receiver = SpscReceiver { ring, entries_base };
+        let mut sender = SpscSender { ring, entries_base, ring_size, entries_size };
+        let mut receiver = SpscReceiver { ring, entries_base, ring_size, entries_size };
 
         simple_multithreaded_test!(sender, receiver);
     }

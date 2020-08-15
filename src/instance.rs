@@ -339,6 +339,7 @@ mod consumer_instance {
                         offset: mmap_offset,
                         size: mmap_size,
                         flags: mmap_flags,
+                        address: 0,
                     },
                 )?
             });
@@ -497,6 +498,9 @@ mod consumer_instance {
         fn attach_inner(self, scheme_name: &[u8]) -> Result<Instance> {
             let kernel = scheme_name == b":";
 
+            let sq_entries_bytesize = self.submission_entries_bytesize();
+            let cq_entries_bytesize = self.completion_entries_bytesize();
+
             let init_flags = self.flags();
             let attach_info = self
                 .consume_attach_state()
@@ -504,19 +508,23 @@ mod consumer_instance {
 
             syscall::attach_iouring(attach_info.ringfd, scheme_name)?;
 
-            fn init_sender<S>(info: &InstanceBuilderAttachStageInfo) -> SpscSender<S> {
+            fn init_sender<S>(info: &InstanceBuilderAttachStageInfo, sq_entries_bytesize: usize) -> SpscSender<S> {
                 unsafe {
                     SpscSender::from_raw(
                         info.sr_virtaddr as *const Ring<S>,
+                        4096, // TODO
                         info.se_virtaddr as *mut S,
+                        sq_entries_bytesize,
                     )
                 }
             }
-            fn init_receiver<C>(info: &InstanceBuilderAttachStageInfo) -> SpscReceiver<C> {
+            fn init_receiver<C>(info: &InstanceBuilderAttachStageInfo, cq_entries_bytesize: usize) -> SpscReceiver<C> {
                 unsafe {
                     SpscReceiver::from_raw(
                         info.cr_virtaddr as *const Ring<C>,
+                        4096, // TODO
                         info.ce_virtaddr as *const C,
+                        cq_entries_bytesize,
                     )
                 }
             }
@@ -525,14 +533,14 @@ mod consumer_instance {
                 with_kernel: kernel,
                 ringfd: attach_info.ringfd,
                 sender: if init_flags.contains(IoUringCreateFlags::BITS_32) {
-                    GenericSender::Bits32(init_sender(&attach_info))
+                    GenericSender::Bits32(init_sender(&attach_info, sq_entries_bytesize))
                 } else {
-                    GenericSender::Bits64(init_sender(&attach_info))
+                    GenericSender::Bits64(init_sender(&attach_info, sq_entries_bytesize))
                 },
                 receiver: if init_flags.contains(IoUringCreateFlags::BITS_32) {
-                    GenericReceiver::Bits32(init_receiver(&attach_info))
+                    GenericReceiver::Bits32(init_receiver(&attach_info, cq_entries_bytesize))
                 } else {
-                    GenericReceiver::Bits64(init_receiver(&attach_info))
+                    GenericReceiver::Bits64(init_receiver(&attach_info, cq_entries_bytesize))
                 },
             })
         }
@@ -733,6 +741,8 @@ pub use consumer_instance::{
 };
 
 mod producer_instance {
+    use core::mem;
+
     use syscall::io_uring::v1::{CqEntry32, CqEntry64, Ring, SqEntry32, SqEntry64};
     use syscall::io_uring::{IoUringRecvFlags, IoUringRecvInfo};
 
@@ -860,33 +870,45 @@ mod producer_instance {
             } // TODO: Better error code
             let flags = IoUringRecvFlags::from_bits(recv_info.flags).ok_or(Error::new(EINVAL))?;
 
-            fn init_sender<C>(info: &IoUringRecvInfo) -> SpscSender<C> {
+            fn init_sender<C>(info: &IoUringRecvInfo, flags: IoUringRecvFlags) -> SpscSender<C> {
                 unsafe {
                     SpscSender::from_raw(
                         info.cr_virtaddr as *const Ring<C>,
+                        4096, // TODO
                         info.ce_virtaddr as *mut C,
+                        info.cq_entry_count.checked_mul(if flags.contains(IoUringRecvFlags::BITS_32) {
+                            mem::size_of::<CqEntry32>()
+                        } else {
+                            mem::size_of::<CqEntry64>()
+                        }).expect("cq entry count with entry size multiplication overflow (producer)"),
                     )
                 }
             }
-            fn init_receiver<S>(info: &IoUringRecvInfo) -> SpscReceiver<S> {
+            fn init_receiver<S>(info: &IoUringRecvInfo, flags: IoUringRecvFlags) -> SpscReceiver<S> {
                 unsafe {
                     SpscReceiver::from_raw(
                         info.sr_virtaddr as *const Ring<S>,
+                        4096, // TODO
                         info.se_virtaddr as *mut S,
+                        info.sq_entry_count.checked_mul(if flags.contains(IoUringRecvFlags::BITS_32) {
+                            mem::size_of::<SqEntry32>()
+                        } else {
+                            mem::size_of::<SqEntry64>()
+                        }).expect("sq entry count with entry size multiplication overflow (producer)")
                     )
                 }
             }
 
             Ok(Self {
                 sender: if flags.contains(IoUringRecvFlags::BITS_32) {
-                    GenericSender::Bits32(init_sender(recv_info))
+                    GenericSender::Bits32(init_sender(recv_info, flags))
                 } else {
-                    GenericSender::Bits64(init_sender(recv_info))
+                    GenericSender::Bits64(init_sender(recv_info, flags))
                 },
                 receiver: if flags.contains(IoUringRecvFlags::BITS_32) {
-                    GenericReceiver::Bits32(init_receiver(recv_info))
+                    GenericReceiver::Bits32(init_receiver(recv_info, flags))
                 } else {
-                    GenericReceiver::Bits64(init_receiver(recv_info))
+                    GenericReceiver::Bits64(init_receiver(recv_info, flags))
                 },
                 ringfd: recv_info.producerfd,
             })

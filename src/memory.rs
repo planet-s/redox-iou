@@ -55,7 +55,7 @@ where
     fn close(&mut self, mmap_entries: pool::MmapEntries<I, E>) -> Result<(), Self::Error> {
         for entry in mmap_entries {
             unsafe {
-                syscall::funmap2(
+                syscall::funmap(
                     entry.pointer.as_ptr() as usize,
                     entry.size.try_into().or(Err(Error::new(EFAULT)))?,
                 )?
@@ -320,6 +320,7 @@ unsafe fn expand_blocking<I: TryInto<usize>>(
     syscall::fmap(
         fd,
         &Mmap {
+            address: 0, // unused
             offset: offset.try_into().or(Err(Error::new(EOVERFLOW)))?,
             size: len,
             flags: map_flags,
