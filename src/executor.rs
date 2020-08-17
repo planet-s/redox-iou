@@ -148,13 +148,18 @@ impl Executor {
                 .upgrade()
                 .expect("failed to wake up executor: integrated reactor dead");
 
-            let instance_guard = reactor.main_instance.consumer_instance.read();
+            if reactor.main_instance.dropped.load(Ordering::Acquire) {
+                return;
+            }
 
-            match instance_guard.sender() {
+            let consumer_instance = &reactor.main_instance.consumer_instance;
+
+            match &*consumer_instance.sender().read() {
                 ConsumerGenericSender::Bits32(ref sender32) => sender32.notify(),
                 ConsumerGenericSender::Bits64(ref sender64) => sender64.notify(),
             }
-            instance_guard
+
+            consumer_instance
                 .enter_for_notification()
                 .expect("failed to wake up executor: entering the io_uring failed");
         })

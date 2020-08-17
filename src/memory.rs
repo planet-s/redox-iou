@@ -151,7 +151,6 @@ impl Handle {
                         "ring id represents consumer instance, but expected a producer instance",
                     )
                     .producer_instance
-                    .read()
                     .ringfd()
             } else {
                 instance
@@ -160,7 +159,6 @@ impl Handle {
                         "ring id represents producer instance, but expected a consumer instance",
                     )
                     .consumer_instance
-                    .read()
                     .ringfd()
             }
         };

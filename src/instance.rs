@@ -1,6 +1,8 @@
 mod consumer_instance {
     use std::{mem, slice};
 
+    use parking_lot::RwLock;
+
     use syscall::data::Map;
     use syscall::error::EINVAL;
     use syscall::error::{Error, Result};
@@ -133,15 +135,23 @@ mod consumer_instance {
                 .flags = Some(flags);
             self
         }
-        /// Set the submission entry count. Note that it only makes sense for the count, multiplied
-        /// by the entry type (depending on the flags), to be divisible by the page size.
+        /// Set the submission entry count.
+        ///
+        /// Note that it only makes sense for the count, multiplied by the entry type (depending on
+        /// the flags), to be divisible by the page size.
+        ///
+        /// The count _must_ also be a power of two.  The reason for this is to simplify the
+        /// internal ring logic; with an entry count that is a power of two, divisions are much
+        /// cheaper, and overflows do not even need to be handled at all.
         ///
         /// # Panics
         ///
-        /// This method will panic if called after the [`create_instance`] method.
+        /// This method will panic if called after the [`create_instance`] method, or if the count
+        /// is not a power of two.
         ///
         /// [`create_instance`]: #method.create_instance
         pub fn with_submission_entry_count(mut self, sq_entry_count: usize) -> Self {
+            assert!(sq_entry_count.is_power_of_two());
             self.as_create_stage()
                 .expect("cannot set submission entry count after kernel instance is created")
                 .sq_entry_count = Some(sq_entry_count);
@@ -172,12 +182,17 @@ mod consumer_instance {
         /// Set the completion entry count. Note that it only makes sense for the count, multiplied
         /// by the entry type (depending on the flags), to be divisible by the page size.
         ///
+        /// The number must also be a power of two, to simplify the internal ring logic, mainly for
+        /// performance.
+        ///
         /// # Panics
         ///
-        /// This method will panic if called after the [`create_instance`] method.
+        /// This method will panic if called after the [`create_instance`] method, or if the count
+        /// is not a power of two.
         ///
         /// [`create_instance`]: #method.create_instance
         pub fn with_completion_entry_count(mut self, cq_entry_count: usize) -> Self {
+            assert!(cq_entry_count.is_power_of_two());
             self.as_create_stage()
                 .expect("cannot set completion entry count after kernel instance is created")
                 .cq_entry_count = Some(cq_entry_count);
@@ -498,8 +513,14 @@ mod consumer_instance {
         fn attach_inner(self, scheme_name: &[u8]) -> Result<Instance> {
             let kernel = scheme_name == b":";
 
-            let sq_entries_bytesize = self.submission_entries_bytesize();
-            let cq_entries_bytesize = self.completion_entries_bytesize();
+            let sq_entry_count = self.submission_entry_count();
+            let cq_entry_count = self.completion_entry_count();
+
+            assert!(sq_entry_count.is_power_of_two());
+            assert!(cq_entry_count.is_power_of_two());
+
+            let sq_log2_entry_count = sq_entry_count.trailing_zeros();
+            let cq_log2_entry_count = cq_entry_count.trailing_zeros();
 
             let init_flags = self.flags();
             let attach_info = self
@@ -508,23 +529,29 @@ mod consumer_instance {
 
             syscall::attach_iouring(attach_info.ringfd, scheme_name)?;
 
-            fn init_sender<S>(info: &InstanceBuilderAttachStageInfo, sq_entries_bytesize: usize) -> SpscSender<S> {
+            fn init_sender<Sqe>(
+                info: &InstanceBuilderAttachStageInfo,
+                sq_log2_entry_count: u32,
+            ) -> SpscSender<Sqe> {
                 unsafe {
                     SpscSender::from_raw(
-                        info.sr_virtaddr as *const Ring<S>,
+                        info.sr_virtaddr as *const Ring<Sqe>,
                         4096, // TODO
-                        info.se_virtaddr as *mut S,
-                        sq_entries_bytesize,
+                        info.se_virtaddr as *mut Sqe,
+                        sq_log2_entry_count,
                     )
                 }
             }
-            fn init_receiver<C>(info: &InstanceBuilderAttachStageInfo, cq_entries_bytesize: usize) -> SpscReceiver<C> {
+            fn init_receiver<Cqe>(
+                info: &InstanceBuilderAttachStageInfo,
+                cq_log2_entry_count: u32,
+            ) -> SpscReceiver<Cqe> {
                 unsafe {
                     SpscReceiver::from_raw(
-                        info.cr_virtaddr as *const Ring<C>,
+                        info.cr_virtaddr as *const Ring<Cqe>,
                         4096, // TODO
-                        info.ce_virtaddr as *const C,
-                        cq_entries_bytesize,
+                        info.ce_virtaddr as *const Cqe,
+                        cq_log2_entry_count,
                     )
                 }
             }
@@ -532,16 +559,16 @@ mod consumer_instance {
             Ok(Instance {
                 with_kernel: kernel,
                 ringfd: attach_info.ringfd,
-                sender: if init_flags.contains(IoUringCreateFlags::BITS_32) {
-                    GenericSender::Bits32(init_sender(&attach_info, sq_entries_bytesize))
+                sender: RwLock::new(if init_flags.contains(IoUringCreateFlags::BITS_32) {
+                    GenericSender::Bits32(init_sender(&attach_info, sq_log2_entry_count))
                 } else {
-                    GenericSender::Bits64(init_sender(&attach_info, sq_entries_bytesize))
-                },
-                receiver: if init_flags.contains(IoUringCreateFlags::BITS_32) {
-                    GenericReceiver::Bits32(init_receiver(&attach_info, cq_entries_bytesize))
+                    GenericSender::Bits64(init_sender(&attach_info, sq_log2_entry_count))
+                }),
+                receiver: RwLock::new(if init_flags.contains(IoUringCreateFlags::BITS_32) {
+                    GenericReceiver::Bits32(init_receiver(&attach_info, cq_log2_entry_count))
                 } else {
-                    GenericReceiver::Bits64(init_receiver(&attach_info, cq_entries_bytesize))
-                },
+                    GenericReceiver::Bits64(init_receiver(&attach_info, cq_log2_entry_count))
+                }),
             })
         }
     }
@@ -660,13 +687,13 @@ mod consumer_instance {
     #[derive(Debug)]
     pub struct Instance {
         ringfd: usize,
-        // TODO: Add finer-grained locks here, when lock_api can be used in the kernel.
-        sender: GenericSender,
-        receiver: GenericReceiver,
+        sender: RwLock<GenericSender>,
+        receiver: RwLock<GenericReceiver>,
         with_kernel: bool,
     }
     impl Instance {
         /// Create a new consumer instance builder, that will build this type.
+        #[inline]
         pub const fn builder() -> InstanceBuilder {
             InstanceBuilder::new()
         }
@@ -674,32 +701,28 @@ mod consumer_instance {
             syscall::close(self.ringfd)?;
             Ok(())
         }
-        /// Take the sender for the submission ring, immutably.
-        pub fn sender_mut(&mut self) -> &mut GenericSender {
-            &mut self.sender
-        }
-        /// Take the receiver for the completion ring, mutably.
-        pub fn receiver_mut(&mut self) -> &mut GenericReceiver {
-            &mut self.receiver
-        }
-        /// Take the sender for the submission ring, immutably.
-        pub fn sender(&self) -> &GenericSender {
+        /// Retrieve the underlying lock protecting the sender.
+        #[inline]
+        pub const fn sender(&self) -> &RwLock<GenericSender> {
             &self.sender
         }
-        /// Take the receiver for the completion ring, immutably.
-        pub fn receiver(&self) -> &GenericReceiver {
+        /// Retrieve the underlying lock protecting the receiver.
+        #[inline]
+        pub const fn receiver(&self) -> &RwLock<GenericReceiver> {
             &self.receiver
         }
         /// Close the instance, causing the kernel to shut down the ring if it wasn't already. This
         /// is equivalent to the Drop handler, but is recommended in lieu, as it allows getting a
         /// potential error code rather than silently dropping the error.
+        #[cold]
         pub fn close(mut self) -> Result<()> {
             self.deinit()?;
             mem::forget(self);
             Ok(())
         }
         /// Get the file descriptor that represents the io_uring instance by the kernel.
-        pub fn ringfd(&self) -> usize {
+        #[inline]
+        pub const fn ringfd(&self) -> usize {
             self.ringfd
         }
         /// Wait for the `io_uring` to be able to pop additional completion entries, while
@@ -708,27 +731,32 @@ mod consumer_instance {
         ///
         /// Allows giving a minimum of completion events before notification, through
         /// `min_complete`.
+        #[inline]
         pub fn enter(&self, min_complete: usize, flags: IoUringEnterFlags) -> Result<usize> {
             syscall::enter_iouring(self.ringfd, min_complete, flags)
         }
         /// Call `SYS_ENTER_IORING` just like [`enter`] does, but with the `ONLY_NOTIFY` flag. This
         /// will not cause the syscall to block (even though it may take some time), but only
         /// notify the waiting context.
+        #[inline]
         pub fn enter_for_notification(&self) -> Result<usize> {
             self.enter(0, IoUringEnterFlags::ONLY_NOTIFY)
         }
         /// Check if the instance is attached to the kernel, or to a userspace process.
-        pub fn is_attached_to_kernel(&self) -> bool {
+        #[inline]
+        pub const fn is_attached_to_kernel(&self) -> bool {
             // TODO: Add this functionality to producers too.
             self.with_kernel
         }
     }
     impl Drop for Instance {
+        #[cold]
         fn drop(&mut self) {
             let _ = self.deinit();
         }
     }
     impl PartialEq for Instance {
+        #[inline]
         fn eq(&self, other: &Self) -> bool {
             self.ringfd == other.ringfd
         }
@@ -741,7 +769,7 @@ pub use consumer_instance::{
 };
 
 mod producer_instance {
-    use core::mem;
+    use parking_lot::RwLock;
 
     use syscall::io_uring::v1::{CqEntry32, CqEntry64, Ring, SqEntry32, SqEntry64};
     use syscall::io_uring::{IoUringRecvFlags, IoUringRecvInfo};
@@ -854,9 +882,10 @@ mod producer_instance {
     /// [`SYS_RECV_IORING`]: ../../syscall/number/constant.SYS_RECV_IORING.html
     #[derive(Debug)]
     pub struct Instance {
-        sender: GenericSender,
-        receiver: GenericReceiver,
+        sender: RwLock<GenericSender>,
+        receiver: RwLock<GenericReceiver>,
         ringfd: usize,
+        with_kernel: bool,
     }
 
     impl Instance {
@@ -864,73 +893,68 @@ mod producer_instance {
         /// the kernel.
         ///
         /// [`SYS_RECV_IORING`]: ../../syscall/number/constant.SYS_RECV_IORING.html
+        #[cold]
         pub fn new(recv_info: &IoUringRecvInfo) -> Result<Self> {
             if recv_info.version.major != 1 {
                 return Err(Error::new(ENOSYS));
             } // TODO: Better error code
             let flags = IoUringRecvFlags::from_bits(recv_info.flags).ok_or(Error::new(EINVAL))?;
 
-            fn init_sender<C>(info: &IoUringRecvInfo, flags: IoUringRecvFlags) -> SpscSender<C> {
+            fn init_sender<C>(info: &IoUringRecvInfo) -> SpscSender<C> {
                 unsafe {
                     SpscSender::from_raw(
                         info.cr_virtaddr as *const Ring<C>,
                         4096, // TODO
                         info.ce_virtaddr as *mut C,
-                        info.cq_entry_count.checked_mul(if flags.contains(IoUringRecvFlags::BITS_32) {
-                            mem::size_of::<CqEntry32>()
-                        } else {
-                            mem::size_of::<CqEntry64>()
-                        }).expect("cq entry count with entry size multiplication overflow (producer)"),
+                        {
+                            assert!(info.sq_entry_count.is_power_of_two());
+                            info.sq_entry_count.trailing_zeros()
+                        },
                     )
                 }
             }
-            fn init_receiver<S>(info: &IoUringRecvInfo, flags: IoUringRecvFlags) -> SpscReceiver<S> {
+            fn init_receiver<S>(info: &IoUringRecvInfo) -> SpscReceiver<S> {
                 unsafe {
                     SpscReceiver::from_raw(
                         info.sr_virtaddr as *const Ring<S>,
                         4096, // TODO
                         info.se_virtaddr as *mut S,
-                        info.sq_entry_count.checked_mul(if flags.contains(IoUringRecvFlags::BITS_32) {
-                            mem::size_of::<SqEntry32>()
-                        } else {
-                            mem::size_of::<SqEntry64>()
-                        }).expect("sq entry count with entry size multiplication overflow (producer)")
+                        {
+                            assert!(info.cq_entry_count.is_power_of_two());
+                            info.cq_entry_count.trailing_zeros()
+                        },
                     )
                 }
             }
 
             Ok(Self {
-                sender: if flags.contains(IoUringRecvFlags::BITS_32) {
-                    GenericSender::Bits32(init_sender(recv_info, flags))
+                sender: RwLock::new(if flags.contains(IoUringRecvFlags::BITS_32) {
+                    GenericSender::Bits32(init_sender(recv_info))
                 } else {
-                    GenericSender::Bits64(init_sender(recv_info, flags))
-                },
-                receiver: if flags.contains(IoUringRecvFlags::BITS_32) {
-                    GenericReceiver::Bits32(init_receiver(recv_info, flags))
+                    GenericSender::Bits64(init_sender(recv_info))
+                }),
+                receiver: RwLock::new(if flags.contains(IoUringRecvFlags::BITS_32) {
+                    GenericReceiver::Bits32(init_receiver(recv_info))
                 } else {
-                    GenericReceiver::Bits64(init_receiver(recv_info, flags))
-                },
+                    GenericReceiver::Bits64(init_receiver(recv_info))
+                }),
                 ringfd: recv_info.producerfd,
+                with_kernel: flags.contains(IoUringRecvFlags::FROM_KERNEL),
             })
         }
-        /// Take the sender of the completion ring, mutably.
-        pub fn sender_mut(&mut self) -> &mut GenericSender {
-            &mut self.sender
-        }
-        /// Take the sender of the completion ring, immutably.
-        pub fn sender(&self) -> &GenericSender {
+        /// Get the lock protecting the sender.
+        #[inline]
+        pub const fn sender(&self) -> &RwLock<GenericSender> {
             &self.sender
         }
-        /// Take the receiver of the submission ring, mutably.
-        pub fn receiver_mut(&mut self) -> &mut GenericReceiver {
-            &mut self.receiver
-        }
-        /// Take the receiver of the submission ring, immutably.
-        pub fn receiver(&self) -> &GenericReceiver {
+        /// Get the lock protecting the receiver.
+        #[inline]
+        pub const fn receiver(&self) -> &RwLock<GenericReceiver> {
             &self.receiver
         }
         /// Get the file descriptor that is tied to the instance and the rings, by the kernel.
-        pub fn ringfd(&self) -> usize {
+        #[inline]
+        pub const fn ringfd(&self) -> usize {
             self.ringfd
         }
     }

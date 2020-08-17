@@ -108,15 +108,15 @@ pub struct Reactor {
 #[derive(Debug)]
 pub(crate) struct ConsumerInstanceWrapper {
     // a convenient safe wrapper over the raw underlying interface.
-    pub(crate) consumer_instance: RwLock<ConsumerInstance>,
+    pub(crate) consumer_instance: ConsumerInstance,
 
     // stored when the ring encounters a shutdown error either when submitting an SQ, or receiving
     // a CQ.
-    dropped: AtomicBool,
+    pub(crate) dropped: AtomicBool,
 }
 #[derive(Debug)]
 pub(crate) struct ProducerInstanceWrapper {
-    pub(crate) producer_instance: RwLock<ProducerInstance>,
+    pub(crate) producer_instance: ProducerInstance,
     stream_state: Option<Arc<Mutex<ProducerSqesState>>>,
     dropped: AtomicBool,
 }
@@ -346,7 +346,7 @@ impl ReactorBuilder {
 impl Reactor {
     fn new(main_instance: ConsumerInstance, trusted_main_instance: bool) -> Arc<Self> {
         let main_instance = ConsumerInstanceWrapper {
-            consumer_instance: RwLock::new(main_instance),
+            consumer_instance: main_instance,
             dropped: AtomicBool::new(false),
         };
 
@@ -390,7 +390,8 @@ impl Reactor {
         }
     }
     /// Add an additional secondary instance to the reactor, waking up the executor to include it
-    /// if necessary. If the main SQ is full, this will fail with ENOSPC (TODO: fix this).
+    /// if necessary. If the main SQ is full, this will fail with ENOSPC (TODO: fix this, and block
+    /// instead).
     pub fn add_secondary_instance(
         &self,
         instance: ConsumerInstance,
@@ -399,7 +400,7 @@ impl Reactor {
         let ringfd = instance.ringfd();
         self.add_secondary_instance_generic(
             SecondaryInstanceWrapper::ConsumerInstance(ConsumerInstanceWrapper {
-                consumer_instance: RwLock::new(instance),
+                consumer_instance: instance,
                 dropped: AtomicBool::new(false),
             }),
             ringfd,
@@ -422,8 +423,8 @@ impl Reactor {
 
             self.main_instance
                 .consumer_instance
+                .sender()
                 .write()
-                .sender_mut()
                 .as_64_mut()
                 .expect("expected SqEntry64")
                 .try_send(SqEntry64 {
@@ -465,7 +466,7 @@ impl Reactor {
         let ringfd = instance.ringfd();
         self.add_secondary_instance_generic(
             SecondaryInstanceWrapper::ProducerInstance(ProducerInstanceWrapper {
-                producer_instance: RwLock::new(instance),
+                producer_instance: instance,
                 dropped: AtomicBool::new(false),
                 stream_state: None,
             }),
@@ -474,6 +475,7 @@ impl Reactor {
         )
     }
     /// Retrieve the unique ID of this reactor.
+    #[inline]
     pub fn id(&self) -> ReactorId {
         self.id
     }
@@ -488,24 +490,24 @@ impl Reactor {
         primary: bool,
     ) {
         let a = if wait {
-            let read_guard = instance.consumer_instance.read();
-            let flags = if unsafe {
-                read_guard
-                    .sender()
-                    .as_64()
-                    .expect("expected 64-bit SQEs")
-                    .ring_header()
-            }
-            .available_entry_count_spsc()
-                > 0
-            {
+            let free_entry_count = instance
+                .consumer_instance
+                .sender()
+                .read()
+                .as_64()
+                .expect("expected 64-bit SQEs")
+                .free_entry_count();
+
+            let flags = if free_entry_count > 0 {
                 IoUringEnterFlags::empty()
             } else {
+                // TODO: ... and has entries that need to be pushed?
                 IoUringEnterFlags::WAKEUP_ON_SQ_AVAIL
             };
             log::debug!("Entering io_uring");
             Some(
-                read_guard
+                instance
+                    .consumer_instance
                     .enter(0, flags)
                     .expect("redox_iou: failed to enter io_uring"),
             )
@@ -514,10 +516,11 @@ impl Reactor {
         };
         log::debug!("Entered io_uring with a {:?}", a);
 
-        let mut intent_guard = instance.consumer_instance.upgradable_read();
-
-        let ring_header = unsafe { intent_guard.receiver().as_64().unwrap().ring_header() };
-        let available_completions = ring_header.available_entry_count_spsc();
+        let mut receiver_intent_guard = instance.consumer_instance.receiver().upgradable_read();
+        let available_completions = receiver_intent_guard
+            .as_64()
+            .unwrap()
+            .available_entry_count();
 
         log::debug!("Available completions: {}", available_completions);
 
@@ -526,13 +529,13 @@ impl Reactor {
         }
 
         for i in 0..available_completions {
-            let mut write_guard = RwLockUpgradableReadGuard::upgrade(intent_guard);
-            let result = write_guard
-                .receiver_mut()
+            let mut receiver_write_guard =
+                RwLockUpgradableReadGuard::upgrade(receiver_intent_guard);
+            let result = receiver_write_guard
                 .as_64_mut()
                 .expect("expected 64-bit CQEs")
                 .try_recv();
-            intent_guard = RwLockWriteGuard::downgrade_to_upgradable(write_guard);
+            receiver_intent_guard = RwLockWriteGuard::downgrade_to_upgradable(receiver_write_guard);
 
             match result {
                 Ok(cqe) => {
@@ -608,8 +611,14 @@ impl Reactor {
                     waker: ref mut future_waker,
                 } => {
                     if deque.len() < capacity {
-                        let mut guard = instance.producer_instance.write();
-                        let sqe = match guard.receiver_mut().as_64_mut().unwrap().try_recv() {
+                        let sqe = match instance
+                            .producer_instance
+                            .receiver()
+                            .write()
+                            .as_64_mut()
+                            .unwrap()
+                            .try_recv()
+                        {
                             Ok(sqe) => sqe,
                             Err(RingPopError::Empty { .. }) => break,
                             Err(RingPopError::Shutdown) => {
@@ -621,7 +630,7 @@ impl Reactor {
                                 break;
                             }
                         };
-                        log::info!("Secondary producer SQE: {:?}", sqe);
+                        log::trace!("Secondary producer SQE: {:?}", sqe);
                         deque.push_back(sqe);
                         if let Some(future_waker) = future_waker.take() {
                             future_waker.wake();
@@ -689,8 +698,7 @@ impl Reactor {
     pub(crate) fn instance(
         &self,
         ring: impl Into<RingId>,
-    ) -> Option<Either<&RwLock<ConsumerInstance>, MappedRwLockReadGuard<RwLock<ConsumerInstance>>>>
-    {
+    ) -> Option<Either<&ConsumerInstance, MappedRwLockReadGuard<ConsumerInstance>>> {
         let ring = ring.into();
 
         if ring.reactor() != self.id() {
@@ -962,13 +970,16 @@ impl Handle {
                 panic!("cannot send producer CQE using a consumer instance")
             }
         };
-        let mut producer_instance_guard = producer_instance.producer_instance.write();
-        match producer_instance_guard
-            .sender_mut()
+
+        let send_result = producer_instance
+            .producer_instance
+            .sender()
+            .write()
             .as_64_mut()
             .unwrap()
-            .try_send(cqe)
-        {
+            .try_send(cqe);
+
+        match send_result {
             Ok(()) => Ok(()),
             Err(RingPushError::Full(_)) => Err(RingPushError::Full(cqe)),
             Err(RingPushError::Shutdown(_)) => {

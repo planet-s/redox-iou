@@ -88,7 +88,7 @@ impl From<CommandFutureInner> for FdUpdates {
 }
 
 fn try_submit(
-    instance: &mut ConsumerInstance,
+    instance: &ConsumerInstance,
     state: &mut State,
     cx: &mut task::Context<'_>,
     sqe: SqEntry64,
@@ -105,7 +105,8 @@ fn try_submit(
     log::debug!("Sending SQE {:?}", sqe);
 
     match instance
-        .sender_mut()
+        .sender()
+        .write()
         .as_64_mut()
         .expect("expected instance with 64-bit SQEs")
         .try_send(sqe)
@@ -173,13 +174,13 @@ impl CommandFutureInner {
             in_state_sqe = Some(sqe);
             init_sqe = &mut in_state_sqe;
         }
-        let instance_lock_either = reactor.instance(self.ring);
-        let instance_lock = &*instance_lock_either
-            .expect("cannot poll CommandFuture: instance is a producer instance");
+        let instance_either = reactor.instance(self.ring);
+        let instance =
+            &*instance_either.expect("cannot poll CommandFuture: instance is a producer instance");
 
         match &mut state_guard.inner {
             &mut StateInner::Initial | &mut StateInner::Submitting(_, _) => try_submit(
-                &mut *instance_lock.write(),
+                instance,
                 &mut *state_guard,
                 cx,
                 init_sqe.expect("expected an initial SQE when submitting command"),
