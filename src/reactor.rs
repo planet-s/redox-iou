@@ -1808,6 +1808,9 @@ impl Handle {
     /// # Panics
     ///
     /// This will panic if param is some, and the [`DupFlags::PARAM`] isn't set, or vice versa.
+    ///
+    /// [`dup_parameterless`]: #method.dup_parameterless
+    /// [`dup_unchecked`]: #method.dup_unchecked
     pub async fn dup<G>(
         &self,
         id: impl Into<RingId>,
@@ -1832,6 +1835,8 @@ impl Handle {
     /// # Panics
     ///
     /// Since this doesn't pass a parameter, it'll panic if the flags contain [`DupFlags::PARAM`].
+    ///
+    /// [`dup`]: #method.dup
     pub async fn dup_parameterless(
         &self,
         id: impl Into<RingId>,
@@ -2006,17 +2011,18 @@ pub unsafe trait AsOffsetLen {
 ///
 /// Refer to [`AsOffsetLen`].
 pub unsafe trait AsOffsetLenMut: AsOffsetLen {
-    /// Same as [`offset`], but different since the default AsMut impl may point to a different
-    /// slice.
+    /// Same as [`AsOffsetLen::offset`], but different since the default AsMut impl may point to a
+    /// different slice.
     fn offset_mut(&mut self) -> u64;
-    /// Same as [`len`], but different since the default AsMut impl may point to a different slice.
+    /// Same as [`AsOffsetLen::len`], but different since the default AsMut impl may point to a
+    /// different slice.
     fn len_mut(&mut self) -> Option<u64>;
-    /// Same as [`addr`], but different since the default AsMut impl may point to a different
-    /// slice.
+    /// Same as [`AsOffsetLen::addr`], but different since the default AsMut impl may point to a
+    /// different slice.
     fn addr_mut(&mut self) -> usize;
 
-    /// Same as [`is_empty`], but different since the default AsMut impl may point to a different
-    /// slice.
+    /// Same as [`AsOffsetLen::is_empty`], but different since the default AsMut impl may point to
+    /// a different slice.
     fn is_empty_mut(&mut self) -> bool {
         self.len_mut() == Some(0)
     }

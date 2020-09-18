@@ -738,6 +738,8 @@ mod consumer_instance {
         /// Call `SYS_ENTER_IORING` just like [`enter`] does, but with the `ONLY_NOTIFY` flag. This
         /// will not cause the syscall to block (even though it may take some time), but only
         /// notify the waiting context.
+        ///
+        /// [`enter`]: #method.enter
         #[inline]
         pub fn enter_for_notification(&self) -> Result<usize> {
             self.enter(0, IoUringEnterFlags::ONLY_NOTIFY)
