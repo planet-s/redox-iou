@@ -2,10 +2,10 @@ use std::convert::{TryFrom, TryInto};
 use std::sync::atomic::Ordering;
 use std::{fmt, mem};
 
-use syscall::error::ESHUTDOWN;
+use syscall::error::{EIO, ESHUTDOWN};
 use syscall::error::{Error, Result};
 
-pub use syscall::io_uring::v1::{Ring, RingPopError, RingPushError, RingStatus};
+pub use syscall::io_uring::v1::{BrokenRing, Ring, RingPopError, RingPushError, RingStatus};
 
 /// A safe wrapper over the raw `Ring` interface, that takes care of the mmap offset, as well
 /// as the global `Ring` structure. Only allows sending items.
@@ -101,7 +101,8 @@ impl<T> SpscSender<T> {
                     core::sync::atomic::spin_loop_hint();
                     continue;
                 }
-                Err(RingPushError::Shutdown(i)) => return Err(RingSendError::Shutdown(i)),
+                Err(RingPushError::Shutdown(item)) => return Err(RingSendError::Shutdown(item)),
+                Err(RingPushError::Broken(item)) => return Err(RingSendError::Broken(item)),
             }
         }
     }
@@ -160,11 +161,14 @@ impl<T> SpscSender<T> {
 
     /// Get the number of free entry slots that can be pushed to, at the time the function was
     /// called.
+    ///
+    /// This is fallible, and an error is returned if the ring is no longer in a correct state.
     #[inline]
-    pub fn free_entry_count(&self) -> usize {
+    pub fn free_entry_count(&self) -> Result<usize> {
         unsafe {
             self.ring_header()
                 .available_entry_count(self.log2_entry_count as usize)
+                .map_err(|_| Error::new(EIO))
         }
     }
 }
@@ -271,6 +275,7 @@ impl<T> SpscReceiver<T> {
                     continue;
                 }
                 Err(RingPopError::Shutdown) => return Err(RingRecvError::Shutdown),
+                Err(RingPopError::Broken) => return Err(RingRecvError::Broken),
             }
         }
     }
@@ -323,7 +328,7 @@ impl<T> SpscReceiver<T> {
 
     /// Get the number of available entries to pop, at the time this method was called.
     #[inline]
-    pub fn available_entry_count(&self) -> usize {
+    pub fn available_entry_count(&self) -> Result<usize, BrokenRing> {
         unsafe {
             self.ring_header()
                 .available_entry_count(self.log2_entry_count as usize)
@@ -362,11 +367,17 @@ pub enum RingSendError<T> {
     ///
     /// The value from the send attempt is preserved here, for reusage purposes.
     Shutdown(T),
+
+    /// Pushing a new entry to the ring was impossible, due to the ring having entered an
+    /// inconsistent state, typically caused by buggy or undefined behavior in either of the
+    /// producer or consumer.
+    Broken(T),
 }
 impl<T> From<RingSendError<T>> for Error {
     fn from(error: RingSendError<T>) -> Error {
         match error {
             RingSendError::Shutdown(_) => Error::new(ESHUTDOWN),
+            RingSendError::Broken(_) => Error::new(EIO),
         }
     }
 }
@@ -374,6 +385,7 @@ impl<T> core::fmt::Display for RingSendError<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Shutdown(_) => write!(f, "receiver side has shut down"),
+            Self::Broken(_) => write!(f, "broken ring"),
         }
     }
 }
@@ -384,11 +396,15 @@ pub enum RingRecvError {
     /// Popping from the ring was impossible, since the ring had been shutdown from the other side,
     /// most likely due to ring deinitialization.
     Shutdown,
+
+    /// Popping was impossible since the ring had entered an invalid state.
+    Broken,
 }
 impl From<RingRecvError> for Error {
     fn from(error: RingRecvError) -> Error {
         match error {
             RingRecvError::Shutdown => Error::new(ESHUTDOWN),
+            RingRecvError::Broken => Error::new(EIO),
         }
     }
 }
@@ -396,6 +412,7 @@ impl core::fmt::Display for RingRecvError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Shutdown => write!(f, "sender side has shut down"),
+            Self::Broken => write!(f, "broken ring"),
         }
     }
 }
@@ -465,6 +482,7 @@ mod tests {
                             continue 'retry;
                         }
                         Err(RingPushError::Shutdown(_)) => break 'pushing,
+                        Err(RingPushError::Broken(_)) => unreachable!(),
                     }
                 }
             }
@@ -489,6 +507,7 @@ mod tests {
                         continue 'retry;
                     }
                     Err(RingPopError::Shutdown) => break 'popping,
+                    Err(RingPopError::Broken) => unreachable!(),
                 }
             }
         }

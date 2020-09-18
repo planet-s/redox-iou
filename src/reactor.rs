@@ -19,7 +19,7 @@ use std::{ops, task};
 
 use syscall::data::IoVec;
 use syscall::error::{Error, Result};
-use syscall::error::{E2BIG, EBADF, ECANCELED, EFAULT, EINVAL, EOPNOTSUPP, EOVERFLOW};
+use syscall::error::{E2BIG, EBADF, ECANCELED, EFAULT, EINVAL, EIO, EOPNOTSUPP, EOVERFLOW};
 use syscall::flag::{EventFlags, MapFlags};
 use syscall::io_uring::operation::{DupFlags, FilesUpdateFlags};
 use syscall::io_uring::v1::{
@@ -43,6 +43,8 @@ use crate::instance::{ConsumerInstance, ProducerInstance};
 use crate::memory::{Guardable, Guarded};
 
 pub use redox_buffer_pool::NoGuard;
+
+type GuardedPlaceholder = Guarded<DefaultSubmissionGuard, &'static [u8], guard_trait::marker::Shared>;
 
 /// A unique ID that every reactor gets upon initialization.
 ///
@@ -480,7 +482,13 @@ impl Reactor {
         self.id
     }
     pub(crate) fn drive_primary(&self, waker: &task::Waker, wait: bool) {
-        self.drive(&self.main_instance, waker, wait, true)
+        match self.drive(&self.main_instance, waker, wait, true) {
+            Ok(()) => (),
+            Err(error) => {
+                log::warn!("Error when driving primary ring: {}", error);
+                return;
+            }
+        }
     }
     fn drive(
         &self,
@@ -488,7 +496,7 @@ impl Reactor {
         waker: &task::Waker,
         wait: bool,
         primary: bool,
-    ) {
+    ) -> Result<()> {
         let a = if wait {
             let free_entry_count = instance
                 .consumer_instance
@@ -496,7 +504,7 @@ impl Reactor {
                 .read()
                 .as_64()
                 .expect("expected 64-bit SQEs")
-                .free_entry_count();
+                .free_entry_count()?;
 
             let flags = if free_entry_count > 0 {
                 IoUringEnterFlags::empty()
@@ -517,10 +525,19 @@ impl Reactor {
         log::debug!("Entered io_uring with a {:?}", a);
 
         let mut receiver_intent_guard = instance.consumer_instance.receiver().upgradable_read();
+
         let available_completions = receiver_intent_guard
             .as_64()
             .unwrap()
             .available_entry_count();
+
+        let available_completions = match available_completions {
+            Ok(avail) => avail,
+            Err(error) => {
+                log::error!("Failed to retrieve the number of available completions of ring: {}", error);
+                return Err(Error::new(EIO));
+            }
+        };
 
         log::debug!("Available completions: {}", available_completions);
 
@@ -574,28 +591,31 @@ impl Reactor {
                             .get(secondary_instance_index)
                             .expect("fd backref BTreeMap corrupt, contains a file descriptor that was removed")
                         {
-                            SecondaryInstanceWrapper::ConsumerInstance(ref instance) => self.drive(instance, waker, false, false),
-                            SecondaryInstanceWrapper::ProducerInstance(ref instance) => self.drive_producer_instance(&instance),
+                            SecondaryInstanceWrapper::ConsumerInstance(ref instance) => self.drive(instance, waker, false, false)?,
+                            SecondaryInstanceWrapper::ProducerInstance(ref instance) => self.drive_producer_instance(&instance)?,
                         }
 
                     } else {
                         let _ = Self::handle_cqe(self.trusted_main_instance && primary, self.tag_map.read(), waker, cqe);
                     }
-
                 }
                 Err(RingPopError::Empty { .. }) => panic!("the kernel gave us a higher number of available completions than actually available (at {}/{})", i, available_completions),
                 Err(RingPopError::Shutdown) => { instance.dropped.store(true, std::sync::atomic::Ordering::Release); break },
+                Err(RingPopError::Broken) => {
+                    log::error!("Ring (instance: {:?}) was not able to pop, as it had entered an inconsistent state. This is either a bug in the producer, a bug in the io_uring management of this process, or a kernel bug.", instance);
+                }
             }
         }
+        Ok(())
     }
-    fn drive_producer_instance(&self, instance: &ProducerInstanceWrapper) {
+    fn drive_producer_instance(&self, instance: &ProducerInstanceWrapper) -> Result<()> {
         log::debug!("Event was an external producer io_uring, thus polling the ring itself");
         loop {
             assert!(self.trusted_main_instance);
 
             let state_lock = match instance.stream_state {
                 Some(ref s) => s,
-                None => return,
+                None => return Ok(()),
             };
             let mut state_guard = state_lock.lock();
             log::debug!("Driving state: {:?}", &*state_guard);
@@ -629,6 +649,10 @@ impl Reactor {
                                 *state_guard = ProducerSqesState::Finished;
                                 break;
                             }
+                            Err(RingPopError::Broken) => {
+                                log::error!("Producer instance {:?} had a broken io_uring. Failing with EIO, causing the ring to be removed from the reactor.", instance);
+                                return Err(Error::new(EIO));
+                            }
                         };
                         log::trace!("Secondary producer SQE: {:?}", sqe);
                         deque.push_back(sqe);
@@ -646,6 +670,7 @@ impl Reactor {
                 ProducerSqesState::Finished => break,
             }
         }
+        Ok(())
     }
     fn handle_cqe(
         trusted_instance: bool,
@@ -982,7 +1007,7 @@ impl Handle {
         match send_result {
             Ok(()) => Ok(()),
             Err(RingPushError::Full(_)) => Err(RingPushError::Full(cqe)),
-            Err(RingPushError::Shutdown(_)) => {
+            Err(RingPushError::Shutdown(_)) | Err(RingPushError::Broken(_)) => {
                 producer_instance
                     .dropped
                     .store(true, atomic::Ordering::Release);
@@ -991,9 +1016,11 @@ impl Handle {
         }
     }
     /// Create a futures-compatible stream that yields the SQEs sent by the consumer, to this
-    /// producer. The capacity field will specify the number of SQEs in the internal queue of the
-    /// stream. A low capacity will cause the ring to be polled more often, while a higher capacity
-    /// will prevent congestion control to some extent, by popping the submission ring more often,
+    /// producer.
+    ///
+    /// The capacity field will specify the number of SQEs in the internal queue of the stream. A
+    /// low capacity will cause the ring to be polled more often, while a higher capacity will
+    /// prevent congestion control to some extent, by popping the submission ring more often,
     /// allowing the consumer to push more entries before it must block.
     ///
     /// TODO: Poll the ring directly from the future instead.
@@ -1206,7 +1233,7 @@ impl Handle {
         let ring = ring.into();
 
         let (fd, _) = self
-            .open_raw_unchecked_inner(ring, ctx, Either::<&B, [u8; 0]>::Left(path), flags, at)
+            .open_raw_unchecked_inner(ring, ctx, Either::<&B, GuardedPlaceholder>::Left(path), flags, at)
             .await?;
         Ok(fd)
     }
@@ -1335,7 +1362,7 @@ impl Handle {
                             .ok_or(Error::new(EFAULT))?,
                     ))
                 },
-                Either::<_, ()>::Left(buf),
+                Either::<_, GuardedPlaceholder>::Left(buf),
             )
             .await?;
         Ok(bytes_read)
@@ -1404,7 +1431,7 @@ impl Handle {
                 ctx,
                 fd,
                 |sqe, fd, bufs| Ok(sqe.readv(fd, bufs.left().unwrap())),
-                Either::<_, ()>::Left(bufs),
+                Either::<_, GuardedPlaceholder>::Left(bufs),
             )
             .await?;
         Ok(bytes_read)
@@ -1445,7 +1472,7 @@ impl Handle {
                         offset,
                     ))
                 },
-                Either::<_, ()>::Left(buf),
+                Either::<_, GuardedPlaceholder>::Left(buf),
             )
             .await?;
         Ok(bytes_read)
@@ -1515,7 +1542,7 @@ impl Handle {
                 ctx,
                 fd,
                 |sqe, fd, bufs| Ok(sqe.preadv(fd, bufs.left().unwrap(), offset)),
-                Either::<_, ()>::Left(bufs),
+                Either::<_, GuardedPlaceholder>::Left(bufs),
             )
             .await?;
         Ok(bytes_read)
@@ -1555,7 +1582,7 @@ impl Handle {
                             .ok_or(Error::new(EFAULT))?,
                     ))
                 },
-                Either::<_, ()>::Left(buf),
+                Either::<_, GuardedPlaceholder>::Left(buf),
             )
             .await?;
         Ok(bytes_written)
@@ -1623,7 +1650,7 @@ impl Handle {
                 ctx,
                 fd,
                 |sqe, fd, bufs| Ok(sqe.writev(fd, bufs.left().unwrap())),
-                Either::<_, ()>::Left(bufs),
+                Either::<_, GuardedPlaceholder>::Left(bufs),
             )
             .await?;
         Ok(bytes_written)
@@ -1664,7 +1691,7 @@ impl Handle {
                         offset,
                     ))
                 },
-                Either::<_, ()>::Left(buf),
+                Either::<_, GuardedPlaceholder>::Left(buf),
             )
             .await?;
         Ok(bytes_written)
@@ -1737,7 +1764,7 @@ impl Handle {
                 ctx,
                 fd,
                 |sqe, fd, bufs| Ok(sqe.pwritev(fd, bufs.left().unwrap(), offset)),
-                Either::<_, ()>::Left(bufs),
+                Either::<_, GuardedPlaceholder>::Left(bufs),
             )
             .await?;
         Ok(bytes_written)
@@ -1768,7 +1795,7 @@ impl Handle {
         P: AsOffsetLen,
     {
         let (fd, _) = self
-            .dup_unchecked_inner(ring, ctx, fd, flags, param.map(Either::<_, [u8; 0]>::Left))
+            .dup_unchecked_inner(ring, ctx, fd, flags, param.map(Either::<_, GuardedPlaceholder>::Left))
             .await?;
         Ok(fd)
     }
@@ -1818,7 +1845,7 @@ impl Handle {
                 ctx,
                 fd,
                 flags,
-                Option::<crate::memory::Guarded<DefaultSubmissionGuard, Vec<u8>>>::None,
+                Option::<GuardedPlaceholder>::None,
             )
             .await?;
         Ok(fd)
@@ -2118,42 +2145,46 @@ slice_like!(::std::borrow::Cow<'_, [u8]>);
 slice_like!(::std::string::String);
 slice_like!(str);
 slice_like!([u8; 0]);
+slice_like!(&[u8; 0]);
 
 slice_like_mut!([u8]);
 slice_like_mut!(::std::vec::Vec<u8>);
 slice_like_mut!(::std::boxed::Box<[u8]>);
 slice_like_mut!([u8; 0]);
+slice_like!(&mut [u8; 0]);
 // (`Arc` is never mutable)
 // (`Rc` is never mutable)
 // (`Cow` is mutable, but it won't work here)
 // (`String` is AsMut, but not for [u8] (due to UTF-8))
 // (`str` is AsMut, but not for [u8] (due to UTF-8))
 
-unsafe impl<G, T> AsOffsetLen for Guarded<G, T>
+unsafe impl<G, T, M> AsOffsetLen for Guarded<G, T, M>
 where
     G: redox_buffer_pool::Guard,
     T: stable_deref_trait::StableDeref + ops::Deref<Target = [u8]>,
+    M: guard_trait::marker::Mode,
 {
     fn addr(&self) -> usize {
-        self.get_ref().addr()
+        unsafe { self.get_unchecked_ref().addr() }
     }
     fn len(&self) -> Option<u64> {
-        self.get_ref().len().try_into().ok()
+        unsafe { self.get_unchecked_ref().len().try_into().ok() }
     }
     fn offset(&self) -> u64 {
         unreachable!("the Guarded wrapper only works on primary rings")
     }
 }
-unsafe impl<G, T> AsOffsetLenMut for Guarded<G, T>
+unsafe impl<G, T, M> AsOffsetLenMut for Guarded<G, T, M>
 where
     G: redox_buffer_pool::Guard,
     T: stable_deref_trait::StableDeref + AsOffsetLenMut + ops::DerefMut<Target = [u8]>,
+    M: guard_trait::marker::Mode,
 {
     fn addr_mut(&mut self) -> usize {
-        self.get_mut().addr()
+        unsafe { self.get_unchecked_mut() }.addr()
     }
     fn len_mut(&mut self) -> Option<u64> {
-        self.get_mut().len().try_into().ok()
+        unsafe { self.get_unchecked_mut() }.len().try_into().ok()
     }
     fn offset_mut(&mut self) -> u64 {
         unreachable!("the Guarded wrapper only works on primary rings")

@@ -7,7 +7,7 @@ use std::sync::{Arc, Weak};
 use std::task;
 
 use syscall::error::{Error, Result};
-use syscall::error::{ECANCELED, EFAULT, ESHUTDOWN};
+use syscall::error::{ECANCELED, EFAULT, EIO, ESHUTDOWN};
 use syscall::io_uring::{CqEntry64, IoUringCqeFlags, RingPushError, SqEntry64};
 
 use either::*;
@@ -127,6 +127,7 @@ fn try_submit(
             task::Poll::Pending
         }
         Err(RingPushError::Shutdown(_)) => task::Poll::Ready(Some(Err(Error::new(ESHUTDOWN)))),
+        Err(RingPushError::Broken(_)) => task::Poll::Ready(Some(Err(Error::new(EIO)))),
     }
 }
 
