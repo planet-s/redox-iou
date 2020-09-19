@@ -22,7 +22,7 @@ guard-trait = "0.1.1"
 log = "0.4"
 parking_lot = { version = "0.11", features = ["nightly"] }
 redox_syscall = { git = "https://gitlab.redox-os.org/4lDO2/syscall.git", branch = "incompat-io_uring-fix" }
-redox-buffer-pool = { path = "/home/me/Projects/redox-buffer-pool", version = "0.2", features = ["redox"] }
+redox-buffer-pool = { version = "0.3", features = ["redox"] }
 stable_deref_trait = "1.2"
 
 [dev-dependencies]
