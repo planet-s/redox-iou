@@ -527,7 +527,7 @@ mod consumer_instance {
                 .consume_attach_state()
                 .expect("attaching an io_uring before the builder was in its attach stage");
 
-            syscall::attach_iouring(attach_info.ringfd, scheme_name)?;
+            syscall::io_uring_attach(attach_info.ringfd, scheme_name)?;
 
             fn init_sender<Sqe>(
                 info: &InstanceBuilderAttachStageInfo,
@@ -732,8 +732,8 @@ mod consumer_instance {
         /// Allows giving a minimum of completion events before notification, through
         /// `min_complete`.
         #[inline]
-        pub fn enter(&self, min_complete: usize, flags: IoUringEnterFlags) -> Result<usize> {
-            syscall::enter_iouring(self.ringfd, min_complete, flags)
+        pub fn enter(&self, min_complete: usize, min_submit: usize, flags: IoUringEnterFlags) -> Result<usize> {
+            syscall::io_uring_enter(self.ringfd, min_complete, min_submit, flags)
         }
         /// Call `SYS_ENTER_IORING` just like [`enter`] does, but with the `ONLY_NOTIFY` flag. This
         /// will not cause the syscall to block (even though it may take some time), but only
@@ -742,7 +742,7 @@ mod consumer_instance {
         /// [`enter`]: #method.enter
         #[inline]
         pub fn enter_for_notification(&self) -> Result<usize> {
-            self.enter(0, IoUringEnterFlags::ONLY_NOTIFY)
+            self.enter(0, 0, IoUringEnterFlags::ONLY_NOTIFY)
         }
         /// Check if the instance is attached to the kernel, or to a userspace process.
         #[inline]

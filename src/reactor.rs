@@ -516,7 +516,7 @@ impl Reactor {
             Some(
                 instance
                     .consumer_instance
-                    .enter(0, flags)
+                    .enter(0, 0, flags)
                     .expect("redox_iou: failed to enter io_uring"),
             )
         } else {
