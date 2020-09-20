@@ -12,7 +12,7 @@ use syscall::io_uring::v1::{PoolFdEntry, Priority};
 
 use parking_lot::Mutex;
 
-pub use guard_trait::{Guarded, Guardable};
+pub use guard_trait::{Guardable, GuardableExclusive, GuardableShared, Guarded};
 
 pub use redox_buffer_pool as pool;
 
@@ -92,9 +92,10 @@ impl CommandFuture {
     /// Protect a slice with a future guard, preventing the memory from being reclaimed until the
     /// future has completed. This will cause the buffer slice to leak memory if dropped too early,
     /// but prevents undefined behavior.
-    pub fn guard<G>(&self, slice: &mut G)
+    pub fn guard<G, T>(&self, slice: &mut G)
     where
-        G: Guardable<CommandFutureGuard>,
+        G: Guardable<CommandFutureGuard, T>,
+        T: ?Sized,
     {
         let guard_inner = match self.inner.repr {
             CommandFutureRepr::Direct { ref state, .. } => Arc::clone(state),
@@ -334,8 +335,8 @@ pub struct CommandFutureGuard {
     inner: Arc<Mutex<CommandFutureState>>,
     epoch: usize,
 }
-impl pool::Guard for CommandFutureGuard {
-    fn try_release(&self) -> bool {
+impl guard_trait::Guard for CommandFutureGuard {
+    fn try_release(&mut self) -> bool {
         let state_guard = self.inner.lock();
 
         // Only allow reclaiming buffer slices when their guarded future has actually

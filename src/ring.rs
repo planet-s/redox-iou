@@ -2,8 +2,8 @@ use std::convert::{TryFrom, TryInto};
 use std::sync::atomic::Ordering;
 use std::{fmt, mem};
 
-use syscall::error::{EIO, ESHUTDOWN};
 use syscall::error::{Error, Result};
+use syscall::error::{EIO, ESHUTDOWN};
 
 pub use syscall::io_uring::v1::{BrokenRing, Ring, RingPopError, RingPushError, RingStatus};
 

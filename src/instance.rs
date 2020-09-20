@@ -732,7 +732,12 @@ mod consumer_instance {
         /// Allows giving a minimum of completion events before notification, through
         /// `min_complete`.
         #[inline]
-        pub fn enter(&self, min_complete: usize, min_submit: usize, flags: IoUringEnterFlags) -> Result<usize> {
+        pub fn enter(
+            &self,
+            min_complete: usize,
+            min_submit: usize,
+            flags: IoUringEnterFlags,
+        ) -> Result<usize> {
             syscall::io_uring_enter(self.ringfd, min_complete, min_submit, flags)
         }
         /// Call `SYS_ENTER_IORING` just like [`enter`] does, but with the `ONLY_NOTIFY` flag. This

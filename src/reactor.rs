@@ -19,7 +19,9 @@ use std::{ops, task};
 
 use syscall::data::IoVec;
 use syscall::error::{Error, Result};
-use syscall::error::{E2BIG, EBADF, ECANCELED, EFAULT, EINVAL, EIO, EOPNOTSUPP, EOVERFLOW};
+use syscall::error::{
+    E2BIG, EADDRINUSE, EBADF, ECANCELED, EFAULT, EINVAL, EIO, EOPNOTSUPP, EOVERFLOW,
+};
 use syscall::flag::{EventFlags, MapFlags};
 use syscall::io_uring::operation::{DupFlags, FilesUpdateFlags};
 use syscall::io_uring::v1::{
@@ -40,11 +42,12 @@ use crate::future::{
     ProducerSqesState, State, StateInner, Tag,
 };
 use crate::instance::{ConsumerInstance, ProducerInstance};
-use crate::memory::{Guardable, Guarded};
+use crate::memory::{Guardable, GuardableExclusive, GuardableShared, Guarded};
 
 pub use redox_buffer_pool::NoGuard;
 
-type GuardedPlaceholder = Guarded<DefaultSubmissionGuard, &'static [u8], guard_trait::marker::Shared>;
+type GuardedPlaceholder =
+    Guarded<DefaultSubmissionGuard, &'static [u8], guard_trait::marker::Shared>;
 
 /// A unique ID that every reactor gets upon initialization.
 ///
@@ -534,7 +537,10 @@ impl Reactor {
         let available_completions = match available_completions {
             Ok(avail) => avail,
             Err(error) => {
-                log::error!("Failed to retrieve the number of available completions of ring: {}", error);
+                log::error!(
+                    "Failed to retrieve the number of available completions of ring: {}",
+                    error
+                );
                 return Err(Error::new(EIO));
             }
         };
@@ -1134,7 +1140,7 @@ impl Handle {
     ) -> Result<(usize, Option<G>)>
     where
         F: FnOnce(SqEntry64, u64, Either<&mut B, &mut G>) -> Result<SqEntry64>,
-        G: crate::memory::Guardable<DefaultSubmissionGuard>,
+        G: crate::memory::Guardable<DefaultSubmissionGuard, [u8]>,
     {
         let fd: u64 = fd.try_into().or(Err(Error::new(EOVERFLOW)))?;
 
@@ -1166,7 +1172,7 @@ impl Handle {
     ) -> Result<(usize, Option<G>)>
     where
         B: AsOffsetLen + ?Sized,
-        G: Guardable<DefaultSubmissionGuard> + AsOffsetLen,
+        G: Guardable<DefaultSubmissionGuard, [u8]> + AsOffsetLen,
     {
         let ring = ring.into();
 
@@ -1233,7 +1239,13 @@ impl Handle {
         let ring = ring.into();
 
         let (fd, _) = self
-            .open_raw_unchecked_inner(ring, ctx, Either::<&B, GuardedPlaceholder>::Left(path), flags, at)
+            .open_raw_unchecked_inner(
+                ring,
+                ctx,
+                Either::<&B, GuardedPlaceholder>::Left(path),
+                flags,
+                at,
+            )
             .await?;
         Ok(fd)
     }
@@ -1257,7 +1269,7 @@ impl Handle {
         at: Option<usize>,
     ) -> Result<(usize, G)>
     where
-        G: Guardable<DefaultSubmissionGuard> + AsOffsetLen,
+        G: Guardable<DefaultSubmissionGuard, [u8]> + AsOffsetLen,
     {
         let (fd, guard_opt) = unsafe {
             self.open_raw_unchecked_inner(ring, ctx, Either::<&[u8; 0], G>::Right(path), flags, at)
@@ -1380,7 +1392,7 @@ impl Handle {
         buf: G,
     ) -> Result<(usize, G)>
     where
-        G: Guardable<DefaultSubmissionGuard> + AsMut<[u8]>,
+        G: GuardableExclusive<DefaultSubmissionGuard, [u8]>,
     {
         let ring = ring.into();
 
@@ -1394,7 +1406,8 @@ impl Handle {
                         fd,
                         buf.right()
                             .unwrap()
-                            .as_mut()
+                            .try_get_data_mut()
+                            .ok_or(Error::new(EADDRINUSE))?
                             .as_generic_slice_mut(ring.is_primary())
                             .ok_or(Error::new(EFAULT))?,
                     ))
@@ -1491,7 +1504,7 @@ impl Handle {
         offset: u64,
     ) -> Result<(usize, G)>
     where
-        G: Guardable<DefaultSubmissionGuard> + AsMut<[u8]>,
+        G: GuardableExclusive<DefaultSubmissionGuard, [u8]>,
     {
         let ring = ring.into();
 
@@ -1505,7 +1518,8 @@ impl Handle {
                         fd,
                         buf.right()
                             .unwrap()
-                            .as_mut()
+                            .try_get_data_mut()
+                            .ok_or(Error::new(EADDRINUSE))?
                             .as_generic_slice_mut(ring.is_primary())
                             .ok_or(Error::new(EFAULT))?,
                         offset,
@@ -1601,7 +1615,7 @@ impl Handle {
         buf: G,
     ) -> Result<(usize, G)>
     where
-        G: Guardable<DefaultSubmissionGuard> + AsRef<[u8]>,
+        G: GuardableShared<DefaultSubmissionGuard, [u8]>,
     {
         let ring = ring.into();
 
@@ -1615,7 +1629,7 @@ impl Handle {
                         fd,
                         buf.right()
                             .unwrap()
-                            .as_ref()
+                            .data_shared()
                             .as_generic_slice(ring.is_primary())
                             .ok_or(Error::new(EFAULT))?,
                     ))
@@ -1715,7 +1729,7 @@ impl Handle {
         offset: u64,
     ) -> Result<usize>
     where
-        G: Guardable<DefaultSubmissionGuard> + AsRef<[u8]>,
+        G: GuardableShared<DefaultSubmissionGuard, [u8]>,
     {
         let ring = ring.into();
 
@@ -1729,7 +1743,7 @@ impl Handle {
                         fd,
                         buf.right()
                             .unwrap()
-                            .as_ref()
+                            .data_shared()
                             .as_generic_slice(ring.is_primary())
                             .ok_or(Error::new(EFAULT))?,
                         offset,
@@ -1795,7 +1809,13 @@ impl Handle {
         P: AsOffsetLen,
     {
         let (fd, _) = self
-            .dup_unchecked_inner(ring, ctx, fd, flags, param.map(Either::<_, GuardedPlaceholder>::Left))
+            .dup_unchecked_inner(
+                ring,
+                ctx,
+                fd,
+                flags,
+                param.map(Either::<_, GuardedPlaceholder>::Left),
+            )
             .await?;
         Ok(fd)
     }
@@ -1820,7 +1840,7 @@ impl Handle {
         param: Option<G>,
     ) -> Result<(usize, Option<G>)>
     where
-        G: Guardable<DefaultSubmissionGuard> + AsOffsetLen,
+        G: GuardableShared<DefaultSubmissionGuard, [u8]> + AsOffsetLen,
     {
         unsafe {
             self.dup_unchecked_inner(id, ctx, fd, flags, param.map(Either::<[u8; 0], _>::Right))
@@ -1865,7 +1885,7 @@ impl Handle {
     ) -> Result<(usize, Option<G>)>
     where
         P: AsOffsetLen,
-        G: Guardable<DefaultSubmissionGuard> + AsOffsetLen,
+        G: GuardableShared<DefaultSubmissionGuard, [u8]> + AsOffsetLen,
     {
         let ring = ring.into();
 
@@ -2043,7 +2063,7 @@ where
         Some(redox_buffer_pool::BufferSlice::len(self).into())
     }
     fn addr(&self) -> usize {
-        redox_buffer_pool::BufferSlice::as_slice(self).as_ptr() as usize
+        redox_buffer_pool::BufferSlice::try_as_slice(self).expect("TODO: enforce in the type system that AsOffsetLen is only implemented for guardless types").as_ptr() as usize
     }
 }
 unsafe impl<'a, I, H, E, G, C> AsOffsetLenMut for crate::memory::BufferSlice<'a, I, E, G, H, C>
@@ -2061,7 +2081,7 @@ where
         Some(redox_buffer_pool::BufferSlice::len(self).into())
     }
     fn addr_mut(&mut self) -> usize {
-        redox_buffer_pool::BufferSlice::as_slice_mut(self).as_mut_ptr() as usize
+        redox_buffer_pool::BufferSlice::try_as_slice_mut(self).expect("TODO: Enforce in the type system that AsOffsetLenMut is only implemented where there is no guard").as_mut_ptr() as usize
     }
 }
 mod private2 {
