@@ -7,7 +7,8 @@
 //! libraries such as `tokio` and `async-std` do.
 
 #![feature(
-    get_mut_unchecked,
+    arc_new_cyclic,
+    doc_cfg,
     maybe_uninit_ref,
     option_expect_none,
     vec_into_raw_parts

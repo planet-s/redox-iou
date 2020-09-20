@@ -183,6 +183,8 @@ impl Handle {
     }
     /// Create a new buffer pool meant for use by producers. This will ask the kernel for the
     /// offsets the consumer has already preallocated.
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
     pub async fn create_producer_buffer_pool<I: pool::Integer + TryFrom<u64> + TryInto<usize>>(
         &self,
         secondary_instance: SecondaryRingId,
@@ -197,6 +199,8 @@ impl Handle {
     /// Create a buffer pool meant for consumers. The buffer pool will be semi-managed by the
     /// kernel; the kernel will keep track of all mmap ranges that have been allocated, and allow
     /// the consumer to check for new offsets, so that the pool can be expanded correctly.
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
     pub async fn create_buffer_pool<E: Copy, I: pool::Integer + TryInto<usize> + TryInto<u64>>(
         &self,
         secondary_instance: SecondaryRingId,

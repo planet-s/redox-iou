@@ -107,7 +107,7 @@ pub struct Reactor {
     // this is lazily initialized to make things work at initialization, but one should always
     // assume that the reactor holds a weak reference to itself, to make it easier to obtain a
     // handle.
-    weak_ref: Option<Weak<Reactor>>,
+    weak_ref: Weak<Reactor>,
 }
 
 #[derive(Debug)]
@@ -355,7 +355,7 @@ impl Reactor {
             dropped: AtomicBool::new(false),
         };
 
-        let mut reactor_arc = Arc::new(Reactor {
+        Arc::new_cyclic(|weak_ref| Reactor {
             id: ReactorId {
                 inner: LAST_REACTOR_ID.fetch_add(1, atomic::Ordering::Relaxed),
             },
@@ -369,18 +369,8 @@ impl Reactor {
             tag_map: RwLock::new(BTreeMap::new()),
             next_tag: AtomicTag::new(1),
             reusable_tags: ArrayQueue::new(512),
-            weak_ref: None,
-        });
-        let reactor_weak = Arc::downgrade(&reactor_arc);
-        {
-            // SAFETY: This is safe because we know that the only reference to the reactor apart
-            // from the reference we're unsafely upgrading, is the weak reference we are inserting.
-            // Since that reference is only upgraded after the scope in which this unsafe mutable
-            // borrow exists, nothing will happen.
-            let reactor_mut = unsafe { Arc::get_mut_unchecked(&mut reactor_arc) };
-            reactor_mut.weak_ref = Some(reactor_weak);
-        }
-        reactor_arc
+            weak_ref: Weak::clone(weak_ref),
+        })
     }
     /// Retrieve the ring ID of the primary instance, which must be a userspace-to-kernel ring if
     /// there are more than one rings in the reactor.
@@ -391,12 +381,14 @@ impl Reactor {
     /// be weakly owned, and panic on regular operations if this reactor is dropped.
     pub fn handle(&self) -> Handle {
         Handle {
-            reactor: Weak::clone(self.weak_ref.as_ref().unwrap()),
+            reactor: Weak::clone(&self.weak_ref),
         }
     }
     /// Add an additional secondary instance to the reactor, waking up the executor to include it
     /// if necessary. If the main SQ is full, this will fail with ENOSPC (TODO: fix this, and block
     /// instead).
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
     pub fn add_secondary_instance(
         &self,
         instance: ConsumerInstance,
@@ -412,6 +404,7 @@ impl Reactor {
             priority,
         )
     }
+    #[cfg(target_os = "redox")]
     fn add_secondary_instance_generic(
         &self,
         instance: SecondaryInstanceWrapper,
@@ -463,6 +456,8 @@ impl Reactor {
     /// Add a producer instance (the producer of a userspace-to-userspace or kernel-to-userspace
     /// instance). This will use the main ring to register interest in file updates on the file
     /// descriptor of this ring.
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
     pub fn add_producer_instance(
         &self,
         instance: ProducerInstance,
@@ -977,6 +972,8 @@ impl Handle {
     }
     /// Send a Completion Queue Entry to the consumer, waking it up when the reactor enters the
     /// io_uring again.
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
     pub fn send_producer_cqe(
         &self,
         instance: SecondaryRingId,
@@ -1035,6 +1032,8 @@ impl Handle {
     ///
     /// This method will panic if the reactor has been dropped, if the secondary ring ID is
     /// invalid, or if the capacity is zero.
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
     pub fn producer_sqes(&self, ring_id: SecondaryRingId, capacity: usize) -> ProducerSqes {
         let reactor = self
             .reactor
@@ -1797,6 +1796,8 @@ impl Handle {
     /// Additionally, that slice must also outlive the lifetime of this future, and if the future
     /// is dropped or forgotten, the slice must not be used afterwards, since that would lead to a
     /// data race.
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
     pub async unsafe fn dup_unchecked<Id, P>(
         &self,
         ring: impl Into<RingId>,
@@ -1831,6 +1832,8 @@ impl Handle {
     ///
     /// [`dup_parameterless`]: #method.dup_parameterless
     /// [`dup_unchecked`]: #method.dup_unchecked
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
     pub async fn dup<G>(
         &self,
         id: impl Into<RingId>,
@@ -1857,6 +1860,8 @@ impl Handle {
     /// Since this doesn't pass a parameter, it'll panic if the flags contain [`DupFlags::PARAM`].
     ///
     /// [`dup`]: #method.dup
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
     pub async fn dup_parameterless(
         &self,
         id: impl Into<RingId>,
@@ -1875,6 +1880,7 @@ impl Handle {
             .await?;
         Ok(fd)
     }
+    #[cfg(target_os = "redox")]
     async unsafe fn dup_unchecked_inner<P, G>(
         &self,
         ring: impl Into<RingId>,
@@ -1941,6 +1947,8 @@ impl Handle {
     /// [`MAP_FIXED_NOREPLACE`]:
     /// ../../syscall/flag/struct.MapFlags.html#associatedconstant.MAP_FIXED_NOREPLACE
     #[allow(clippy::too_many_arguments)]
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
     pub async unsafe fn mmap2(
         &self,
         ring: impl Into<RingId>,
@@ -1992,6 +2000,8 @@ impl Handle {
     ///
     /// [`mmap2`]: #method.mmap2
     /// [`MAP_FIXED`]: ../../syscall/flag/struct.MapFlags.html#associatedconstant.MAP_FIXED
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
     pub async unsafe fn mmap(
         &self,
         ring: impl Into<RingId>,
