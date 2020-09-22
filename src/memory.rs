@@ -122,6 +122,7 @@ impl CommandFuture {
     }
 }
 impl Handle {
+    #[cfg(target_os = "redox")]
     async fn create_buffer_pool_inner<I, E>(
         &self,
         secondary_instance: SecondaryRingId,
@@ -227,6 +228,8 @@ impl Handle {
     }
 }
 /// Expand the buffer pool, creating a new mmap.
+#[cfg(any(doc, target_os = "redox"))]
+#[doc(cfg(target_os = "redox"))]
 pub async fn expand(handle: &BufferPoolHandle, offset: u64, len: usize) -> Result<*mut u8> {
     let map_flags = MapFlags::MAP_SHARED | MapFlags::PROT_READ | MapFlags::PROT_WRITE;
 

@@ -755,6 +755,35 @@ mod consumer_instance {
             // TODO: Add this functionality to producers too.
             self.with_kernel
         }
+
+        #[inline]
+        pub fn sq_free_entry_count(&self) -> Result<usize> {
+            match self.sender.read() {
+                Either::Left(ref sender) => sender.free_entry_count(),
+                Either::Right(ref sender) => sender.free_entry_count(),
+            }
+        }
+        #[inline]
+        pub fn sq_available_entry_count(&self) -> Result<usize> {
+            match self.sender.read() {
+                Either::Left(ref sender) => sender.available_entry_count(),
+                Either::Right(ref sender) => sender.available_entry_count(),
+            }
+        }
+        #[inline]
+        pub fn cq_free_entry_count(&self) -> Result<usize> {
+            match self.receiver.read() {
+                Either::Left(ref receiver) => receiver.free_entry_count(),
+                Either::Right(ref receiver) => receiver.free_entry_count(),
+            }
+        }
+        #[inline]
+        pub fn cq_available_entry_count(&self) -> Result<usize> {
+            match self.receiver.read() {
+                Either::Left(ref receiver) => receiver.available_entry_count(),
+                Either::Right(ref receiver) => receiver.available_entry_count(),
+            }
+        }
     }
     impl Drop for Instance {
         #[cold]

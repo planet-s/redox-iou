@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::{TryFrom, TryInto};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{self, AtomicBool, AtomicUsize};
+use std::sync::atomic::{self, AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::{ops, task};
 
@@ -38,10 +38,19 @@ use parking_lot::{
 };
 
 use crate::future::{
-    AtomicTag, CommandFuture, CommandFutureInner, CommandFutureRepr, FdUpdates, ProducerSqes,
-    ProducerSqesState, State, StateInner, Tag,
+    AtomicTag, CommandFuture, CommandFutureInner, CommandFutureRepr, FdUpdates, State, StateInner,
+    Tag,
 };
-use crate::instance::{ConsumerInstance, ProducerInstance};
+#[cfg(target_os = "redox")]
+use crate::future::{ProducerSqes, ProducerSqesState};
+use crate::executor::Runqueue;
+
+#[cfg(target_os = "redox")]
+use crate::redox::instance::{ConsumerInstance, ConsumerGenericSender, ProducerInstance};
+
+#[cfg(target_os = "linux")]
+use crate::linux::ConsumerInstance;
+
 use crate::memory::{Guardable, GuardableExclusive, GuardableShared, Guarded};
 
 pub use redox_buffer_pool::NoGuard;
@@ -70,13 +79,13 @@ pub struct Reactor {
     // instance, that can monitor secondary instances (typically userspace-to-userspace rings).
     // when only a single instance is used, then this instance is free to also be a
     // userspace-to-userspace ring.
-    pub(crate) main_instance: ConsumerInstanceWrapper,
+    pub(crate) main_instances: ConsumerInstanceWrapper,
 
     // distinguishes "trusted instances" from "non-trusted" instances. the major difference between
     // these two, is that a non-trusted instance will use a map to associate integer tags with the
     // future states. meanwhile, a trusted instance will put the a Weak::into_raw pointer in the
     // user_data field, and then call Weak::from_raw to wake up the executor (which hopefully is
-    // this one). this is because we most likely don't want a user process modifying out own
+    // this one). this is because we most likely don't want a user process modifying our own
     // pointers!
     trusted_main_instance: bool,
 
@@ -115,10 +124,15 @@ pub(crate) struct ConsumerInstanceWrapper {
     // a convenient safe wrapper over the raw underlying interface.
     pub(crate) consumer_instance: ConsumerInstance,
 
+    // the thread id (actually a libc::c_int)
+    #[cfg(target_os = "linux")]
+    pub(crate) current_threadid: AtomicUsize,
+
     // stored when the ring encounters a shutdown error either when submitting an SQ, or receiving
     // a CQ.
     pub(crate) dropped: AtomicBool,
 }
+#[cfg(target_os = "redox")]
 #[derive(Debug)]
 pub(crate) struct ProducerInstanceWrapper {
     pub(crate) producer_instance: ProducerInstance,
@@ -130,6 +144,7 @@ pub(crate) enum SecondaryInstanceWrapper {
     // Since this is a secondary instance, a userspace-to-userspace consumer.
     ConsumerInstance(ConsumerInstanceWrapper),
 
+    #[cfg(target_os = "redox")]
     // Either a kernel-to-userspace producer, or a userspace-to-userspace producer.
     ProducerInstance(ProducerInstanceWrapper),
 }
@@ -138,9 +153,12 @@ impl SecondaryInstanceWrapper {
     pub(crate) fn as_consumer_instance(&self) -> Option<&ConsumerInstanceWrapper> {
         match self {
             Self::ConsumerInstance(ref instance) => Some(instance),
+
+            #[cfg(target_os = "redox")]
             Self::ProducerInstance(_) => None,
         }
     }
+    #[cfg(target_os = "redox")]
     pub(crate) fn as_producer_instance(&self) -> Option<&ProducerInstanceWrapper> {
         match self {
             Self::ConsumerInstance(_) => None,
@@ -297,13 +315,13 @@ impl ReactorBuilder {
             primary_instance: None,
         }
     }
-    ///
     /// Assume that the producer of the `io_uring` can be trusted, and that the `user_data` field
     /// of completion entries _always_ equals the corresponding user data of the submission for
     /// that command. This option is disabled by default, so long as the producer is not the
     /// kernel.
     ///
     /// # Safety
+    ///
     /// This is unsafe because when enabled, it will optimize the executor to use the `user_data`
     /// field as a pointer to the status. A rogue producer would be able to change the user data
     /// pointer, to an arbitrary address, and cause program corruption. While the addresses can be
@@ -311,20 +329,18 @@ impl ReactorBuilder {
     /// probably even more expensive than simply storing the user_data as a tag, which is the
     /// default). When the kernel is a producer though, this will not make anything more unsafe
     /// (since the kernel has full access to the address space anyways).
-    ///
     pub unsafe fn assume_trusted_instance(self) -> Self {
         Self {
             trusted_instance: true,
             ..self
         }
     }
-    ///
     /// Set the primary instance that will be used by the executor.
     ///
     /// # Panics
+    ///
     /// This function will panic if the primary instance has already been specified, or if this
     /// instance is one of the secondary instances.
-    ///
     pub fn with_primary_instance(self, primary_instance: ConsumerInstance) -> Self {
         // TODO: ConsumerInstance Debug impl
         if self.primary_instance.is_some() {
@@ -479,6 +495,74 @@ impl Reactor {
     pub fn id(&self) -> ReactorId {
         self.id
     }
+    pub(crate) fn driving_waker(
+        reactor: &Arc<Reactor>,
+        runqueue: Option<(Weak<Runqueue>, usize)>,
+    ) -> task::Waker {
+        let reactor = Arc::downgrade(reactor);
+
+        async_task::waker_fn(move || {
+            if let Some((runqueue, tag)) = runqueue
+                .as_ref()
+                .and_then(|(rq, tag)| Some((rq.upgrade()?, tag)))
+            {
+                let removed = runqueue.pending_futures.lock().remove(&tag);
+
+                match removed {
+                    Some(pending) => runqueue.ready_futures.push(pending),
+                    None => return,
+                }
+            }
+
+            let reactor = reactor
+                .upgrade()
+                .expect("failed to wake up executor: integrated reactor dead");
+
+            if reactor.main_instance.dropped.load(Ordering::Acquire) {
+                return;
+            }
+
+            #[cfg(target_os = "redox")]
+            {
+                // On Redox, we wake up the primary ring (i.e. the only ring that the reactor waits
+                // for), by incrementing the push epoch of the CQ without necessarily any new
+                // entry. Then we enter the ring with 0 as min_submit and 0 as min_complete,
+                // effectively causing the kernel to poll the ring and its epochs, and see that we
+                // notified it.
+
+                // TODO: Is this any better than the signal logic on Linux? Apart from saving a
+                // system call when notifying, by only adding 1 to the epochs and letting the
+                // kernel unblock the target context after scheduling time the waker context (which
+                // is only true for certain higher-priority processes), there are probably no major
+                // benefits in addition to that.
+
+                let consumer_instance = &reactor.main_instance.consumer_instance;
+
+                match &*consumer_instance.receiver().read() {
+                    ConsumerGenericSender::Bits32(ref sender32) => sender32.notify(),
+                    ConsumerGenericSender::Bits64(ref sender64) => sender64.notify(),
+                }
+
+                // TODO: Only enter for rings that are not polled by the kernel when scheduling.
+                consumer_instance
+                    .enter_for_notification()
+                    .expect("failed to wake up executor: entering the io_uring failed");
+            }
+            #[cfg(target_os = "linux")]
+            {
+                // On Linux, we wake up the primary ring by triggering a custom signal that is set
+                // to SIG_IGN, but with the SA_RESTART flag, causing the `io_uring_enter` syscall
+                // to immediately error with EINTR.
+
+                // TODO: When using thread pools, begin with finding a thread that the future can
+                // be moved to, and then simply unblock that thread. This system call will only
+                // need to be used when either all threads are currently in the kernel waiting for
+                // an io_uring event, or when it would otherwise make sense to do so, to distribute
+                // futures more evenly.
+                libc::pthread_kill();
+            }
+        })
+    }
     pub(crate) fn drive_primary(&self, waker: &task::Waker, wait: bool) {
         match self.drive(&self.main_instance, waker, wait, true) {
             Ok(()) => (),
@@ -495,120 +579,94 @@ impl Reactor {
         wait: bool,
         primary: bool,
     ) -> Result<()> {
-        let a = if wait {
-            let free_entry_count = instance
-                .consumer_instance
-                .sender()
-                .read()
-                .as_64()
-                .expect("expected 64-bit SQEs")
-                .free_entry_count()?;
-
-            let flags = if free_entry_count > 0 {
-                IoUringEnterFlags::empty()
-            } else {
-                // TODO: ... and has entries that need to be pushed?
-                IoUringEnterFlags::WAKEUP_ON_SQ_AVAIL
-            };
-            log::debug!("Entering io_uring");
-            Some(
-                instance
+        #[cfg(target_os = "redox")]
+        {
+            let num_completed = if wait {
+                let sq_free_entry_count = instance
                     .consumer_instance
-                    .enter(0, 0, flags)
-                    .expect("redox_iou: failed to enter io_uring"),
-            )
-        } else {
-            None
-        };
-        log::debug!("Entered io_uring with a {:?}", a);
+                    .sq_free_entry_count()?;
 
-        let mut receiver_intent_guard = instance.consumer_instance.receiver().upgradable_read();
+                let flags = if free_entry_count > 0 {
+                    IoUringEnterFlags::empty()
+                } else {
+                    // TODO: ... and has entries that need to be pushed?
+                    IoUringEnterFlags::WAKEUP_ON_SQ_AVAIL
+                };
+                log::debug!("Entering io_uring");
+                Some(
+                    instance
+                        .consumer_instance
+                        .enter(0, 0, flags)?
+                )
+            } else {
+                None
+            };
+            log::debug!("Entered io_uring with num_completed {:?}", num_completed);
 
-        let available_completions = receiver_intent_guard
-            .as_64()
-            .unwrap()
-            .available_entry_count();
+            let mut receiver_intent_guard = instance.consumer_instance.receiver().upgradable_read();
 
-        let available_completions = match available_completions {
-            Ok(avail) => avail,
-            Err(error) => {
-                log::error!(
-                    "Failed to retrieve the number of available completions of ring: {}",
-                    error
-                );
-                return Err(Error::new(EIO));
-            }
-        };
-
-        log::debug!("Available completions: {}", available_completions);
-
-        if a.unwrap_or(0) > available_completions {
-            log::warn!("The kernel/other process gave us a higher number of available completions than present on the ring.");
-        }
-
-        for i in 0..available_completions {
-            let mut receiver_write_guard =
-                RwLockUpgradableReadGuard::upgrade(receiver_intent_guard);
-            let result = receiver_write_guard
-                .as_64_mut()
-                .expect("expected 64-bit CQEs")
-                .try_recv();
-            receiver_intent_guard = RwLockWriteGuard::downgrade_to_upgradable(receiver_write_guard);
-
-            match result {
-                Ok(cqe) => {
-                    log::debug!("Received CQE: {:?}", cqe);
-                    if IoUringCqeFlags::from_bits_truncate((cqe.flags & 0xFF) as u8).contains(IoUringCqeFlags::EVENT) && EventFlags::from_bits_truncate((cqe.flags >> 8) as usize).contains(EventFlags::EVENT_IO_URING) {
-                        // if this was an event, that was tagged io_uring, we can assume that the
-                        // event came from the kernel having polled some secondary io_urings. We'll
-                        // then drive those instances and wakeup futures.
-
-                        let fd64 = match Error::demux64(cqe.status) {
-                            Ok(fd64) => fd64,
-                            Err(error) => {
-                                log::warn!("Error on receiving an event about secondary io_uring progress: {}. Ignoring event.", error);
-                                continue;
-                            }
-                        };
-
-                        let fd = match usize::try_from(fd64) {
-                            Ok(fd) => fd,
-                            Err(_) => {
-                                log::warn!("The kernel gave us a CQE with a status that was too large to fit a system-wide file descriptor ({} > {}). Ignoring event.", cqe.status, usize::max_value());
-                                continue;
-                            }
-                        };
-
-                        let secondary_instances_guard = self.secondary_instances.read();
-
-                        let secondary_instance_index = match secondary_instances_guard.fds_backref.get(&fd) {
-                            Some(idx) => *idx,
-                            None => {
-                                log::warn!("The fd ({}) meant to describe the instance to drive, was not recognized. Ignoring event.", fd);
-                                continue;
-                            }
-                        };
-                        match secondary_instances_guard.instances
-                            .get(secondary_instance_index)
-                            .expect("fd backref BTreeMap corrupt, contains a file descriptor that was removed")
-                        {
-                            SecondaryInstanceWrapper::ConsumerInstance(ref instance) => self.drive(instance, waker, false, false)?,
-                            SecondaryInstanceWrapper::ProducerInstance(ref instance) => self.drive_producer_instance(&instance)?,
-                        }
-
-                    } else {
-                        let _ = Self::handle_cqe(self.trusted_main_instance && primary, self.tag_map.read(), waker, cqe);
+            for cqe_result in instance.consumer_instance.sender.write().as_64_mut().unwrap().try_iter() {
+                #[cfg(target_os = "redox")]
+                if a.unwrap_or(0) > available_completions {
+                    log::warn!("The kernel/other process gave us a higher number of available completions than present on the ring.");
+                }
+                match cqe_result {
+                    Ok(cqe) => Self::drive_handle_cqe(cqe),
+                    Err(RingPopError::Empty { .. }) => panic!("the kernel gave us a higher number of available completions than actually available (at {}/{})", i, available_completions),
+                    Err(RingPopError::Shutdown) => { instance.dropped.store(true, std::sync::atomic::Ordering::Release); break },
+                    Err(RingPopError::Broken) => {
+                        log::error!("Ring (instance: {:?}) was not able to pop, as it had entered an inconsistent state. This is either a bug in the producer, a bug in the io_uring management of this process, or a kernel bug.", instance);
                     }
                 }
-                Err(RingPopError::Empty { .. }) => panic!("the kernel gave us a higher number of available completions than actually available (at {}/{})", i, available_completions),
-                Err(RingPopError::Shutdown) => { instance.dropped.store(true, std::sync::atomic::Ordering::Release); break },
-                Err(RingPopError::Broken) => {
-                    log::error!("Ring (instance: {:?}) was not able to pop, as it had entered an inconsistent state. This is either a bug in the producer, a bug in the io_uring management of this process, or a kernel bug.", instance);
-                }
             }
-        }
-        Ok(())
+        };
     }
+    fn drive_handle_cqe(&self, primary: bool, cqe: CqEntry64, waker: &task::Waker) {
+        log::debug!("Received CQE: {:?}", cqe);
+        #[cfg(target_os = "redox")]
+        if IoUringCqeFlags::from_bits_truncate((cqe.flags & 0xFF) as u8).contains(IoUringCqeFlags::EVENT) && EventFlags::from_bits_truncate((cqe.flags >> 8) as usize).contains(EventFlags::EVENT_IO_URING) {
+            // if this was an event, that was tagged io_uring, we can assume that the
+            // event came from the kernel having polled some secondary io_urings. We'll
+            // then drive those instances and wakeup futures.
+
+            let fd64 = match Error::demux64(cqe.status) {
+                Ok(fd64) => fd64,
+                Err(error) => {
+                    log::warn!("Error on receiving an event about secondary io_uring progress: {}. Ignoring event.", error);
+                    return;
+                }
+            };
+
+            let fd = match usize::try_from(fd64) {
+                Ok(fd) => fd,
+                Err(_) => {
+                    log::warn!("The kernel gave us a CQE with a status that was too large to fit a system-wide file descriptor ({} > {}). Ignoring event.", cqe.status, usize::max_value());
+                    return;
+                }
+            };
+
+            let secondary_instances_guard = self.secondary_instances.read();
+
+            let secondary_instance_index = match secondary_instances_guard.fds_backref.get(&fd) {
+                Some(idx) => *idx,
+                None => {
+                    log::warn!("The fd ({}) meant to describe the instance to drive, was not recognized. Ignoring event.", fd);
+                    return;
+                }
+            };
+            match secondary_instances_guard.instances
+                .get(secondary_instance_index)
+                .expect("fd backref BTreeMap corrupt, contains a file descriptor that was removed")
+            {
+                SecondaryInstanceWrapper::ConsumerInstance(ref instance) => self.drive(instance, waker, false, false)?,
+                SecondaryInstanceWrapper::ProducerInstance(ref instance) => self.drive_producer_instance(&instance)?,
+            }
+            return;
+        }
+
+        let _ = Self::handle_cqe(self.trusted_main_instance && primary, self.tag_map.read(), waker, cqe);
+    }
+    #[cfg(target_os = "redox")]
     fn drive_producer_instance(&self, instance: &ProducerInstanceWrapper) -> Result<()> {
         log::debug!("Event was an external producer io_uring, thus polling the ring itself");
         loop {

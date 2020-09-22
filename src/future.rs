@@ -14,7 +14,12 @@ use either::*;
 use futures_core::Stream;
 use parking_lot::Mutex;
 
-use crate::instance::ConsumerInstance;
+#[cfg(target_os = "redox")]
+use crate::redox::instance::ConsumerInstance;
+
+#[cfg(target_os = "linux")]
+use crate::linux::ConsumerInstance;
+
 use crate::reactor::{Reactor, RingId};
 
 pub(crate) type Tag = u64;
@@ -290,6 +295,7 @@ impl Stream for FdUpdates {
 }
 
 #[derive(Debug)]
+#[cfg(target_os = "redox")]
 pub(crate) enum ProducerSqesState {
     Receiving {
         deque: VecDeque<SqEntry64>,
@@ -301,9 +307,13 @@ pub(crate) enum ProducerSqesState {
 
 /// A stream that yields the SQEs sent to a producer instance.
 #[derive(Debug)]
+#[cfg(any(doc, target_os = "redox"))]
+#[doc(cfg(target_os = "redox"))]
 pub struct ProducerSqes {
     pub(crate) state: Arc<Mutex<ProducerSqesState>>,
 }
+#[cfg(any(doc, target_os = "redox"))]
+#[doc(cfg(target_os = "redox"))]
 impl Stream for ProducerSqes {
     type Item = Result<SqEntry64>;
 

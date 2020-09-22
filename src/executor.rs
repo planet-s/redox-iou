@@ -23,7 +23,6 @@ use std::{fmt, task, thread};
 use crossbeam_queue::SegQueue;
 use parking_lot::{Mutex, RwLock};
 
-use crate::instance::ConsumerGenericSender;
 use crate::reactor::{Handle as ReactorHandle, Reactor};
 
 /// A minimal executor, that does not require any thread pool.
@@ -48,10 +47,10 @@ pub struct Executor {
 
 type TaggedFutureMap = BTreeMap<usize, Pin<Box<dyn Future<Output = ()> + Send + 'static>>>;
 
-struct Runqueue {
-    ready_futures: SegQueue<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
-    pending_futures: Mutex<TaggedFutureMap>,
-    next_pending_tag: AtomicUsize,
+pub(crate) struct Runqueue {
+    pub(crate) ready_futures: SegQueue<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
+    pub(crate) pending_futures: Mutex<TaggedFutureMap>,
+    pub(crate) next_pending_tag: AtomicUsize,
 }
 
 impl fmt::Debug for Runqueue {
@@ -107,63 +106,23 @@ impl Executor {
         }
     }
 
+    /// Create an executor that includes an integrated reactor.
     ///
-    /// Create an executor that includes an integrated reactor. This is generally more efficient
-    /// than offloading the reactor to another thread, provided that the futures can drive the
-    /// ring themselves when polled, since the kernel can immediately wake up the futures once new
-    /// completion entries are attainable. The executor can also be woken up by other threads
-    /// directly, by incrementing the pop epoch of the main ring, which will trick the kernel into
-    /// thinking that new entries are available.
-    ///
+    /// This is generally more efficient than offloading the reactor to another thread, provided
+    /// that the futures can drive the ring themselves when polled, since the kernel can
+    /// immediately wake up the futures once new completion entries are attainable. The executor
+    /// can also be woken up by other threads directly, by incrementing the pop epoch of the main
+    /// ring, which will trick the kernel into thinking that new entries are available.
     pub fn with_reactor(reactor_arc: Arc<Reactor>) -> Self {
         let mut this = Self::without_reactor();
 
         this.reactor = Some(ReactorWrapper {
-            driving_waker: Self::driving_waker(&reactor_arc, None),
+            driving_waker: Reactor::driving_waker(&reactor_arc, None),
             reactor: reactor_arc,
         });
         this
     }
 
-    fn driving_waker(
-        reactor: &Arc<Reactor>,
-        runqueue: Option<(Weak<Runqueue>, usize)>,
-    ) -> task::Waker {
-        let reactor = Arc::downgrade(reactor);
-
-        async_task::waker_fn(move || {
-            if let Some((runqueue, tag)) = runqueue
-                .as_ref()
-                .and_then(|(rq, tag)| Some((rq.upgrade()?, tag)))
-            {
-                let removed = runqueue.pending_futures.lock().remove(&tag);
-
-                match removed {
-                    Some(pending) => runqueue.ready_futures.push(pending),
-                    None => return,
-                }
-            }
-
-            let reactor = reactor
-                .upgrade()
-                .expect("failed to wake up executor: integrated reactor dead");
-
-            if reactor.main_instance.dropped.load(Ordering::Acquire) {
-                return;
-            }
-
-            let consumer_instance = &reactor.main_instance.consumer_instance;
-
-            match &*consumer_instance.sender().read() {
-                ConsumerGenericSender::Bits32(ref sender32) => sender32.notify(),
-                ConsumerGenericSender::Bits64(ref sender64) => sender64.notify(),
-            }
-
-            consumer_instance
-                .enter_for_notification()
-                .expect("failed to wake up executor: entering the io_uring failed");
-        })
-    }
     fn standard_waker(
         standard_waker_thread: &Arc<RwLock<thread::Thread>>,
         runqueue: Option<(Weak<Runqueue>, usize)>,
@@ -241,7 +200,7 @@ impl Executor {
                 .fetch_add(1, Ordering::Relaxed);
 
             let secondary_waker = if let Some(reactor) = self.reactor.as_ref() {
-                Self::driving_waker(
+                Reactor::driving_waker(
                     &reactor.reactor,
                     Some((Arc::downgrade(&self.runqueue), tag)),
                 )

@@ -33,13 +33,19 @@ pub use redox_syscall::io_uring as interface;
 pub mod executor;
 /// Future types used by the reactor, that indirectly represent pending entries from rings.
 pub mod future;
-/// Wrapper types for all the resources used by `io_uring`s, together with initialization
-/// helpers.
-pub mod instance;
 /// A buffer pool that is mainly used for userspace-to-userspace rings, to share memory.
 pub mod memory;
 /// The reactor for io_uring, capable of polling multiple rings, both for producers and for
 /// consumers.
 pub mod reactor;
-/// Wrapper types for sending a receiving entries on the ring.
-pub mod ring;
+
+#[cfg(any(doc, target_os = "redox"))]
+#[doc(cfg(target_os = "redox"))]
+pub mod redox;
+
+#[cfg(any(doc, target_os = "linux"))]
+#[doc(cfg(target_os = "linux"))]
+pub mod linux;
+
+// TODO: Windows's, but also perhaps Solaris's and AIX's I/O Completion Ports (IOCP) interface.
+// TODO: Linux AIO, maybe?
