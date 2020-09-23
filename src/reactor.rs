@@ -75,34 +75,39 @@ static LAST_REACTOR_ID: AtomicUsize = AtomicUsize::new(0);
 pub struct Reactor {
     pub(crate) id: ReactorId,
 
-    // the primary instance - when using secondary instances, this should be a kernel-attached
-    // instance, that can monitor secondary instances (typically userspace-to-userspace rings).
-    // when only a single instance is used, then this instance is free to also be a
+    // The primary instances - these are the io_urings that are actually entered when waiting for
+    // I/O in the reactor. There will typically only exist one such instance per OS thread,
+    // allowing for parallelism even in the kernel.
+    //
+    // For Redox, when using secondary instances, these primary instances should be kernel-attached
+    // instances, that can monitor secondary instances (typically userspace-to-userspace rings).
+    // When only a single instance is used, then this instance is free to also be a
     // userspace-to-userspace ring.
-    pub(crate) main_instances: ConsumerInstanceWrapper,
+    pub(crate) main_instances: Vec<ConsumerInstanceWrapper>,
 
-    // distinguishes "trusted instances" from "non-trusted" instances. the major difference between
+    // Distinguishes "trusted instances" from "non-trusted" instances. The major difference between
     // these two, is that a non-trusted instance will use a map to associate integer tags with the
-    // future states. meanwhile, a trusted instance will put the a Weak::into_raw pointer in the
+    // future states. Meanwhile, a trusted instance will put the a Weak::into_raw pointer in the
     // user_data field, and then call Weak::from_raw to wake up the executor (which hopefully is
-    // this one). this is because we most likely don't want a user process modifying our own
+    // this one). This is because we most likely don't want a user process modifying our own
     // pointers!
     trusted_main_instance: bool,
 
-    // the secondary instances, which are typically userspace-to-userspace, for schemes I/O or IPC.
-    // these are not blocked on using the `SYS_ENTER_IORING` syscall; instead, they use FilesUpdate
+    // The secondary instances, which are typically userspace-to-userspace, for schemes I/O or IPC.
+    // These are not blocked on using the `SYS_ENTER_IORING` syscall; instead, they use FilesUpdate
     // on the main instance (which __must__ be attached to the kernel for secondary instances to
     // exist whatsoever), and then pops the entries of that ring separately, precisely like with
     // the primary ring.
+    #[cfg(target_os = "redox")]
     pub(crate) secondary_instances: RwLock<SecondaryInstancesWrapper>,
 
     // TODO: ConcurrentBTreeMap - I (4lDO2) am currently writing this.
 
-    // a map between integer tags and internal future state. this map is only used for untrusted
-    // secondary instances, and for the main instance if `trusted_main_instance` is false.
+    // A map between integer tags and internal future state. This map is only used for untrusted
+    // secondary instances, and for main instances if `trusted_main_instance` is false.
     pub(crate) tag_map: RwLock<BTreeMap<Tag, Arc<Mutex<State>>>>,
 
-    // the next tag to use, retrieved with fetch_add(1, Ordering::Relaxed). if the value has
+    // The next tag to use, retrieved with `fetch_add(1, Ordering::Relaxed)`. If the value has
     // overflown, `tag_has_overflown` will be set, and further tags must be checked so that no tag
     // is accidentally replaced. this limit will probably _never_ be encountered on a 64-bit
     // system, but on a 32-bit system it might happen.
@@ -110,12 +115,11 @@ pub struct Reactor {
     // TODO: 64-bit tags?
     next_tag: AtomicTag,
 
-    // an atomic queue that is used for Arc reclamation of `State`s.
+    // An atomic queue that is used for Arc reclamation of `State`s, preventing unnecessary load on
+    // the global allocator when we can use a pool of allocations instead.
     reusable_tags: ArrayQueue<(Tag, Arc<Mutex<State>>)>,
 
-    // this is lazily initialized to make things work at initialization, but one should always
-    // assume that the reactor holds a weak reference to itself, to make it easier to obtain a
-    // handle.
+    // This is a weak backref to the reactor itself, allowing handles to be obtained.
     weak_ref: Weak<Reactor>,
 }
 
@@ -125,8 +129,10 @@ pub(crate) struct ConsumerInstanceWrapper {
     pub(crate) consumer_instance: ConsumerInstance,
 
     // the thread id (actually a libc::c_int)
+
+    // TODO: CMPXCHG16B - we need this to be atomic!
     #[cfg(target_os = "linux")]
-    pub(crate) current_threadid: AtomicUsize,
+    pub(crate) current_threadid: RwLock<Option<libc::pthread_t>>,
 
     // stored when the ring encounters a shutdown error either when submitting an SQ, or receiving
     // a CQ.
@@ -182,140 +188,258 @@ pub struct RingId {
     // 0 means main instance, a number above zero is the index of the secondary instance in the
     // vec, plus 1.
     pub(crate) inner: usize,
+    pub(crate) ty: RingTy,
 }
-/// A ring ID that is guaranteed to be a secondary ring of a reactor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SecondaryRingId {
-    pub(crate) reactor: ReactorId,
-    // the index into the secondary array, plus 1
-    pub(crate) inner: NonZeroUsize,
+pub(crate) enum RingTy {
+    Primary,
+    #[cfg(target_os = "redox")]
+    Secondary,
+    #[cfg(target_os = "redox")]
+    Producer,
 }
 /// A ring ID that is guaranteed to be the primary ring of a reactor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrimaryRingId {
     pub(crate) reactor: ReactorId,
+    pub(crate) inner: usize,
+}
+/// A ring ID that is guaranteed to be a secondary ring of a reactor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(doc, target_os = "redox"))]
+#[doc(cfg(target_os = "redox"))]
+pub struct SecondaryRingId {
+    pub(crate) reactor: ReactorId,
+    pub(crate) inner: usize,
+}
+#[cfg(any(doc, target_os = "redox"))]
+#[doc(cfg(target_os = "redox"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProducerRingId {
+    pub(crate) reactor: ReactorId,
+    pub(crate) inner: usize,
 }
 impl PrimaryRingId {
     /// Get the unique reactor ID using this ring.
+    #[inline]
     pub fn reactor(&self) -> ReactorId {
         self.reactor
     }
 }
+#[cfg(any(doc, target_os = "redox"))]
+#[doc(cfg(target_os = "redox"))]
 impl SecondaryRingId {
     /// Get the unique reactor ID using this ring.
+    #[inline]
+    pub fn reactor(&self) -> ReactorId {
+        self.reactor
+    }
+}
+#[cfg(any(doc, target_os = "redox"))]
+#[doc(cfg(target_os = "redox"))]
+impl ProducerRingId {
+    #[inline]
     pub fn reactor(&self) -> ReactorId {
         self.reactor
     }
 }
 impl RingId {
     /// Get an ID that can uniquely identify the reactor that uses this ring.
+    #[inline]
     pub fn reactor(&self) -> ReactorId {
         self.reactor
     }
     /// Check whether the ring is the primary ring.
+    #[inline]
     pub fn is_primary(&self) -> bool {
-        self.inner == 0
+        self.ty == RingTy::Primary
     }
-    /// Check whether the ring is a secondary ring (a userspace-to-userspace or kernel-to-userspace
-    /// ring, controlled by the main userspace-to-kernel ring), or false if it's the primary ring.
+    /// Check whether the ring is a secondary ring (a userspace-to-userspace controlled by a main
+    /// userspace-to-kernel ring).
+    #[inline]
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
     pub fn is_secondary(&self) -> bool {
-        self.inner > 0
+        self.ty == RingTy::Secondary
+    }
+    /// Check whether the ring is a producer ring (which is a kernel-to-userspace or the producer
+    /// part of a userspace-to-userspace ring, typically controlled by a main ring).
+    #[inline]
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
+    pub fn is_producer(&self) -> bool {
+        self.ty == RingTy::Producer
     }
     /// Attempt to convert this generic ring ID into a primary ring ID, if it represents one.
+    #[inline]
     pub fn try_into_primary(&self) -> Option<PrimaryRingId> {
-        if self.inner == 0 {
-            Some(PrimaryRingId {
-                reactor: self.reactor,
-            })
+        if self.is_primary() {
+            Some(PrimaryRingId { reactor: self.reactor, inner: self.inner })
         } else {
             None
         }
     }
     /// Attempt to convert this generic ring ID into a secondary ring ID, if it represents one.
+    #[inline]
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
     pub fn try_into_secondary(&self) -> Option<SecondaryRingId> {
-        NonZeroUsize::new(self.inner).map(|inner| SecondaryRingId {
-            inner,
-            reactor: self.reactor,
-        })
+        if self.is_secondary() {
+            Some(SecondaryRingId { reactor: self.reactor, inner: self.inner })
+        } else {
+            None
+        }
+    }
+    /// Attempt to convert this generic ring ID into a producer ring ID, if it represents one.
+    #[inline]
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
+    pub fn try_into_producer(&self) -> Option<ProducerRingId> {
+        if self.is_producer() {
+            Some(ProducerRingId { reactor: self.reactor, inner: self.inner })
+        } else {
+            None
+        }
     }
 }
 
 impl PartialEq<RingId> for PrimaryRingId {
+    #[inline]
     fn eq(&self, other: &RingId) -> bool {
-        self.reactor == other.reactor && other.inner == 0
-    }
-}
-impl PartialEq<RingId> for SecondaryRingId {
-    fn eq(&self, other: &RingId) -> bool {
-        self.reactor == other.reactor && self.inner.get() == other.inner
+        self.reactor == other.reactor && self.inner == other.inner && other.ty == RingTy::Primary
     }
 }
 impl PartialEq<PrimaryRingId> for RingId {
+    #[inline]
     fn eq(&self, other: &PrimaryRingId) -> bool {
         other == self
     }
 }
+#[cfg(any(doc, target_os = "redox"))]
+#[doc(cfg(target_os = "redox"))]
+impl PartialEq<RingId> for SecondaryRingId {
+    #[inline]
+    fn eq(&self, other: &RingId) -> bool {
+        self.reactor == other.reactor && self.inner == other.inner && other.ty == RingTy::Secondary
+    }
+}
+#[cfg(any(doc, target_os = "redox"))]
+#[doc(cfg(target_os = "redox"))]
 impl PartialEq<SecondaryRingId> for RingId {
+    #[inline]
     fn eq(&self, other: &SecondaryRingId) -> bool {
         other == self
     }
 }
+#[cfg(any(doc, target_os = "redox"))]
+#[doc(cfg(target_os = "redox"))]
+impl PartialEq<RingId> for ProducerRingId {
+    #[inline]
+    fn eq(&self, other: &RingId) -> bool {
+        self.reactor == other.reactor && self.inner == other.inner && other.ty == RingTy::Producer
+    }
+}
+#[cfg(any(doc, target_os = "redox"))]
+#[doc(cfg(target_os = "redox"))]
+impl PartialEq<ProducerRingId> for RingId {
+    #[inline]
+    fn eq(&self, other: &ProducerRingId) -> bool {
+        other == self
+    }
+}
 impl From<PrimaryRingId> for RingId {
+    #[inline]
     fn from(primary: PrimaryRingId) -> Self {
         Self {
             reactor: primary.reactor,
-            inner: 0,
+            inner: primary.inner,
+            ty: RingTy::Primary,
         }
     }
 }
+#[cfg(any(doc, target_os = "redox"))]
+#[doc(cfg(target_os = "redox"))]
 impl From<SecondaryRingId> for RingId {
+    #[inline]
     fn from(secondary: SecondaryRingId) -> Self {
         Self {
             reactor: secondary.reactor,
-            inner: secondary.inner.get(),
+            inner: secondary.inner,
+            ty: RingTy::Secondary,
+        }
+    }
+}
+#[cfg(any(doc, target_os = "redox"))]
+#[doc(cfg(target_os = "redox"))]
+impl From<ProducerRingId> for RingId {
+    #[inline]
+    fn from(secondary: ProducerRingId) -> Self {
+        Self {
+            reactor: secondary.reactor,
+            inner: secondary.inner,
+            ty: RingTy::Producer,
         }
     }
 }
 pub(crate) enum RingIdKind {
     Primary(PrimaryRingId),
+    #[cfg(target_os = "redox")]
     Secondary(SecondaryRingId),
+    #[cfg(target_os = "redox")]
+    Producer(ProducerRingId),
 }
 impl From<RingId> for RingIdKind {
+    #[inline]
     fn from(id: RingId) -> Self {
-        if let Some(primary) = id.try_into_primary() {
-            Self::Primary(primary)
-        } else if let Some(secondary) = id.try_into_secondary() {
-            Self::Secondary(secondary)
-        } else {
-            unreachable!()
+        match id.ty {
+            RingTy::Primary => RingIdKind::Primary(PrimaryRingId { reactor: id.reactor, inner: id.inner }),
+            #[cfg(target_os = "redox")]
+            RingTy::Secondary => RingIdKind::Secondary(SecondaryRingId { reactor: id.reactor, inner: id.inner }),
+            #[cfg(target_os = "redox")]
+            RingTy::Producer => RingIdKind::Producer(ProducerRingId { reactor: id.reactor, inner: id.inner }),
         }
     }
 }
 impl From<RingIdKind> for RingId {
+    #[inline]
     fn from(id_kind: RingIdKind) -> Self {
         match id_kind {
             RingIdKind::Primary(p) => p.into(),
+            #[cfg(target_os = "redox")]
             RingIdKind::Secondary(s) => s.into(),
+            #[cfg(target_os = "redox")]
+            RingIdKind::Producer(p) => p.into(),
         }
     }
 }
+
+#[cfg(target_os = "redox")]
+pub type SysSqe = SqEntry64;
+#[cfg(target_os = "linux")]
+pub type SysSqe = uring_sys::io_uring_sqe;
+
+#[cfg(target_os = "redox")]
+pub type SysCqe = CqEntry64;
+#[cfg(target_os = "linux")]
+pub type SysCqe = iou::CQE;
 
 /// A builder that configures the reactor.
 #[derive(Debug)]
 pub struct ReactorBuilder {
-    trusted_instance: bool,
-    primary_instance: Option<ConsumerInstance>,
+    trusted_instances: Option<bool>,
+    primary_instances: Vec<ConsumerInstance>,
 }
 
 impl ReactorBuilder {
     /// Create an executor builder with the default options.
+    #[inline]
     pub const fn new() -> Self {
         Self {
-            trusted_instance: false,
-            primary_instance: None,
+            primary_instances: Vec::new(),
+            trusted_instances: None,
         }
     }
-    /// Assume that the producer of the `io_uring` can be trusted, and that the `user_data` field
+    /// Assume that the producer of the `io_uring`s can be trusted, and that the `user_data` field
     /// of completion entries _always_ equals the corresponding user data of the submission for
     /// that command. This option is disabled by default, so long as the producer is not the
     /// kernel.
@@ -328,55 +452,48 @@ impl ReactorBuilder {
     /// checked at runtime, this is too expensive to check if performance is a concern (and
     /// probably even more expensive than simply storing the user_data as a tag, which is the
     /// default). When the kernel is a producer though, this will not make anything more unsafe
-    /// (since the kernel has full access to the address space anyways).
-    pub unsafe fn assume_trusted_instance(self) -> Self {
+    /// (since the kernel has full access to the address space anyway).
+    pub unsafe fn assume_trusted_instances(self) -> Self {
         Self {
-            trusted_instance: true,
+            trusted_instances: Some(true),
             ..self
         }
     }
-    /// Set the primary instance that will be used by the executor.
-    ///
-    /// # Panics
-    ///
-    /// This function will panic if the primary instance has already been specified, or if this
-    /// instance is one of the secondary instances.
-    pub fn with_primary_instance(self, primary_instance: ConsumerInstance) -> Self {
-        // TODO: ConsumerInstance Debug impl
-        if self.primary_instance.is_some() {
-            panic!("Cannot specify the primary instance twice!");
-        }
-        // TODO: Check for conflict with secondary instances
-        Self {
-            primary_instance: Some(primary_instance),
-            ..self
-        }
+    /// Add a primary instance that will be used by the executor. Note that only one of these may
+    /// be blocked on concurrently, but it may be more performant to use multiple instances in a
+    /// multithreaded program.
+    pub fn with_primary_instance(mut self, primary_instance: ConsumerInstance) -> Self {
+        self.primary_instances.push(primary_instance);
+        self
     }
 
-    ///
     /// Finalize the reactor, using the options that have been specified here.
     ///
     /// # Panics
-    /// This function will panic if the primary instance has not been set.
     ///
+    /// This function will panic if the primary instance has not been set.
     pub fn build(self) -> Arc<Reactor> {
-        let primary_instance = self.primary_instance.expect("expected");
-        Reactor::new(primary_instance, self.trusted_instance)
+        Reactor::new(self.primary_instances.into_iter(), self.trusted_instance)
     }
 }
 impl Reactor {
-    fn new(main_instance: ConsumerInstance, trusted_main_instance: bool) -> Arc<Self> {
-        let main_instance = ConsumerInstanceWrapper {
+    fn new(main_instances: impl IntoIterator<Item = ConsumerInstance>, trusted_main_instance: bool) -> Arc<Self> {
+        let main_instances = main_instances.into_iter().map(|main_instance| ConsumerInstanceWrapper {
             consumer_instance: main_instance,
             dropped: AtomicBool::new(false),
-        };
+
+            #[cfg(target_os = "linux")]
+            current_threadid: RwLock::new(None),
+        }).collect();
 
         Arc::new_cyclic(|weak_ref| Reactor {
             id: ReactorId {
                 inner: LAST_REACTOR_ID.fetch_add(1, atomic::Ordering::Relaxed),
             },
-            main_instance,
+            main_instances,
             trusted_main_instance,
+
+            #[cfg(target_os = "redox")]
             secondary_instances: RwLock::new(SecondaryInstancesWrapper {
                 instances: Vec::new(),
                 fds_backref: BTreeMap::new(),
@@ -390,8 +507,13 @@ impl Reactor {
     }
     /// Retrieve the ring ID of the primary instance, which must be a userspace-to-kernel ring if
     /// there are more than one rings in the reactor.
-    pub fn primary_instance(&self) -> PrimaryRingId {
-        PrimaryRingId { reactor: self.id }
+    pub fn primary_instances(&self) -> impl Iterator<Item = PrimaryRingId> + '_ {
+        let id = self.id();
+
+        (0..self.main_instances.len()).map(move |idx| PrimaryRingId {
+            reactor: id,
+            inner: idx,
+        })
     }
     /// Obtain a handle to this reactor, capable of creating futures that use it. The handle will
     /// be weakly owned, and panic on regular operations if this reactor is dropped.
@@ -498,6 +620,9 @@ impl Reactor {
     pub(crate) fn driving_waker(
         reactor: &Arc<Reactor>,
         runqueue: Option<(Weak<Runqueue>, usize)>,
+        // NOTE: We know that the Vec of instances is immutable, since the reactor will always be
+        // wrapped in an Arc. Hence, the order will never change, so indices are fine.
+        index: usize,
     ) -> task::Waker {
         let reactor = Arc::downgrade(reactor);
 
@@ -518,7 +643,9 @@ impl Reactor {
                 .upgrade()
                 .expect("failed to wake up executor: integrated reactor dead");
 
-            if reactor.main_instance.dropped.load(Ordering::Acquire) {
+            let instance = reactor.main_instances.get(index).expect("index passed to driving_waker shouldn't be invalid");
+
+            if instance.dropped.load(Ordering::Acquire) {
                 return;
             }
 
@@ -550,6 +677,7 @@ impl Reactor {
             }
             #[cfg(target_os = "linux")]
             {
+                let guard = instance.current_threadid.read();
                 // On Linux, we wake up the primary ring by triggering a custom signal that is set
                 // to SIG_IGN, but with the SA_RESTART flag, causing the `io_uring_enter` syscall
                 // to immediately error with EINTR.
@@ -559,12 +687,15 @@ impl Reactor {
                 // need to be used when either all threads are currently in the kernel waiting for
                 // an io_uring event, or when it would otherwise make sense to do so, to distribute
                 // futures more evenly.
-                libc::pthread_kill();
+                if let Some(pthread_id) = *guard {
+                    // TODO: Handle error!
+                    let _ = unsafe { libc::pthread_kill(pthread_id, libc::SIGUSR1) };
+                }
             }
         })
     }
-    pub(crate) fn drive_primary(&self, waker: &task::Waker, wait: bool) {
-        match self.drive(&self.main_instance, waker, wait, true) {
+    pub(crate) fn drive_primary(&self, idx: usize, waker: &task::Waker, wait: bool) {
+        match self.drive(&self.main_instances[idx], waker, wait, true) {
             Ok(()) => (),
             Err(error) => {
                 log::warn!("Error when driving primary ring: {}", error);
@@ -611,7 +742,7 @@ impl Reactor {
                     log::warn!("The kernel/other process gave us a higher number of available completions than present on the ring.");
                 }
                 match cqe_result {
-                    Ok(cqe) => Self::drive_handle_cqe(cqe),
+                    Ok(cqe) => self.drive_handle_cqe(primary, cqe, waker),
                     Err(RingPopError::Empty { .. }) => panic!("the kernel gave us a higher number of available completions than actually available (at {}/{})", i, available_completions),
                     Err(RingPopError::Shutdown) => { instance.dropped.store(true, std::sync::atomic::Ordering::Release); break },
                     Err(RingPopError::Broken) => {
@@ -619,9 +750,24 @@ impl Reactor {
                     }
                 }
             }
-        };
+            Ok(())
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let mut guard = instance.consumer_instance.lock();
+            for cqe_result in guard.cqes_blocking(1) {
+                match cqe_result {
+                    Ok(cqe) => self.drive_handle_cqe(primary, cqe, waker),
+                    Err(error) => {
+                        log::error!("Failed to pop CQE from CQ: {}", error);
+                        todo!("convert error");
+                    }
+                }
+            }
+            Ok(())
+        }
     }
-    fn drive_handle_cqe(&self, primary: bool, cqe: CqEntry64, waker: &task::Waker) {
+    fn drive_handle_cqe(&self, primary: bool, cqe: SysCqe, waker: &task::Waker) {
         log::debug!("Received CQE: {:?}", cqe);
         #[cfg(target_os = "redox")]
         if IoUringCqeFlags::from_bits_truncate((cqe.flags & 0xFF) as u8).contains(IoUringCqeFlags::EVENT) && EventFlags::from_bits_truncate((cqe.flags >> 8) as usize).contains(EventFlags::EVENT_IO_URING) {
@@ -735,26 +881,38 @@ impl Reactor {
         trusted_instance: bool,
         tags: RwLockReadGuard<'_, BTreeMap<Tag, Arc<Mutex<State>>>>,
         driving_waker: &task::Waker,
-        cqe: CqEntry64,
+        cqe: SysCqe,
     ) -> Option<()> {
-        let cancelled = cqe.status == (-(ECANCELED as i64)) as u64;
+        #[cfg(target_os = "redox")]
+        let (cancelled, user_data) = {
+            let cancelled = cqe.status == (-(ECANCELED as i64)) as u64;
+            let user_data = cqe.user_data;
+            (cancelled, user_data)
+        };
+
+        #[cfg(target_os = "linux")]
+        let (cancelled, user_data) = {
+            let cancelled = cqe.raw_result() == -libc::ECANCELED;
+            let user_data = cqe.user_data();
+            (cancelled, user_data)
+        };
 
         let state_arc;
 
         let state_lock = if trusted_instance {
-            let pointer = usize::try_from(cqe.user_data).ok()? as *mut Mutex<State>;
+            let pointer = usize::try_from(user_data).ok()? as *mut Mutex<State>;
             let state_weak = unsafe { Weak::from_raw(pointer) };
             state_arc = state_weak.upgrade()?;
             &state_arc
         } else {
-            tags.get(&cqe.user_data)?
+            tags.get(&user_data)?
         };
 
         let mut state = state_lock.lock();
         match &mut state.inner {
             // invalid state after having received a completion
             StateInner::Initial
-            | StateInner::Submitting(_, _)
+            | StateInner::Submitting(_)
             | StateInner::Completed(_)
             | StateInner::Cancelled => return None,
 
@@ -779,7 +937,7 @@ impl Reactor {
         }
         Some(())
     }
-    pub(crate) fn instance(
+    pub(crate) fn consumer_instance(
         &self,
         ring: impl Into<RingId>,
     ) -> Option<Either<&ConsumerInstance, MappedRwLockReadGuard<ConsumerInstance>>> {
@@ -793,16 +951,21 @@ impl Reactor {
             );
         }
 
-        if ring == self.primary_instance() {
-            Some(Left(&self.main_instance.consumer_instance))
+        if ring.is_primary() {
+            Some(Left(&self.main_instances[ring.inner].consumer_instance))
         } else {
-            RwLockReadGuard::try_map(self.secondary_instances.read(), |instances| {
-                instances.instances[ring.inner - 1]
-                    .as_consumer_instance()
-                    .map(|i| &i.consumer_instance)
-            })
-            .ok()
-            .map(Right)
+            #[cfg(target_os = "redox")]
+            {
+                RwLockReadGuard::try_map(self.secondary_instances.read(), |instances| {
+                    instances.instances[ring.inner - 1]
+                        .as_consumer_instance()
+                        .map(|i| &i.consumer_instance)
+                })
+                .ok()
+                .map(Right)
+            }
+            #[cfg(not(target_os = "redox"))]
+            unreachable!();
         }
     }
 }
@@ -1092,7 +1255,7 @@ impl Handle {
     /// invalid, or if the capacity is zero.
     #[cfg(any(doc, target_os = "redox"))]
     #[doc(cfg(target_os = "redox"))]
-    pub fn producer_sqes(&self, ring_id: SecondaryRingId, capacity: usize) -> ProducerSqes {
+    pub fn producer_sqes(&self, ring_id: ProducerRingId, capacity: usize) -> ProducerSqes {
         let reactor = self
             .reactor
             .upgrade()

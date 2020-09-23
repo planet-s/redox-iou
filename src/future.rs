@@ -20,7 +20,7 @@ use crate::redox::instance::ConsumerInstance;
 #[cfg(target_os = "linux")]
 use crate::linux::ConsumerInstance;
 
-use crate::reactor::{Reactor, RingId};
+use crate::reactor::{Reactor, RingId, SysSqe, SysCqe};
 
 pub(crate) type Tag = u64;
 pub(crate) type AtomicTag = AtomicU64;
@@ -45,27 +45,30 @@ pub(crate) struct State {
     pub(crate) epoch: usize,
 }
 
-// the internal state of the pending command.
+// The internal state of the pending command.
 #[derive(Debug)]
 pub(crate) enum StateInner {
-    // the future has been initiated, but nothing has happened to it yet
+    // The future has been initiated, but nothing has happened to it yet
     Initial,
 
-    // the future is currently trying to submit the future, to a ring that was full
-    Submitting(SqEntry64, task::Waker),
+    // The future is currently trying to submit the future, to a ring that was full
 
-    // the future has submitted the SQE, but is waiting for the command to complete with the
+    // TODO: Should the SQE be stored here or not?
+    Submitting(task::Waker),
+
+    // The future has submitted the SQE, but is waiting for the command to complete with the
     // corresponding CQE.
     Completing(task::Waker),
 
-    // the future is a stream and is receiving multiple CQEs.
-    ReceivingMulti(VecDeque<CqEntry64>, task::Waker),
+    // The future is a stream and is receiving multiple CQEs.
+    // TODO: Remove the vecdeque from here.
+    ReceivingMulti(VecDeque<SysCqe>, task::Waker),
 
-    // the future has received the CQE, and the command is now complete. this state can now be
+    // The future has received the CQE, and the command is now complete. This state can now be
     // reused for another future.
-    Completed(CqEntry64),
+    Completed(SysCqe),
 
-    // the command was cancelled, while in the Completing state.
+    // The command was cancelled, while in the Completing state.
     Cancelled,
 }
 
@@ -78,7 +81,7 @@ pub(crate) enum CommandFutureRepr {
 
     Tagged {
         tag: Tag,
-        initial_sqe: Option<SqEntry64>,
+        initial_sqe: SqEntry64,
     },
 }
 impl From<CommandFutureInner> for CommandFuture {
@@ -96,19 +99,49 @@ fn try_submit(
     instance: &ConsumerInstance,
     state: &mut State,
     cx: &mut task::Context<'_>,
-    sqe: SqEntry64,
+    sqe: impl FnOnce(&mut SysSqe),
     user_data: Either<Weak<Mutex<State>>, Tag>,
     is_stream: bool,
-) -> task::Poll<Option<Result<CqEntry64>>> {
+) -> task::Poll<Result<CqEntry64>> {
+    #[cfg(target_os = "redox")]
+    let mut sqe = SqEntry64::default();
+    #[cfg(target_os = "redox")]
+    let sqe = &mut sqe;
+
+    #[cfg(target_os = "linux")]
+    let guard = instance.lock();
+    #[cfg(target_os = "linux")]
+    let sqe = match guard.prepare_sqe() {
+        Some(sqe_slot) => sqe_slot,
+        None => {
+            state.inner = StateInner::Submitting(cx.waker().clone());
+            log::debug!("io_uring submission queue full");
+            return task::Poll::Pending;
+        }
+    };
+
     let sqe = match user_data {
         Left(state_weak) => match (Weak::into_raw(state_weak) as usize).try_into() {
-            Ok(ptr64) => sqe.with_user_data(ptr64),
-            Err(_) => return task::Poll::Ready(Some(Err(Error::new(EFAULT)))),
+            Ok(ptr64) => {
+                #[cfg(target_os = "redox")]
+                { sqe.user_data = ptr64; }
+
+                #[cfg(target_os = "linux")]
+                unsafe { sqe.set_user_data(ptr64) }
+            }
+            Err(_) => return task::Poll::Ready(Err(Error::new(EFAULT))),
         },
-        Right(tag) => sqe.with_user_data(tag),
+        Right(tag) => {
+            #[cfg(target_os = "redox")]
+            { sqe.user_data = tag; }
+
+            #[cfg(target_os = "linux")]
+            unsafe { sqe.set_user_data(tag) }
+        }
     };
     log::debug!("Sending SQE {:?}", sqe);
 
+    #[cfg(target_os = "redox")]
     match instance
         .sender()
         .write()
@@ -128,11 +161,11 @@ fn try_submit(
         }
         Err(RingPushError::Full(sqe)) => {
             state.inner = StateInner::Submitting(sqe, cx.waker().clone());
-            log::debug!("Submission ring is full");
+            log::debug!("io_uring submission queue full");
             task::Poll::Pending
         }
-        Err(RingPushError::Shutdown(_)) => task::Poll::Ready(Some(Err(Error::new(ESHUTDOWN)))),
-        Err(RingPushError::Broken(_)) => task::Poll::Ready(Some(Err(Error::new(EIO)))),
+        Err(RingPushError::Shutdown(_)) => task::Poll::Ready(Err(Error::new(ESHUTDOWN))),
+        Err(RingPushError::Broken(_)) => task::Poll::Ready(Err(Error::new(EIO))),
     }
 }
 
@@ -174,9 +207,7 @@ impl CommandFutureInner {
 
         let mut state_guard = state_lock.lock();
 
-        let mut in_state_sqe;
-
-        if let StateInner::Submitting(sqe, _) = state_guard.inner {
+        if let StateInner::Submitting(_) = state_guard.inner {
             in_state_sqe = Some(sqe);
             init_sqe = &mut in_state_sqe;
         }

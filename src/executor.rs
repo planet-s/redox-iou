@@ -170,6 +170,13 @@ impl Executor {
 
         let mut cx = task::Context::from_waker(&waker);
 
+        // TODO: Support pinning the future to a single thread for `!Send` futures, by allowing the
+        // future to pin its SQEs to the io_uring in the same thread executing that future, to
+        // avoid having to wake up other rings with signals or in other ways. `Send` futures would
+        // instead freely be movable to whatever thread is not currently waiting for an io_uring.
+        // So, change `idx` to something that is not necessarily zero.
+        let idx = 0;
+
         loop {
             let pinned_future = unsafe { Pin::new_unchecked(&mut future) };
             match pinned_future.poll(&mut cx) {
@@ -177,9 +184,9 @@ impl Executor {
 
                 task::Poll::Pending => {
                     if let Some(reactor_wrapper) = self.reactor.as_ref() {
-                        reactor_wrapper.reactor.drive_primary(&waker, false);
+                        reactor_wrapper.reactor.drive_primary(idx, &waker, false);
                         self.poll_spawned_futures();
-                        reactor_wrapper.reactor.drive_primary(&waker, true);
+                        reactor_wrapper.reactor.drive_primary(idx, &waker, true);
                     } else {
                         self.poll_spawned_futures();
                         thread::park();

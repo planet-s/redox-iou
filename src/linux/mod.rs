@@ -1,7 +1,6 @@
-use std::{io, iter, fmt};
+use std::fmt;
 
-use iou::CompletionQueueEvent;
-use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
+use parking_lot::{Mutex, MutexGuard};
 
 pub struct ConsumerInstance {
     io_uring: Mutex<iou::IoUring>,
