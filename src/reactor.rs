@@ -413,9 +413,9 @@ impl From<RingIdKind> for RingId {
 }
 
 #[cfg(target_os = "redox")]
-pub type SysSqe = SqEntry64;
+pub type SysSqeRef<'ring> = &'ring mut SqEntry64;
 #[cfg(target_os = "linux")]
-pub type SysSqe<'ring> = iou::SQE<'ring>;
+pub type SysSqeRef<'ring> = iou::SQE<'ring>;
 
 #[cfg(target_os = "redox")]
 pub type SysCqe = CqEntry64;
@@ -1112,7 +1112,7 @@ impl Handle {
     /// is UB.
     pub unsafe fn send<F>(&self, ring: impl Into<RingId>, prepare_sqe: F) -> CommandFuture<F>
     where
-        F: FnOnce(&mut SysSqe),
+        F: for<'ring> FnOnce(SysSqeRef<'ring>),
     {
         self.send_inner(ring, prepare_sqe, false)
             .left()
@@ -1349,7 +1349,7 @@ impl Handle {
         oneshot: bool,
     ) -> FdUpdates {
         assert!(!event_flags.contains(EventFlags::EVENT_IO_URING), "only the redox_iou reactor is allowed to use this flag unless io_uring API is used directly");
-        let prepare_sqe = move |sqe: &mut SysSqe| {
+        let prepare_sqe = move |sqe: SysSqeRef| {
             {
                 sqe.base(
                     IoUringSqeFlags::SUBSCRIBE,
@@ -1364,12 +1364,29 @@ impl Handle {
             .expect("send_inner must return Right if is_stream is set to true")
     }
 
-    fn completion_as_rw_io_result(cqe: CqEntry64) -> Result<usize> {
+    fn completion_as_rw_io_result(cqe: SysCqe) -> Result<usize> {
         // reinterpret the status as signed, to take an errors into account.
+        #[cfg(target_os = "redox")]
         let signed = cqe.status as i64;
+        #[cfg(target_os = "linux")]
+        let signed = cqe.raw_result();
 
         match isize::try_from(signed) {
-            Ok(s) => Error::demux(s as usize),
+            Ok(s) => {
+                #[cfg(target_os = "redox")]
+                {
+                    Error::demux(s as usize)
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    if s >= 0 {
+                        Ok(s as usize)
+                    } else {
+                        // TODO: Cross-platform error type.
+                        Err(Error::new(s as i32))
+                    }
+                }
+            }
             Err(_) => {
                 log::warn!("Failed to cast 64 bit {{,p}}{{read,write}}{{,v}} status ({:?}), into pointer sized status.", Error::demux64(signed as u64));
                 if let Ok(actual_bytes_read) = Error::demux64(signed as u64) {
@@ -1382,28 +1399,35 @@ impl Handle {
             }
         }
     }
+    #[inline]
     async unsafe fn rw_io<F, B, G>(
         &self,
         ring: impl Into<RingId>,
         context: SubmissionContext,
-        fd: usize,
+        fd: SysFd,
         f: F,
         mut buf: Either<B, G>,
     ) -> Result<(usize, Option<G>)>
     where
-        F: FnOnce(SqEntry64, u64, Either<&mut B, &mut G>) -> Result<SqEntry64>,
+        F: for<'ring> FnOnce(SysSqeRef<'ring>, SysFd, Either<&mut B, &mut G>) -> Result<()>,
         G: crate::memory::Guardable<DefaultSubmissionGuard, [u8]>,
     {
         let fd: u64 = fd.try_into().or(Err(Error::new(EOVERFLOW)))?;
 
-        let base_sqe = SqEntry64::new(
-            context.sync().sqe_flags(),
-            context.priority(),
-            (-1i64) as u64,
-        );
-        let sqe = f(base_sqe, fd, buf.as_mut())?;
+        let prepare_fn = |sqe| {
+            #[cfg(target_os = "redox")]
+            {
+                let sqe = sqe.base(
+                    context.sync().sqe_flags(),
+                    context.priority(),
+                    (-1i64) as u64,
+                );
+                f(sqe, fd, buf.as_mut())?;
+                sqe
+            }
+        };
 
-        let fut = self.send(ring, sqe);
+        let fut = self.send(ring, prepare_fn);
 
         if let Right(guardable) = buf.as_mut() {
             fut.guard(guardable);
@@ -1798,8 +1822,9 @@ impl Handle {
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
-        fd: usize,
-        bufs: &[IoVec],
+        fd: SysFd,
+        // TODO: Support immutable slices of slices as well.
+        bufs: &mut [IoVec],
         offset: u64,
     ) -> Result<usize> {
         let (bytes_read, _) = self
@@ -1807,7 +1832,24 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, bufs| Ok(sqe.preadv(fd, bufs.left().unwrap(), offset)),
+                |mut sqe: SysSqeRef, fd, bufs| {
+                    let bufs_unchecked = bufs.left().unwrap();
+
+                    #[cfg(target_os = "redox")]
+                    {
+                        sqe.sys_preadv(fd, bufs_unchecked, offset);
+                    }
+
+                    #[cfg(target_os = "linux")]
+                    {
+                        let mut bufs_unchecked = bufs_unchecked;
+                        // TODO
+                        let bufs_unchecked = unsafe { core::slice::from_raw_parts_mut(bufs_unchecked.as_ptr() as *mut std::io::IoSliceMut, bufs_unchecked.len()) };
+                        sqe.prep_read_vectored(fd, bufs_unchecked, offset);
+                    }
+
+                    Ok(())
+                },
                 Either::<_, GuardedPlaceholder>::Left(bufs),
             )
             .await?;
@@ -1829,7 +1871,7 @@ impl Handle {
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
-        fd: usize,
+        fd: SysFd,
         buf: &[u8],
     ) -> Result<usize> {
         let ring = ring.into();
@@ -1863,7 +1905,7 @@ impl Handle {
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
-        fd: usize,
+        fd: SysFd,
         buf: G,
     ) -> Result<(usize, G)>
     where
@@ -1877,14 +1919,20 @@ impl Handle {
                 ctx,
                 fd,
                 |sqe, fd, buf| {
-                    Ok(sqe.write(
+                    #[cfg(target_os = "redox")]
+                    sqe.sys_write(
                         fd,
                         buf.right()
                             .unwrap()
                             .data_shared()
                             .as_generic_slice(ring.is_primary())
                             .ok_or(Error::new(EFAULT))?,
-                    ))
+                    );
+
+                    #[cfg(target_os = "linux")]
+                    compile_error!("TODO");
+
+                    Ok(())
                 },
                 Either::<(), _>::Right(buf),
             )
@@ -1907,7 +1955,7 @@ impl Handle {
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
-        fd: usize,
+        fd: SysFd,
         bufs: &[IoVec],
     ) -> Result<usize> {
         let (bytes_written, _) = self
@@ -1915,7 +1963,7 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, bufs| Ok(sqe.writev(fd, bufs.left().unwrap())),
+                |sqe, fd, bufs| Ok(sqe.sys_writev(fd, bufs.left().unwrap())),
                 Either::<_, GuardedPlaceholder>::Left(bufs),
             )
             .await?;
@@ -1936,7 +1984,7 @@ impl Handle {
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
-        fd: usize,
+        fd: SysFd,
         buf: &[u8],
         offset: u64,
     ) -> Result<usize> {
@@ -1947,15 +1995,26 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, buf| {
-                    Ok(sqe.pwrite(
+                |mut sqe: SysSqeRef, fd, buf| {
+                    let buf_unchecked = *buf.left().unwrap();
+
+                    #[cfg(target_os = "redox")]
+                    sqe.pwrite(
                         fd,
-                        buf.left()
-                            .unwrap()
+                        buf_unchecked
                             .as_generic_slice(ring.is_primary())
                             .ok_or(Error::new(EFAULT))?,
                         offset,
-                    ))
+                    );
+
+                    #[cfg(target_os = "linux")]
+                    sqe.prep_write(
+                        fd,
+                        buf_unchecked,
+                        offset
+                    );
+
+                    Ok(())
                 },
                 Either::<_, GuardedPlaceholder>::Left(buf),
             )
@@ -1976,7 +2035,7 @@ impl Handle {
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
-        fd: usize,
+        fd: SysFd,
         buf: G,
         offset: u64,
     ) -> Result<usize>
@@ -1990,16 +2049,28 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, buf| {
-                    Ok(sqe.pwrite(
-                        fd,
-                        buf.right()
-                            .unwrap()
-                            .data_shared()
-                            .as_generic_slice(ring.is_primary())
-                            .ok_or(Error::new(EFAULT))?,
-                        offset,
-                    ))
+                |sqe: SysSqeRef, fd, buf| {
+                    let buf_checked = buf.right().unwrap();
+
+                    #[cfg(target_os = "redox")]
+                    {
+                        sqe.sys_pwrite(
+                            fd,
+                            buf_checked
+                                .as_generic_slice(ring.is_primary())
+                                .ok_or(Error::new(EFAULT))?,
+                            offset,
+                        )
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        sqe.prep_write(
+                            fd,
+                            buf_checked.get_ref(),
+                            offset,
+                        )
+                    }
+                    Ok(())
                 },
                 Either::<(), _>::Right(buf),
             )
@@ -2020,7 +2091,7 @@ impl Handle {
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
-        fd: usize,
+        fd: SysFd,
         bufs: &[IoVec],
         offset: u64,
     ) -> Result<usize> {
@@ -2029,7 +2100,25 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, bufs| Ok(sqe.pwritev(fd, bufs.left().unwrap(), offset)),
+                |mut sqe: SysSqeRef, fd, bufs| {
+                    let bufs_unchecked = bufs.left().unwrap();
+
+                    #[cfg(target_os = "redox")]
+                    {
+                        sqe.sys_pwritev(fd, bufs_unchecked, offset);
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        // TODO: Use the `ioslice` crate for safe casts. Otherwise, it will suffice
+                        // to simply cast the slice unsafely, by reinterpreting its type. They must
+                        // be valid since this is unsafe.
+                        let bufs_unchecked = unsafe { core::slice::from_raw_parts(bufs_unchecked.as_ptr() as *const std::io::IoSlice, bufs_unchecked.len()) };
+
+                        sqe.prep_write_vectored(fd as SysFd, bufs_unchecked, offset);
+                    }
+
+                    Ok(())
+                },
                 Either::<_, GuardedPlaceholder>::Left(bufs),
             )
             .await?;

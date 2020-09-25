@@ -21,7 +21,7 @@ use crate::redox::instance::ConsumerInstance;
 #[cfg(target_os = "linux")]
 use crate::linux::ConsumerInstance;
 
-use crate::reactor::{Reactor, RingId, SysFd, SysSqe, SysCqe};
+use crate::reactor::{Reactor, RingId, SysFd, SysSqeRef, SysCqe};
 
 pub(crate) type Tag = u64;
 pub(crate) type AtomicTag = AtomicU64;
@@ -90,7 +90,7 @@ impl<F> fmt::Debug for CommandFuture<F> {
 fn try_submit(
     instance: &ConsumerInstance,
     state: &mut State,
-    prepare: impl FnOnce(&mut SysSqe),
+    prepare: impl FnOnce(SysSqeRef),
     user_data: Either<Weak<Mutex<State>>, Tag>,
     is_stream: bool,
     cx: &mut task::Context<'_>,
@@ -174,7 +174,7 @@ impl CommandFutureInner {
     fn poll(
         &mut self,
         is_stream: bool,
-        prepare_fn: Option<impl FnOnce(&mut SysSqe)>,
+        prepare_fn: Option<impl FnOnce(SysSqeRef)>,
         cx: &mut task::Context,
     ) -> task::Poll<Option<Result<SysCqe>>> {
         log::debug!("Polling future");
@@ -288,7 +288,7 @@ impl<F> Drop for CommandFuture<F> {
 
 impl<F> Future for CommandFuture<F>
 where
-    F: FnOnce(&mut SysSqe) + Unpin,
+    F: for<'ring> FnOnce(SysSqeRef<'ring>) + Unpin,
 {
     type Output = Result<SysCqe>;
 
@@ -318,6 +318,8 @@ pub(crate) struct FdEventsInitial {
     oneshot: bool,
 }
 
+#[cfg(target_os = "redox")]
+// TODO: linux
 impl Stream for FdEvents {
     type Item = Result<SysCqe>;
 
