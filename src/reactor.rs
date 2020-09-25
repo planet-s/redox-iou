@@ -85,14 +85,6 @@ pub struct Reactor {
     // userspace-to-userspace ring.
     pub(crate) main_instances: Vec<ConsumerInstanceWrapper>,
 
-    // Distinguishes "trusted instances" from "non-trusted" instances. The major difference between
-    // these two, is that a non-trusted instance will use a map to associate integer tags with the
-    // future states. Meanwhile, a trusted instance will put the a Weak::into_raw pointer in the
-    // user_data field, and then call Weak::from_raw to wake up the executor (which hopefully is
-    // this one). This is because we most likely don't want a user process modifying our own
-    // pointers!
-    trusted_main_instance: bool,
-
     // The secondary instances, which are typically userspace-to-userspace, for schemes I/O or IPC.
     // These are not blocked on using the `SYS_ENTER_IORING` syscall; instead, they use FilesUpdate
     // on the main instance (which __must__ be attached to the kernel for secondary instances to
@@ -125,17 +117,24 @@ pub struct Reactor {
 
 #[derive(Debug)]
 pub(crate) struct ConsumerInstanceWrapper {
-    // a convenient safe wrapper over the raw underlying interface.
+    // A convenient safe wrapper over the raw underlying interface.
     pub(crate) consumer_instance: ConsumerInstance,
 
-    // the thread id (actually a libc::c_int)
+    // Distinguishes "trusted instances" from "non-trusted" instances. The major difference between
+    // these two, is that a non-trusted instance will use a map to associate integer tags with the
+    // future states. Meanwhile, a trusted instance will put the a Weak::into_raw pointer in the
+    // user_data field, and then call Weak::from_raw to wake up the executor (which hopefully is
+    // this one). This is because we most likely don't want a user process modifying our own
+    // pointers!
+    #[cfg(target_os = "redox")]
+    pub(crate) trusted: bool,
 
-    // TODO: CMPXCHG16B - we need this to be atomic!
+    // TODO: CMPXCHG16B (or CMPXCHG8B on i386) - we need this to be atomic!
     #[cfg(target_os = "linux")]
     pub(crate) current_threadid: RwLock<Option<libc::pthread_t>>,
 
-    // stored when the ring encounters a shutdown error either when submitting an SQ, or receiving
-    // a CQ.
+    // Stored when the ring encounters a shutdown error either when submitting an SQE, or receiving
+    // a CQE.
     pub(crate) dropped: AtomicBool,
 }
 #[cfg(target_os = "redox")]
@@ -416,18 +415,22 @@ impl From<RingIdKind> for RingId {
 #[cfg(target_os = "redox")]
 pub type SysSqe = SqEntry64;
 #[cfg(target_os = "linux")]
-pub type SysSqe = uring_sys::io_uring_sqe;
+pub type SysSqe<'ring> = iou::SQE<'ring>;
 
 #[cfg(target_os = "redox")]
 pub type SysCqe = CqEntry64;
 #[cfg(target_os = "linux")]
 pub type SysCqe = iou::CQE;
 
+#[cfg(target_os = "linux")]
+pub type SysFd = std::os::unix::io::RawFd;
+#[cfg(target_os = "redox")]
+pub type SysFd = usize;
+
 /// A builder that configures the reactor.
 #[derive(Debug)]
 pub struct ReactorBuilder {
-    trusted_instances: Option<bool>,
-    primary_instances: Vec<ConsumerInstance>,
+    primary_instances: Vec<ConsumerInstanceWrapper>,
 }
 
 impl ReactorBuilder {
@@ -436,13 +439,16 @@ impl ReactorBuilder {
     pub const fn new() -> Self {
         Self {
             primary_instances: Vec::new(),
-            trusted_instances: None,
         }
     }
-    /// Assume that the producer of the `io_uring`s can be trusted, and that the `user_data` field
-    /// of completion entries _always_ equals the corresponding user data of the submission for
-    /// that command. This option is disabled by default, so long as the producer is not the
-    /// kernel.
+    /// Add a primary instance that will be used by the executor. Note that only one of these may
+    /// be blocked on concurrently, but it may be more performant to use multiple instances in a
+    /// multithreaded program.
+    ///
+    /// It will be assumed for the instance here, that the producer of the `io_uring`s can be
+    /// trusted, and that the `user_data` field of completion entries _always_ equals the
+    /// corresponding user data of the submission for that command. This option is disabled by
+    /// default, when the the producer is not the kernel.
     ///
     /// # Safety
     ///
@@ -453,18 +459,39 @@ impl ReactorBuilder {
     /// probably even more expensive than simply storing the user_data as a tag, which is the
     /// default). When the kernel is a producer though, this will not make anything more unsafe
     /// (since the kernel has full access to the address space anyway).
-    pub unsafe fn assume_trusted_instances(self) -> Self {
-        Self {
-            trusted_instances: Some(true),
-            ..self
-        }
+    pub unsafe fn with_trusted_primary_instance(self, primary_instance: ConsumerInstance) -> Self {
+        self.with_primary_instance_generic(primary_instance, true)
     }
-    /// Add a primary instance that will be used by the executor. Note that only one of these may
-    /// be blocked on concurrently, but it may be more performant to use multiple instances in a
-    /// multithreaded program.
-    pub fn with_primary_instance(mut self, primary_instance: ConsumerInstance) -> Self {
-        self.primary_instances.push(primary_instance);
+    #[allow(unused_variables)]
+    unsafe fn with_primary_instance_generic(mut self, primary_instance: ConsumerInstance, trusted: bool) -> Self {
+        self.primary_instances.push(ConsumerInstanceWrapper {
+            consumer_instance: primary_instance,
+            #[cfg(target_os = "redox")]
+            trusted,
+            dropped: AtomicBool::new(false),
+
+            #[cfg(target_os = "linux")]
+            current_threadid: RwLock::new(None),
+        });
         self
+    }
+    /// Add a primary instance that is considered untrusted. Hence, rather than storing pointers
+    /// directly in the user data fields of the SQEs, the user data field will rather point to a
+    /// tag, that is the key of a B-tree map of states.
+    pub fn with_untrusted_primary_instance(self, primary_instance: ConsumerInstance) -> Self {
+        unsafe { self.with_primary_instance_generic(primary_instance, false) }
+    }
+    /// Add a primary instance to the reactor. Whether this is to be marked _trusted_ is determined
+    /// based on platform (Linux is a monolithic kernel and thus only has the kernel as producer),
+    /// and the type of the instance.
+    pub fn with_primary_instance(mut self, primary_instance: ConsumerInstance) -> Self {
+        #[cfg(target_os = "redox")]
+        let trust = primary_instance.is_attached_to_kernel();
+
+        #[cfg(target_os = "linux")]
+        let trust = true;
+
+        unsafe { self.with_primary_instance_generic(primary_instance, trust) }
     }
 
     /// Finalize the reactor, using the options that have been specified here.
@@ -473,25 +500,16 @@ impl ReactorBuilder {
     ///
     /// This function will panic if the primary instance has not been set.
     pub fn build(self) -> Arc<Reactor> {
-        Reactor::new(self.primary_instances.into_iter(), self.trusted_instance)
+        Reactor::new(self.primary_instances)
     }
 }
 impl Reactor {
-    fn new(main_instances: impl IntoIterator<Item = ConsumerInstance>, trusted_main_instance: bool) -> Arc<Self> {
-        let main_instances = main_instances.into_iter().map(|main_instance| ConsumerInstanceWrapper {
-            consumer_instance: main_instance,
-            dropped: AtomicBool::new(false),
-
-            #[cfg(target_os = "linux")]
-            current_threadid: RwLock::new(None),
-        }).collect();
-
+    fn new(main_instances: Vec<ConsumerInstanceWrapper>) -> Arc<Self> {
         Arc::new_cyclic(|weak_ref| Reactor {
             id: ReactorId {
                 inner: LAST_REACTOR_ID.fetch_add(1, atomic::Ordering::Relaxed),
             },
             main_instances,
-            trusted_main_instance,
 
             #[cfg(target_os = "redox")]
             secondary_instances: RwLock::new(SecondaryInstancesWrapper {
@@ -755,9 +773,11 @@ impl Reactor {
         #[cfg(target_os = "linux")]
         {
             let mut guard = instance.consumer_instance.lock();
+            let trusted = true;
+
             for cqe_result in guard.cqes_blocking(1) {
                 match cqe_result {
-                    Ok(cqe) => self.drive_handle_cqe(primary, cqe, waker),
+                    Ok(cqe) => self.drive_handle_cqe(primary, trusted, cqe, waker),
                     Err(error) => {
                         log::error!("Failed to pop CQE from CQ: {}", error);
                         todo!("convert error");
@@ -767,7 +787,7 @@ impl Reactor {
             Ok(())
         }
     }
-    fn drive_handle_cqe(&self, primary: bool, cqe: SysCqe, waker: &task::Waker) {
+    fn drive_handle_cqe(&self, primary: bool, trusted: bool, cqe: SysCqe, waker: &task::Waker) {
         log::debug!("Received CQE: {:?}", cqe);
         #[cfg(target_os = "redox")]
         if IoUringCqeFlags::from_bits_truncate((cqe.flags & 0xFF) as u8).contains(IoUringCqeFlags::EVENT) && EventFlags::from_bits_truncate((cqe.flags >> 8) as usize).contains(EventFlags::EVENT_IO_URING) {
@@ -810,7 +830,7 @@ impl Reactor {
             return;
         }
 
-        let _ = Self::handle_cqe(self.trusted_main_instance && primary, self.tag_map.read(), waker, cqe);
+        let _ = Self::handle_cqe(trusted, self.tag_map.read(), waker, cqe);
     }
     #[cfg(target_os = "redox")]
     fn drive_producer_instance(&self, instance: &ProducerInstanceWrapper) -> Result<()> {
@@ -1090,17 +1110,20 @@ impl Handle {
     ///
     /// Additionally, the buffers used may point to invalid locations on the stack or heap, which
     /// is UB.
-    pub unsafe fn send(&self, ring: impl Into<RingId>, sqe: SqEntry64) -> CommandFuture {
-        self.send_inner(ring, sqe, false)
+    pub unsafe fn send<F>(&self, ring: impl Into<RingId>, prepare_sqe: F) -> CommandFuture<F>
+    where
+        F: FnOnce(&mut SysSqe),
+    {
+        self.send_inner(ring, prepare_sqe, false)
             .left()
             .expect("send_inner() must return CommandFuture if is_stream is set to false")
     }
-    unsafe fn send_inner(
+    unsafe fn send_inner<F>(
         &self,
         ring: impl Into<RingId>,
-        sqe: SqEntry64,
+        prepare_sqe: F,
         is_stream: bool,
-    ) -> Either<CommandFuture, FdUpdates> {
+    ) -> Either<CommandFuture<F>, FdUpdates> {
         let ring = ring.into();
 
         let reactor = self
@@ -1109,6 +1132,12 @@ impl Handle {
             .expect("failed to initiate new command: reactor is dead");
 
         assert_eq!(ring.reactor, reactor.id());
+
+        #[cfg(target_os = "redox")]
+        let trusted = ring.is_primary() && reactor.main_instances[ring.inner].trusted;
+
+        #[cfg(target_os = "linux")]
+        let trusted = true;
 
         let (tag_num_opt, state_opt) = match reactor.reusable_tags.pop() {
             // try getting a reusable tag to minimize unnecessary allocations
@@ -1128,7 +1157,7 @@ impl Handle {
                     "weird leakage of weak refs to CommandFuture state"
                 );
 
-                if reactor.trusted_main_instance && ring.is_primary() {
+                if trusted {
                     (None, Some(state))
                 } else {
                     reactor
@@ -1160,7 +1189,7 @@ impl Handle {
                     panic!("redox-iou tag overflow");
                 }
 
-                if reactor.trusted_main_instance && ring.is_primary() {
+                if trusted {
                     (None, Some(state_arc))
                 } else {
                     reactor.tag_map.write().insert(n, state_arc);
@@ -1172,23 +1201,21 @@ impl Handle {
         let inner = CommandFutureInner {
             ring,
             reactor: Weak::clone(&self.reactor),
-            repr: if reactor.trusted_main_instance && ring.is_primary() {
-                CommandFutureRepr::Direct {
-                    state: state_opt.unwrap(),
-                    initial_sqe: sqe,
-                }
+            repr: if trusted {
+                CommandFutureRepr::Direct(
+                    state_opt.unwrap(),
+                )
             } else {
-                CommandFutureRepr::Tagged {
-                    tag: tag_num_opt.unwrap(),
-                    initial_sqe: Some(sqe),
-                }
+                CommandFutureRepr::Tagged(
+                    tag_num_opt.unwrap(),
+                )
             },
         };
 
         if is_stream {
-            Right(inner.into())
+            Right(FdUpdates { inner })
         } else {
-            Left(inner.into())
+            Left(CommandFuture { inner, prepare_fn: Some(prepare_sqe) })
         }
     }
     /// Send a Completion Queue Entry to the consumer, waking it up when the reactor enters the
@@ -1311,25 +1338,30 @@ impl Handle {
     /// Create an asynchronous stream that represents the events coming from one of more file
     /// descriptors that are triggered when e.g. the file has changed, or is capable of reading new
     /// data, etc.
-    pub fn subscribe_to_fd_updates(
+    // TODO: Is there an equivalent here for Redox?
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
+    pub unsafe fn fd_events(
         &self,
         ring: impl Into<RingId>,
-        fd: usize,
+        fd: SysFd,
         event_flags: EventFlags,
         oneshot: bool,
     ) -> FdUpdates {
         assert!(!event_flags.contains(EventFlags::EVENT_IO_URING), "only the redox_iou reactor is allowed to use this flag unless io_uring API is used directly");
-        let sqe = SqEntry64::new(
-            IoUringSqeFlags::SUBSCRIBE,
-            Priority::default(),
-            (-1i64) as u64,
-        )
-        .file_update(fd.try_into().unwrap(), event_flags, oneshot);
-        unsafe {
-            self.send_inner(ring, sqe, true)
-                .right()
-                .expect("send_inner must return Right if is_stream is set to true")
-        }
+        let prepare_sqe = move |sqe: &mut SysSqe| {
+            {
+                sqe.base(
+                    IoUringSqeFlags::SUBSCRIBE,
+                    Priority::default(),
+                    (-1i64) as u64,
+                )
+                .sys_files_update(fds, event_flags, oneshot)
+            }
+        };
+        self.send_inner(ring, prepare_sqe, true)
+            .right()
+            .expect("send_inner must return Right if is_stream is set to true")
     }
 
     fn completion_as_rw_io_result(cqe: CqEntry64) -> Result<usize> {

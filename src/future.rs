@@ -4,10 +4,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Weak};
-use std::task;
+use std::{fmt, task};
 
 use syscall::error::{Error, Result};
 use syscall::error::{ECANCELED, EFAULT, EIO, ESHUTDOWN};
+use syscall::flag::EventFlags;
 use syscall::io_uring::{CqEntry64, IoUringCqeFlags, RingPushError, SqEntry64};
 
 use either::*;
@@ -20,7 +21,7 @@ use crate::redox::instance::ConsumerInstance;
 #[cfg(target_os = "linux")]
 use crate::linux::ConsumerInstance;
 
-use crate::reactor::{Reactor, RingId, SysSqe, SysCqe};
+use crate::reactor::{Reactor, RingId, SysFd, SysSqe, SysCqe};
 
 pub(crate) type Tag = u64;
 pub(crate) type AtomicTag = AtomicU64;
@@ -34,9 +35,9 @@ pub(crate) struct CommandFutureInner {
 /// A future representing a submission that is being handled by the producer. This future
 /// implements [`Unpin`], and is safe to drop or forget at any time (since the guard, if present,
 /// will never release the guardee until completion).
-#[derive(Debug)]
-pub struct CommandFuture {
+pub struct CommandFuture<F> {
     pub(crate) inner: CommandFutureInner,
+    pub(crate) prepare_fn: Option<F>,
 }
 
 #[derive(Debug)]
@@ -74,35 +75,26 @@ pub(crate) enum StateInner {
 
 #[derive(Debug)]
 pub(crate) enum CommandFutureRepr {
-    Direct {
-        state: Arc<Mutex<State>>,
-        initial_sqe: SqEntry64,
-    },
-
-    Tagged {
-        tag: Tag,
-        initial_sqe: SqEntry64,
-    },
+    Direct(Arc<Mutex<State>>),
+    Tagged(Tag),
 }
-impl From<CommandFutureInner> for CommandFuture {
-    fn from(inner: CommandFutureInner) -> Self {
-        Self { inner }
-    }
-}
-impl From<CommandFutureInner> for FdUpdates {
-    fn from(inner: CommandFutureInner) -> Self {
-        Self { inner }
+impl<F> fmt::Debug for CommandFuture<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CommandFuture")
+            .field("inner", &self.inner)
+            .field("prepare_fn", &std::any::type_name::<F>())
+            .finish()
     }
 }
 
 fn try_submit(
     instance: &ConsumerInstance,
     state: &mut State,
-    cx: &mut task::Context<'_>,
-    sqe: impl FnOnce(&mut SysSqe),
+    prepare: impl FnOnce(&mut SysSqe),
     user_data: Either<Weak<Mutex<State>>, Tag>,
     is_stream: bool,
-) -> task::Poll<Result<CqEntry64>> {
+    cx: &mut task::Context<'_>,
+) -> task::Poll<syscall::Error> {
     #[cfg(target_os = "redox")]
     let mut sqe = SqEntry64::default();
     #[cfg(target_os = "redox")]
@@ -129,7 +121,7 @@ fn try_submit(
                 #[cfg(target_os = "linux")]
                 unsafe { sqe.set_user_data(ptr64) }
             }
-            Err(_) => return task::Poll::Ready(Err(Error::new(EFAULT))),
+            Err(_) => return task::Poll::Ready(Error::new(EFAULT)),
         },
         Right(tag) => {
             #[cfg(target_os = "redox")]
@@ -160,12 +152,21 @@ fn try_submit(
             task::Poll::Pending
         }
         Err(RingPushError::Full(sqe)) => {
-            state.inner = StateInner::Submitting(sqe, cx.waker().clone());
+            state.inner = StateInner::Submitting(cx.waker().clone());
             log::debug!("io_uring submission queue full");
             task::Poll::Pending
         }
-        Err(RingPushError::Shutdown(_)) => task::Poll::Ready(Err(Error::new(ESHUTDOWN))),
-        Err(RingPushError::Broken(_)) => task::Poll::Ready(Err(Error::new(EIO))),
+        Err(RingPushError::Shutdown(_)) => task::Poll::Ready(Error::new(ESHUTDOWN)),
+        Err(RingPushError::Broken(_)) => task::Poll::Ready(Error::new(EIO)),
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if is_stream {
+            state.inner = StateInner::ReceivingMulti(VecDeque::new(), cx.waker().clone());
+        } else {
+            state.inner = StateInner::Completing(cx.waker().clone());
+        }
+        task::Poll::Pending
     }
 }
 
@@ -173,8 +174,9 @@ impl CommandFutureInner {
     fn poll(
         &mut self,
         is_stream: bool,
+        prepare_fn: Option<impl FnOnce(&mut SysSqe)>,
         cx: &mut task::Context,
-    ) -> task::Poll<Option<Result<CqEntry64>>> {
+    ) -> task::Poll<Option<Result<SysCqe>>> {
         log::debug!("Polling future");
         let reactor = self
             .reactor
@@ -182,53 +184,44 @@ impl CommandFutureInner {
             .expect("failed to poll CommandFuture: reactor is dead");
 
         let tags_guard;
-        let mut initial_sqe;
 
-        let (state_lock, mut init_sqe, is_direct, tag) = match self.repr {
-            CommandFutureRepr::Tagged {
-                tag,
-                ref mut initial_sqe,
-            } => {
+        let (state_lock, is_direct, tag) = match self.repr {
+            CommandFutureRepr::Tagged(tag) => {
                 tags_guard = reactor.tag_map.read();
                 let state_lock = tags_guard
                     .get(&tag)
                     .expect("CommandFuture::poll error: tag used by future has been removed");
 
-                (state_lock, initial_sqe, false, Some(tag))
+                (state_lock, false, Some(tag))
             }
-            CommandFutureRepr::Direct {
-                ref state,
-                initial_sqe: sqe,
-            } => {
-                initial_sqe = Some(sqe);
-                (state, &mut initial_sqe, true, None)
+            CommandFutureRepr::Direct(ref state) => {
+                (state, true, None)
             }
         };
 
         let mut state_guard = state_lock.lock();
 
-        if let StateInner::Submitting(_) = state_guard.inner {
-            in_state_sqe = Some(sqe);
-            init_sqe = &mut in_state_sqe;
-        }
-        let instance_either = reactor.instance(self.ring);
+        let instance_either = reactor.consumer_instance(self.ring);
         let instance =
             &*instance_either.expect("cannot poll CommandFuture: instance is a producer instance");
 
         match &mut state_guard.inner {
-            &mut StateInner::Initial | &mut StateInner::Submitting(_, _) => try_submit(
+            &mut StateInner::Initial | &mut StateInner::Submitting(_) => try_submit(
                 instance,
                 &mut *state_guard,
-                cx,
-                init_sqe.expect("expected an initial SQE when submitting command"),
+                prepare_fn
+                    .expect("expected preparation function when the state was in initial"),
                 if is_direct {
                     Left(Arc::downgrade(&state_lock))
                 } else {
                     Right(tag.expect("expected tagged future to have a tag available"))
                 },
                 is_stream,
-            ),
+                cx,
+            ).map(Err).map(Some),
             &mut StateInner::Completing(_) => task::Poll::Pending,
+
+            #[cfg(target_os = "redox")]
             &mut StateInner::ReceivingMulti(ref mut received, ref mut waker) => {
                 if !waker.will_wake(cx.waker()) {
                     *waker = cx.waker().clone();
@@ -263,14 +256,14 @@ impl CommandFutureInner {
     }
 }
 
-impl Drop for CommandFuture {
+impl<F> Drop for CommandFuture<F> {
     fn drop(&mut self) {
         // TODO: Implement cancellation.
         let this = &*self;
         let arc;
         let state = match this.inner.repr {
-            CommandFutureRepr::Direct { ref state, .. } => &*state,
-            CommandFutureRepr::Tagged { tag, .. } => {
+            CommandFutureRepr::Direct(ref state) => &*state,
+            CommandFutureRepr::Tagged(tag) => {
                 let state_opt = this
                     .inner
                     .reactor
@@ -293,13 +286,16 @@ impl Drop for CommandFuture {
     }
 }
 
-impl Future for CommandFuture {
-    type Output = Result<CqEntry64>;
+impl<F> Future for CommandFuture<F>
+where
+    F: FnOnce(&mut SysSqe) + Unpin,
+{
+    type Output = Result<SysCqe>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<Self::Output> {
         let this = self.get_mut();
 
-        match this.inner.poll(false, cx) {
+        match this.inner.poll(false, this.prepare_fn.take(), cx) {
             task::Poll::Ready(value) => task::Poll::Ready(
                 value.expect("expected return value of non-stream to always be Some"),
             ),
@@ -310,18 +306,35 @@ impl Future for CommandFuture {
 
 /// A stream that yields CQEs representing events, using system event queues under the hood.
 #[derive(Debug)]
-pub struct FdUpdates {
+pub struct FdEvents {
     inner: CommandFutureInner,
+    initial: Option<FdEventsInitial>,
 }
 
-impl Stream for FdUpdates {
-    type Item = Result<CqEntry64>;
+#[derive(Debug)]
+pub(crate) struct FdEventsInitial {
+    fd: SysFd,
+    event_flags: EventFlags,
+    oneshot: bool,
+}
+
+impl Stream for FdEvents {
+    type Item = Result<SysCqe>;
 
     fn poll_next(
         self: Pin<&mut Self>,
         cx: &mut task::Context<'_>,
     ) -> task::Poll<Option<Self::Item>> {
-        self.get_mut().inner.poll(true, cx)
+        let this = self.get_mut();
+
+        let prepare_fn = this.initial.take().map(|initial| |sqe| {
+            #[cfg(target_os = "redox")]
+            {
+                // TODO: Validate cast.
+                sqe.sys_register_events(initial.fd as u64, initial.event_flags, initial.oneshot)
+            }
+        });
+        this.inner.poll(true, prepare_fn, cx)
     }
 }
 

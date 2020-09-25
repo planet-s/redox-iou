@@ -88,7 +88,7 @@ impl BufferPoolHandle {
     }
 }
 
-impl CommandFuture {
+impl<F> CommandFuture<F> {
     /// Protect a slice with a future guard, preventing the memory from being reclaimed until the
     /// future has completed. This will cause the buffer slice to leak memory if dropped too early,
     /// but prevents undefined behavior.
@@ -98,8 +98,8 @@ impl CommandFuture {
         T: ?Sized,
     {
         let guard_inner = match self.inner.repr {
-            CommandFutureRepr::Direct { ref state, .. } => Arc::clone(state),
-            CommandFutureRepr::Tagged { tag, .. } => {
+            CommandFutureRepr::Direct(ref state) => Arc::clone(state),
+            CommandFutureRepr::Tagged(tag) => {
                 if let Some(reactor) = self.inner.reactor.upgrade() {
                     if let Some(state) = reactor.tag_map.read().get(&tag) {
                         Arc::clone(state)
