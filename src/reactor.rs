@@ -1579,6 +1579,7 @@ impl Handle {
     ///
     /// This being safe relies on the runtime lifetime invariant, meaning that the buffer stays in
     /// memory until the future has completed, or successfully been cancelled.
+    // TODO: Support Linux, by using AT_FDCWD.
     pub async unsafe fn open_unchecked<B>(
         &self,
         ring: impl Into<RingId>,
@@ -2691,6 +2692,7 @@ slice_like!(::std::rc::Rc<[u8]>);
 slice_like!(::std::borrow::Cow<'_, [u8]>);
 slice_like!(::std::string::String);
 slice_like!(str);
+slice_like!(&str);
 slice_like!([u8; 0]);
 slice_like!(&[u8; 0]);
 
@@ -2752,6 +2754,20 @@ pub struct OpenInfo {
 
     #[cfg(target_os = "linux")]
     inner: (iou::sqe::OFlag, iou::sqe::Mode),
+}
+
+impl OpenInfo {
+    /// Use the default parameters, meaning no special flags (other than O_CLOEXEC), and with a
+    /// 000-mode.
+    pub fn new() -> Self {
+        Self {
+            #[cfg(target_os = "redox")]
+            inner: 0,
+
+            #[cfg(target_os = "linux")]
+            inner: (iou::sqe::OFlag::O_CLOEXEC, iou::sqe::Mode::empty()),
+        }
+    }
 }
 
 enum SendArg<F> {

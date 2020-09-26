@@ -11,6 +11,12 @@ pub struct ConsumerInstance {
 }
 
 impl ConsumerInstance {
+    /// Wrap an io_uring from `iou`.
+    pub fn from_iou(io_uring: iou::IoUring) -> Self {
+        Self {
+            io_uring: Mutex::new(io_uring),
+        }
+    }
     /// Lock the mutex guard of the consumer instance, retrieving a temporary guard with exclusive
     /// access to the ring.
     pub fn lock(&self) -> MutexGuard<'_, iou::IoUring> {

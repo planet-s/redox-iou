@@ -1,0 +1,5 @@
+This is a test.
+
+Yes, this is really a test, and it's related to zerocopy completion I/O.
+
+Too bad Linux's open syscall takes a nul-terminated ptr, and not ptr+len.
