@@ -756,6 +756,7 @@ mod consumer_instance {
             self.with_kernel
         }
 
+        /// Retrieve the number of free SQEs, that can be _pushed_.
         #[inline]
         pub fn sq_free_entry_count(&self) -> Result<usize> {
             match self.sender.read() {
@@ -763,6 +764,7 @@ mod consumer_instance {
                 Either::Right(ref sender) => sender.free_entry_count(),
             }
         }
+        /// Retrieve the number of free SQEs, that can be _popped_.
         #[inline]
         pub fn sq_available_entry_count(&self) -> Result<usize> {
             match self.sender.read() {
@@ -770,6 +772,7 @@ mod consumer_instance {
                 Either::Right(ref sender) => sender.available_entry_count(),
             }
         }
+        /// Retrieve the number of free CQEs, that can be _pushed_.
         #[inline]
         pub fn cq_free_entry_count(&self) -> Result<usize> {
             match self.receiver.read() {
@@ -777,6 +780,7 @@ mod consumer_instance {
                 Either::Right(ref receiver) => receiver.free_entry_count(),
             }
         }
+        /// Retrieve the number of available CQEs, that can be _popped_.
         #[inline]
         pub fn cq_available_entry_count(&self) -> Result<usize> {
             match self.receiver.read() {

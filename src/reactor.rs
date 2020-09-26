@@ -219,6 +219,7 @@ pub struct SecondaryRingId {
     pub(crate) reactor: ReactorId,
     pub(crate) inner: usize,
 }
+/// A ring ID that is guaranteed to be a producer ring of a reactor.
 #[cfg(any(doc, target_os = "redox"))]
 #[doc(cfg(target_os = "redox"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,6 +246,7 @@ impl SecondaryRingId {
 #[cfg(any(doc, target_os = "redox"))]
 #[doc(cfg(target_os = "redox"))]
 impl ProducerRingId {
+    /// Get the unique reactor ID using this ring.
     #[inline]
     pub fn reactor(&self) -> ReactorId {
         self.reactor
@@ -1535,10 +1537,10 @@ impl Handle {
     /// to a NUL-terminated string (somehow). Since Rust does the right thing and also stores the
     /// length of all dynamically-sized data, this is checked _when debug assertions are enabled_.
     ///
-    /// It is highly recommended that the regular [`open`] call be used instead, which takes care
-    /// of guarding the memory until completion.
+    /// It is highly recommended that the regular [`open_at`] call be used instead, which takes
+    /// care of guarding the memory until completion.
     ///
-    /// [`open`]: #method.open
+    /// [`open_at`]: #method.open_at
     pub async unsafe fn open_unchecked_at<B>(
         &self,
         ring: impl Into<RingId>,
