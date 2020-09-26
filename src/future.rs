@@ -288,7 +288,7 @@ impl<F> Drop for CommandFuture<F> {
 
 impl<F> Future for CommandFuture<F>
 where
-    F: FnOnce(SysSqeRef) + Unpin,
+    F: for<'ring> FnOnce(SysSqeRef<'ring>) + Unpin,
 {
     type Output = Result<SysCqe>;
 
@@ -307,15 +307,15 @@ where
 /// A stream that yields CQEs representing events, using system event queues under the hood.
 #[derive(Debug)]
 pub struct FdEvents {
-    inner: CommandFutureInner,
-    initial: Option<FdEventsInitial>,
+    pub(crate) inner: CommandFutureInner,
+    pub(crate) initial: Option<FdEventsInitial>,
 }
 
 #[derive(Debug)]
 pub(crate) struct FdEventsInitial {
-    fd: SysFd,
-    event_flags: EventFlags,
-    oneshot: bool,
+    pub(crate) fd: SysFd,
+    pub(crate) event_flags: EventFlags,
+    pub(crate) oneshot: bool,
 }
 
 #[cfg(target_os = "redox")]

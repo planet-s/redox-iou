@@ -23,7 +23,7 @@ use syscall::error::{
     E2BIG, EADDRINUSE, EBADF, ECANCELED, EFAULT, EINVAL, EIO, EOPNOTSUPP, EOVERFLOW,
 };
 use syscall::flag::{EventFlags, MapFlags};
-use syscall::io_uring::operation::{DupFlags, FilesUpdateFlags};
+use syscall::io_uring::operation::{DupFlags, RegisterEventsFlags};
 use syscall::io_uring::v1::{
     CqEntry64, IoUringCqeFlags, IoUringSqeFlags, Priority, RingPopError, RingPushError, SqEntry64,
     StandardOpcode,
@@ -38,7 +38,7 @@ use parking_lot::{
 };
 
 use crate::future::{
-    AtomicTag, CommandFuture, CommandFutureInner, CommandFutureRepr, FdUpdates, State, StateInner,
+    AtomicTag, CommandFuture, CommandFutureInner, CommandFutureRepr, FdEvents, FdEventsInitial, State, StateInner,
     Tag,
 };
 #[cfg(target_os = "redox")]
@@ -1112,18 +1112,17 @@ impl Handle {
     /// is UB.
     pub unsafe fn send<F>(&self, ring: impl Into<RingId>, prepare_sqe: F) -> CommandFuture<F>
     where
-        F: FnOnce(SysSqeRef),
+        F: for<'ring> FnOnce(SysSqeRef<'ring>),
     {
-        self.send_inner(ring, prepare_sqe, false)
+        self.send_inner(ring, SendArg::Single(prepare_sqe))
             .left()
             .expect("send_inner() must return CommandFuture if is_stream is set to false")
     }
     unsafe fn send_inner<F>(
         &self,
         ring: impl Into<RingId>,
-        prepare_sqe: F,
-        is_stream: bool,
-    ) -> Either<CommandFuture<F>, FdUpdates> {
+        send_arg: SendArg<F>,
+    ) -> Either<CommandFuture<F>, FdEvents> {
         let ring = ring.into();
 
         let reactor = self
@@ -1212,10 +1211,9 @@ impl Handle {
             },
         };
 
-        if is_stream {
-            Right(FdUpdates { inner })
-        } else {
-            Left(CommandFuture { inner, prepare_fn: Some(prepare_sqe) })
+        match send_arg {
+            SendArg::Stream(initial) => Right(FdEvents { inner, initial: Some(initial) }),
+            SendArg::Single(prepare_sqe) => Left(CommandFuture { inner, prepare_fn: Some(prepare_sqe) }),
         }
     }
     /// Send a Completion Queue Entry to the consumer, waking it up when the reactor enters the
@@ -1409,12 +1407,12 @@ impl Handle {
         mut buf: Either<B, G>,
     ) -> Result<(usize, Option<G>)>
     where
-        F: FnOnce(SysSqeRef, SysFd, Either<B, &mut G>) -> Result<()>,
+        F: for<'ring> FnOnce(SysSqeRef<'ring>, SysFd, Either<B, &mut G>) -> Result<()>,
         G: crate::memory::Guardable<DefaultSubmissionGuard, [u8]>,
     {
         let fd: u64 = fd.try_into().or(Err(Error::new(EOVERFLOW)))?;
 
-        let prepare_fn = |sqe| {
+        let prepare_fn = |sqe: SysSqeRef| {
             #[cfg(target_os = "redox")]
             {
                 let sqe = sqe.base(
@@ -1982,6 +1980,8 @@ impl Handle {
     /// This is the safe variant of the [`write_unchecked`] method.
     ///
     /// [`write_unchecked`]: #method.write_unchecked
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
     pub async fn write<G>(
         &self,
         ring: impl Into<RingId>,
@@ -2009,9 +2009,6 @@ impl Handle {
                             .as_generic_slice(ring.is_primary())
                             .ok_or(Error::new(EFAULT))?,
                     );
-
-                    #[cfg(target_os = "linux")]
-                    compile_error!("TODO");
 
                     Ok(())
                 },
@@ -2668,4 +2665,9 @@ pub struct OpenInfo {
 
     #[cfg(target_os = "linux")]
     inner: (iou::sqe::OFlag, iou::sqe::Mode),
+}
+
+enum SendArg<F> {
+    Stream(FdEventsInitial),
+    Single(F),
 }
