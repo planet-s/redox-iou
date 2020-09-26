@@ -288,7 +288,7 @@ impl<F> Drop for CommandFuture<F> {
 
 impl<F> Future for CommandFuture<F>
 where
-    F: for<'ring> FnOnce(SysSqeRef<'ring>) + Unpin,
+    F: FnOnce(SysSqeRef) + Unpin,
 {
     type Output = Result<SysCqe>;
 

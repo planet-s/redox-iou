@@ -1112,7 +1112,7 @@ impl Handle {
     /// is UB.
     pub unsafe fn send<F>(&self, ring: impl Into<RingId>, prepare_sqe: F) -> CommandFuture<F>
     where
-        F: for<'ring> FnOnce(SysSqeRef<'ring>),
+        F: FnOnce(SysSqeRef),
     {
         self.send_inner(ring, prepare_sqe, false)
             .left()
@@ -1409,7 +1409,7 @@ impl Handle {
         mut buf: Either<B, G>,
     ) -> Result<(usize, Option<G>)>
     where
-        F: for<'ring> FnOnce(SysSqeRef<'ring>, SysFd, Either<&mut B, &mut G>) -> Result<()>,
+        F: FnOnce(SysSqeRef, SysFd, Either<B, &mut G>) -> Result<()>,
         G: crate::memory::Guardable<DefaultSubmissionGuard, [u8]>,
     {
         let fd: u64 = fd.try_into().or(Err(Error::new(EOVERFLOW)))?;
@@ -1443,8 +1443,8 @@ impl Handle {
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
         path: Either<&B, G>,
-        flags: u64,
-        at: Option<usize>,
+        info: OpenInfo,
+        at: Option<SysFd>,
     ) -> Result<(usize, Option<G>)>
     where
         B: AsOffsetLen + ?Sized,
@@ -1457,7 +1457,8 @@ impl Handle {
         let reference = match path {
             Left(r) => r
                 .as_generic_slice(ring.is_primary())
-                .ok_or(Error::new(EFAULT))?,
+                .ok_or(Error::new(EFAULT))?
+                .as_static(),
             Right(r) => {
                 guardable = Some(r);
                 guardable
@@ -1465,17 +1466,36 @@ impl Handle {
                     .unwrap()
                     .as_generic_slice(ring.is_primary())
                     .ok_or(Error::new(EFAULT))?
+                    .as_static()
             }
         };
-        let sqe_base = SqEntry64::new(ctx.sync().sqe_flags(), ctx.priority(), (-1i64) as u64);
-        let sqe = if let Some(at_fd) = at {
-            let fd64 = u64::try_from(at_fd)?;
-            sqe_base.open_at(fd64, reference, flags)
-        } else {
-            sqe_base.open(reference, flags)
+        let prepare_fn = |mut sqe: SysSqeRef| {
+            #[cfg(target_os = "redox")]
+            {
+                let sqe = sqe.base(ctx.sync().sqe_flags(), ctx.priority(), (-1i64) as u64);
+
+                if let Some(at_fd) = at {
+                    let fd64 = u64::try_from(at_fd)?;
+                    sqe_base.open_at(fd64, reference, flags)
+                } else {
+                    sqe_base.open(reference, flags)
+                }
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let (flags, mode) = info.inner;
+
+                let slice = std::slice::from_raw_parts(reference.offset() as usize as *const u8, reference.len() as usize);
+
+                #[cfg(debug_assertions)]
+                nul_check(slice);
+
+                let cstr = std::ffi::CStr::from_bytes_with_nul_unchecked(slice);
+                sqe.prep_openat(at.unwrap(), cstr, flags, mode)
+            }
         };
 
-        let fut = self.send(ring, sqe);
+        let fut = self.send(ring, prepare_fn);
         if let Some(ref mut guardable) = guardable {
             fut.guard(guardable);
         }
@@ -1485,8 +1505,8 @@ impl Handle {
         Ok((fd, guardable))
     }
 
-    /// Open a path represented by a byte slice, returning a new file descriptor for the file
-    /// at by that path. This is the unsafe version of [`open`].
+    /// Open a path represented by a byte slice (NUL-terminated on Linux), returning a new file
+    /// descriptor for the file at by that path. This is the unsafe version of [`open_at`].
     ///
     /// # Safety
     ///
@@ -1497,17 +1517,24 @@ impl Handle {
     /// [`std::mem::ManuallyDrop`], or with references which lifetimes you otherwise know will outlive
     /// the entire submission.
     ///
+    /// ## Platform-specific invariants
+    ///
+    /// An additional safety invariant is that on Linux, the buffer passed to the system call,
+    /// _must_ be NUL-terminated, as the open(2), openat(2) and even openat2(2) all take a pointer
+    /// to a NUL-terminated string (somehow). Since Rust does the right thing and also stores the
+    /// length of all dynamically-sized data, this is checked _when debug assertions are enabled_.
+    ///
     /// It is highly recommended that the regular [`open`] call be used instead, which takes care
     /// of guarding the memory until completion.
     ///
     /// [`open`]: #method.open
-    pub async unsafe fn open_unchecked<B>(
+    pub async unsafe fn open_unchecked_at<B>(
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
         path: &B,
-        flags: u64,
-        at: Option<usize>,
+        info: OpenInfo,
+        at: SysFd,
     ) -> Result<usize>
     where
         B: AsOffsetLen + ?Sized,
@@ -1519,8 +1546,8 @@ impl Handle {
                 ring,
                 ctx,
                 Either::<&B, GuardedPlaceholder>::Left(path),
-                flags,
-                at,
+                info,
+                Some(at),
             )
             .await?;
         Ok(fd)
@@ -1536,19 +1563,24 @@ impl Handle {
     /// [`open_unchecked`]: #method.open_unchecked
     /// [`Guarded`]: ../memory/struct.Guarded.html
     /// [`Guardable`]: ../memory/trait.Guardable.html
-    pub async fn open<G>(
+    pub async fn open_at<G>(
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
         path: G,
-        flags: u64,
-        at: Option<usize>,
+        info: OpenInfo,
+        at: SysFd,
     ) -> Result<(usize, G)>
     where
         G: Guardable<DefaultSubmissionGuard, [u8]> + AsOffsetLen,
     {
+        #[cfg(target_os = "linux")]
+        if let Some(slice) = path.try_get_data() {
+            nul_check(slice);
+        }
+
         let (fd, guard_opt) = unsafe {
-            self.open_raw_unchecked_inner(ring, ctx, Either::<&[u8; 0], G>::Right(path), flags, at)
+            self.open_raw_unchecked_inner(ring, ctx, Either::<&[u8; 0], G>::Right(path), info, Some(at))
         }
         .await?;
         let guard = guard_opt.expect(
@@ -1576,12 +1608,22 @@ impl Handle {
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
-        fd: usize,
+        fd: SysFd,
         flush: bool,
     ) -> Result<()> {
-        let sqe = SqEntry64::new(ctx.sync().sqe_flags(), ctx.priority(), (-1i64) as u64)
-            .close(fd.try_into().or(Err(Error::new(EOVERFLOW)))?, flush);
-        let cqe = self.send(ring, sqe).await?;
+        let prepare_fn = |mut sqe: SysSqeRef| {
+            #[cfg(target_os = "redox")]
+            {
+                sqe.base(ctx.sync().sqe_flags(), ctx.priority(), (-1i64) as u64)
+                    .close(fd.try_into().or(Err(Error::new(EOVERFLOW)))?, flush)
+            }
+            #[cfg(target_os = "linux")]
+            {
+                // TODO: flush
+                sqe.prep_close(fd)
+            }
+        };
+        let cqe = self.send(ring, prepare_fn).await?;
 
         Self::completion_as_rw_io_result(cqe)?;
 
@@ -1597,6 +1639,8 @@ impl Handle {
     /// Refer to the invariants documented in the [`close`] call.
     ///
     /// [`close`]: #method.close
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
     pub async unsafe fn close_range(
         &self,
         ring: impl Into<RingId>,
@@ -1608,9 +1652,11 @@ impl Handle {
         let end: u64 = range.end.try_into().or(Err(Error::new(EOVERFLOW)))?;
         let count = end.checked_sub(start).ok_or(Error::new(EINVAL))?;
 
-        let sqe = SqEntry64::new(ctx.sync.sqe_flags(), ctx.priority(), (-1i64) as u64)
-            .close_many(start, count, flush);
-        let cqe = self.send(ring, sqe).await?;
+        let prepare_fn = |sqe: SysSqeRef| {
+            sqe.base(ctx.sync.sqe_flags(), ctx.priority(), (-1i64) as u64)
+                .sys_close_many(start, count, flush);
+        };
+        let cqe = self.send(ring, prepare_fn).await?;
 
         Self::completion_as_rw_io_result(cqe)?;
 
@@ -1627,11 +1673,14 @@ impl Handle {
     /// not reclaimed until the command is either complete or cancelled.
     ///
     /// [`read`]: #method.read
+    // TODO: Linux?
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
     pub async unsafe fn read_unchecked(
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
-        fd: usize,
+        fd: SysFd,
         buf: &mut [u8],
     ) -> Result<usize> {
         let ring = ring.into();
@@ -1642,13 +1691,13 @@ impl Handle {
                 ctx,
                 fd,
                 |sqe, fd, buf| {
-                    Ok(sqe.read(
+                    sqe.sys_read(
                         fd,
                         buf.left()
                             .unwrap()
                             .as_generic_slice_mut(ring.is_primary())
                             .ok_or(Error::new(EFAULT))?,
-                    ))
+                    );
                 },
                 Either::<_, GuardedPlaceholder>::Left(buf),
             )
@@ -1660,6 +1709,9 @@ impl Handle {
     /// This is the safe variant of [`read_unchecked`].
     ///
     /// [`read_unchecked`]: #method.read_unchecked
+    // TODO: Linux?
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
     pub async fn read<G>(
         &self,
         ring: impl Into<RingId>,
@@ -1678,7 +1730,7 @@ impl Handle {
                 ctx,
                 fd,
                 |sqe, fd, buf| {
-                    Ok(sqe.read(
+                    sqe.sys_read(
                         fd,
                         buf.right()
                             .unwrap()
@@ -1686,7 +1738,8 @@ impl Handle {
                             .ok_or(Error::new(EADDRINUSE))?
                             .as_generic_slice_mut(ring.is_primary())
                             .ok_or(Error::new(EFAULT))?,
-                    ))
+                    );
+                    Ok(())
                 },
                 Either::<(), _>::Right(buf),
             )
@@ -1705,6 +1758,8 @@ impl Handle {
     /// The caller must ensure that the buffers outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
     // TODO: safe wrapper
+    // TODO: Linux?
+    #[cfg(any(doc, target_os = "redox"))]
     pub async unsafe fn readv_unchecked(
         &self,
         ring: impl Into<RingId>,
@@ -1719,7 +1774,10 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, bufs| Ok(sqe.readv(fd, bufs.left().unwrap())),
+                |sqe, fd, bufs| {
+                    sqe.sys_readv(fd, bufs.left().unwrap());
+                    Ok(())
+                },
                 Either::<_, GuardedPlaceholder>::Left(bufs),
             )
             .await?;
@@ -1740,7 +1798,7 @@ impl Handle {
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
-        fd: usize,
+        fd: SysFd,
         buf: &mut [u8],
         offset: u64,
     ) -> Result<usize> {
@@ -1751,15 +1809,24 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, buf| {
-                    Ok(sqe.pread(
+                |mut sqe, fd, buf| {
+                    let buf_unchecked = buf.left().unwrap();
+
+                    #[cfg(target_os = "redox")]
+                    sqe.sys_pread(
                         fd,
-                        buf.left()
-                            .unwrap()
+                        buf_unchecked
                             .as_generic_slice_mut(ring.is_primary())
                             .ok_or(Error::new(EFAULT))?,
                         offset,
-                    ))
+                    );
+                    #[cfg(target_os = "linux")]
+                    sqe.prep_read(
+                        fd,
+                        buf_unchecked,
+                        offset,
+                    );
+                    Ok(())
                 },
                 Either::<_, GuardedPlaceholder>::Left(buf),
             )
@@ -1775,7 +1842,7 @@ impl Handle {
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
-        fd: usize,
+        fd: SysFd,
         buf: G,
         offset: u64,
     ) -> Result<(usize, G)>
@@ -1789,17 +1856,27 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, buf| {
-                    Ok(sqe.pread(
+                |mut sqe, fd, buf| {
+                    let buf_checked = buf.right().unwrap();
+                    let data_mut = buf_checked.try_get_data_mut()
+                        .ok_or(Error::new(EADDRINUSE))?;
+
+                    #[cfg(target_os = "redox")]
+                    sqe.sys_pread(
                         fd,
-                        buf.right()
-                            .unwrap()
-                            .try_get_data_mut()
-                            .ok_or(Error::new(EADDRINUSE))?
+                        data_mut
                             .as_generic_slice_mut(ring.is_primary())
                             .ok_or(Error::new(EFAULT))?,
                         offset,
-                    ))
+                    );
+                    #[cfg(target_os = "linux")]
+                    sqe.prep_read(
+                        fd,
+                        data_mut,
+                        offset,
+                    );
+
+                    Ok(())
                 },
                 Either::<(), _>::Right(buf),
             )
@@ -1844,7 +1921,7 @@ impl Handle {
                     {
                         let mut bufs_unchecked = bufs_unchecked;
                         // TODO
-                        let bufs_unchecked = unsafe { core::slice::from_raw_parts_mut(bufs_unchecked.as_ptr() as *mut std::io::IoSliceMut, bufs_unchecked.len()) };
+                        let bufs_unchecked = unsafe { core::slice::from_raw_parts_mut(bufs_unchecked.as_mut_ptr() as *mut std::io::IoSliceMut, bufs_unchecked.len()) };
                         sqe.prep_read_vectored(fd, bufs_unchecked, offset);
                     }
 
@@ -1867,6 +1944,9 @@ impl Handle {
     /// not reclaimed until the command is either complete or cancelled.
     ///
     /// [`write`]: #method.write
+    // TODO: On Linux?
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
     pub async unsafe fn write_unchecked(
         &self,
         ring: impl Into<RingId>,
@@ -1881,14 +1961,15 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, buf| {
-                    Ok(sqe.write(
+                |mut sqe, fd, buf| {
+                    sqe.sys_write(
                         fd,
                         buf.left()
                             .unwrap()
                             .as_generic_slice(ring.is_primary())
                             .ok_or(Error::new(EFAULT))?,
-                    ))
+                    );
+                    Ok(())
                 },
                 Either::<_, GuardedPlaceholder>::Left(buf),
             )
@@ -1951,6 +2032,9 @@ impl Handle {
     ///
     /// The caller must ensure that the buffers outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
+    // TODO: Does Linux support system calls that change the file offset, when using io_uring?
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
     pub async unsafe fn writev(
         &self,
         ring: impl Into<RingId>,
@@ -1963,7 +2047,10 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |sqe, fd, bufs| Ok(sqe.sys_writev(fd, bufs.left().unwrap())),
+                |mut sqe, fd, bufs| {
+                    sqe.sys_writev(fd, bufs.left().unwrap());
+                    Ok(())
+                },
                 Either::<_, GuardedPlaceholder>::Left(bufs),
             )
             .await?;
@@ -1996,7 +2083,7 @@ impl Handle {
                 ctx,
                 fd,
                 |mut sqe: SysSqeRef, fd, buf| {
-                    let buf_unchecked = *buf.left().unwrap();
+                    let buf_unchecked = buf.left().unwrap();
 
                     #[cfg(target_os = "redox")]
                     sqe.pwrite(
@@ -2049,7 +2136,7 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |sqe: SysSqeRef, fd, buf| {
+                |mut sqe: SysSqeRef, fd, buf| {
                     let buf_checked = buf.right().unwrap();
 
                     #[cfg(target_os = "redox")]
@@ -2057,6 +2144,7 @@ impl Handle {
                         sqe.sys_pwrite(
                             fd,
                             buf_checked
+                                .data_shared()
                                 .as_generic_slice(ring.is_primary())
                                 .ok_or(Error::new(EFAULT))?,
                             offset,
@@ -2066,7 +2154,7 @@ impl Handle {
                     {
                         sqe.prep_write(
                             fd,
-                            buf_checked.get_ref(),
+                            buf_checked.data_shared(),
                             offset,
                         )
                     }
@@ -2567,4 +2655,17 @@ where
     fn offset_mut(&mut self) -> u64 {
         unreachable!("the Guarded wrapper only works on primary rings")
     }
+}
+
+#[cfg(target_os = "linux")]
+fn nul_check(slice: &[u8]) {
+    assert_eq!(slice.last(), Some(&0), "path passed to open_raw_unchecked_inner was not NUL-terminated");
+}
+
+pub struct OpenInfo {
+    #[cfg(target_os = "redox")]
+    inner: u64,
+
+    #[cfg(target_os = "linux")]
+    inner: (iou::sqe::OFlag, iou::sqe::Mode),
 }
