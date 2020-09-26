@@ -41,10 +41,12 @@ pub mod reactor;
 
 #[cfg(any(doc, target_os = "redox"))]
 #[doc(cfg(target_os = "redox"))]
+/// Redox-specific functionality.
 pub mod redox;
 
 #[cfg(any(doc, target_os = "linux"))]
 #[doc(cfg(target_os = "linux"))]
+/// Linux-specific functionality.
 pub mod linux;
 
 // TODO: Windows's, but also perhaps Solaris's and AIX's I/O Completion Ports (IOCP) interface.

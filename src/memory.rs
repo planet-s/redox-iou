@@ -22,7 +22,7 @@ use crate::future::{
 };
 use crate::reactor::{Handle, SubmissionContext, SubmissionSync};
 
-#[cfg(target_os = "redox")]
+#[cfg(any(doc, target_os = "redox"))]
 use crate::reactor::SecondaryRingId;
 
 /// A buffer pool, with the default options for use by userspace-to-userspace rings.

@@ -41,14 +41,22 @@ use crate::future::{
     AtomicTag, CommandFuture, CommandFutureInner, CommandFutureRepr, FdEvents, FdEventsInitial, State, StateInner,
     Tag,
 };
+#[cfg(any(doc, target_os = "redox"))]
+use crate::future::ProducerSqes;
+
 #[cfg(target_os = "redox")]
-use crate::future::{ProducerSqes, ProducerSqesState};
+use crate::future::ProducerSqesState;
+
 use crate::executor::Runqueue;
 
-#[cfg(target_os = "redox")]
-use crate::redox::instance::{ConsumerInstance, ConsumerGenericSender, ProducerInstance};
+#[cfg(any(target_os = "redox"))]
+use crate::redox::instance::{ConsumerInstance, ConsumerGenericSender};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(doc, target_os = "redox"))]
+use crate::redox::instance::ProducerInstance;
+
+// TODO: Fix ConsumerInstance conflict.
+#[cfg(any(doc, target_os = "linux"))]
 use crate::linux::ConsumerInstance;
 
 use crate::memory::{Guardable, GuardableExclusive, GuardableShared, Guarded};
@@ -415,14 +423,18 @@ impl From<RingIdKind> for RingId {
 #[cfg(target_os = "redox")]
 pub type SysSqeRef<'ring> = &'ring mut SqEntry64;
 #[cfg(target_os = "linux")]
+/// A reference type (since SQEs are usually large) to the Submission Queue Entry type for the
+/// current platform.
 pub type SysSqeRef<'ring> = iou::SQE<'ring>;
 
 #[cfg(target_os = "redox")]
 pub type SysCqe = CqEntry64;
 #[cfg(target_os = "linux")]
+/// The Completion Queue Entry type for the current platform.
 pub type SysCqe = iou::CQE;
 
 #[cfg(target_os = "linux")]
+/// The system file descriptor type.
 pub type SysFd = std::os::unix::io::RawFd;
 #[cfg(target_os = "redox")]
 pub type SysFd = usize;
@@ -948,6 +960,7 @@ impl Reactor {
                     StateInner::Completed(cqe)
                 };
             }
+            #[cfg(target_os = "redox")]
             StateInner::ReceivingMulti(ref mut pending_cqes, waker) => {
                 if !waker.will_wake(driving_waker) {
                     waker.wake_by_ref();
@@ -1345,7 +1358,7 @@ impl Handle {
         fd: SysFd,
         event_flags: EventFlags,
         oneshot: bool,
-    ) -> FdUpdates {
+    ) -> FdEvents {
         assert!(!event_flags.contains(EventFlags::EVENT_IO_URING), "only the redox_iou reactor is allowed to use this flag unless io_uring API is used directly");
         let prepare_sqe = move |sqe: SysSqeRef| {
             {
@@ -2659,6 +2672,9 @@ fn nul_check(slice: &[u8]) {
     assert_eq!(slice.last(), Some(&0), "path passed to open_raw_unchecked_inner was not NUL-terminated");
 }
 
+/// Extra information passed to the `open_at` system calls, with parameters such as file descriptor
+/// mode, flags, and how the path is resolved (Linux).
+#[derive(Debug)]
 pub struct OpenInfo {
     #[cfg(target_os = "redox")]
     inner: u64,

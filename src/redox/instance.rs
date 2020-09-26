@@ -19,7 +19,7 @@ mod consumer_instance {
     use syscall::io_uring::v1::{CURRENT_MINOR, CURRENT_PATCH};
     use syscall::io_uring::{IoUringCreateInfo, IoUringEnterFlags, IoUringVersion};
 
-    use crate::ring::{SpscReceiver, SpscSender};
+    use crate::redox::ring::{SpscReceiver, SpscSender};
 
     #[derive(Debug, Default)]
     struct InstanceBuilderCreateStageInfo {
@@ -813,7 +813,7 @@ mod producer_instance {
     use syscall::error::{Error, Result};
     use syscall::error::{EINVAL, ENOSYS};
 
-    use crate::ring::{SpscReceiver, SpscSender};
+    use crate::redox::ring::{SpscReceiver, SpscSender};
 
     /// The possible different types of senders (which for producers, are always completion rings)
     /// for producer instances, with either 32-bit or 64-bit completion entries.

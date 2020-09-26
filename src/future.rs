@@ -63,6 +63,7 @@ pub(crate) enum StateInner {
 
     // The future is a stream and is receiving multiple CQEs.
     // TODO: Remove the vecdeque from here.
+    #[cfg(target_os = "redox")]
     ReceivingMulti(VecDeque<SysCqe>, task::Waker),
 
     // The future has received the CQE, and the command is now complete. This state can now be
@@ -101,9 +102,9 @@ fn try_submit(
     let sqe = &mut sqe;
 
     #[cfg(target_os = "linux")]
-    let guard = instance.lock();
+    let mut guard = instance.lock();
     #[cfg(target_os = "linux")]
-    let sqe = match guard.prepare_sqe() {
+    let mut sqe = match guard.prepare_sqe() {
         Some(sqe_slot) => sqe_slot,
         None => {
             state.inner = StateInner::Submitting(cx.waker().clone());
@@ -162,7 +163,8 @@ fn try_submit(
     #[cfg(target_os = "linux")]
     {
         if is_stream {
-            state.inner = StateInner::ReceivingMulti(VecDeque::new(), cx.waker().clone());
+            todo!();
+            //state.inner = StateInner::ReceivingMulti(VecDeque::new(), cx.waker().clone());
         } else {
             state.inner = StateInner::Completing(cx.waker().clone());
         }
@@ -242,8 +244,11 @@ impl CommandFutureInner {
                 }
             }
 
-            &mut StateInner::Completed(cqe) => {
-                state_guard.inner = StateInner::Initial;
+            completed @ &mut StateInner::Completed(_) => {
+                let cqe = match std::mem::replace(completed, StateInner::Initial) {
+                    StateInner::Completed(cqe) => cqe,
+                    _ => unreachable!(),
+                };
                 state_guard.epoch += 1;
                 task::Poll::Ready(Some(Ok(cqe)))
             }
@@ -341,7 +346,7 @@ impl Stream for FdEvents {
 }
 
 #[derive(Debug)]
-#[cfg(target_os = "redox")]
+#[cfg(any(doc, target_os = "redox"))]
 pub(crate) enum ProducerSqesState {
     Receiving {
         deque: VecDeque<SqEntry64>,
