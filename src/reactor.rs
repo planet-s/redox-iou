@@ -1565,6 +1565,45 @@ impl Handle {
             .await?;
         Ok(fd)
     }
+
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
+    /// Open a file in a similar way to how [`open_unchecked_at`] works, but without the need to
+    /// specify a file descriptor to initially search from, with `/` being the default.
+    ///
+    /// This is Redox-only, since Linux only has `IORING_OP_OPENAT`, which always requires a file
+    /// descriptor. For maximum portability, prefer to manually open a file descriptor for the root
+    /// directory, and using that fd.
+    ///
+    /// # Safety
+    ///
+    /// This being safe relies on the runtime lifetime invariant, meaning that the buffer stays in
+    /// memory until the future has completed, or successfully been cancelled.
+    pub async unsafe fn open_unchecked<B>(
+        &self,
+        ring: impl Into<RingId>,
+        ctx: SubmissionContext,
+        path: &B,
+        info: OpenInfo,
+        at: Option<SysFd>,
+    ) -> Result<usize>
+    where
+        B: AsOffsetLen + ?Sized,
+    {
+        let ring = ring.into();
+
+        let (fd, _) = self
+            .open_raw_unchecked_inner(
+                ring,
+                ctx,
+                Either::<&B, GuardedPlaceholder>::Left(path),
+                info,
+                at,
+            )
+            .await?;
+        Ok(fd)
+    }
+
     /// Open a path represented by a byte slice, returning a new file descriptor for the file at
     /// that path.
     ///
@@ -1594,6 +1633,36 @@ impl Handle {
 
         let (fd, guard_opt) = unsafe {
             self.open_raw_unchecked_inner(ring, ctx, Either::<&[u8; 0], G>::Right(path), info, Some(at))
+        }
+        .await?;
+        let guard = guard_opt.expect(
+            "expected returned guard to be present returning from open_raw_unchecked_inner",
+        );
+        Ok((fd, guard))
+    }
+
+    /// Open a file in a similar way to how [`open_at`] works, but without having to necessarily
+    /// specify a file descriptor.
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(target_os = "redox")]
+    pub async fn open<G>(
+        &self,
+        ring: impl Into<RingId>,
+        ctx: SubmissionContext,
+        path: G,
+        info: OpenInfo,
+        at: Option<SysFd>,
+    ) -> Result<(usize, G)>
+    where
+        G: Guardable<DefaultSubmissionGuard, [u8]> + AsOffsetLen,
+    {
+        #[cfg(target_os = "linux")]
+        if let Some(slice) = path.try_get_data() {
+            nul_check(slice);
+        }
+
+        let (fd, guard_opt) = unsafe {
+            self.open_raw_unchecked_inner(ring, ctx, Either::<&[u8; 0], G>::Right(path), info, at)
         }
         .await?;
         let guard = guard_opt.expect(
