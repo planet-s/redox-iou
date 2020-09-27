@@ -6,7 +6,7 @@ use std::sync::Arc;
 use guard_trait::Guarded;
 
 use redox_iou::executor::Executor;
-use redox_iou::reactor::{Handle, OpenInfo, ReactorBuilder, SubmissionContext};
+use redox_iou::reactor::{Handle, OpenInfo, ReactorBuilder, SubmissionContext, SubmissionSync};
 
 #[cfg(target_os = "linux")]
 use redox_iou::linux::ConsumerInstance;
@@ -30,7 +30,7 @@ fn basic_file_io() -> Result<(), Box<dyn Error + 'static>> {
 
     executor.run(async move {
         // TODO: IntoGuardable trait?
-        let root_dir = handle
+        let (fd, _) = handle
             .open_at(
                 ring,
                 SubmissionContext::default(),
@@ -39,6 +39,26 @@ fn basic_file_io() -> Result<(), Box<dyn Error + 'static>> {
                 libc::AT_FDCWD,
             )
             .await?;
+
+        let mut buffer = vec! [0u8; 4096];
+        let guarded_buffer = Guarded::new(buffer);
+
+        let (bytes_read, guarded_buffer) = handle.pread(
+            ring,
+            SubmissionContext::new()
+                .with_sync(SubmissionSync::Drain),
+            fd,
+            guarded_buffer,
+            0,
+        ).await?;
+
+        unsafe { handle.close(
+            ring,
+            SubmissionContext::new()
+                .with_sync(SubmissionSync::Drain),
+            fd,
+            false,
+        ).await?; }
 
         Ok(())
     })

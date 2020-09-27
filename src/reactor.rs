@@ -1500,7 +1500,7 @@ impl Handle {
         path: Either<&B, G>,
         info: OpenInfo,
         at: Option<SysFd>,
-    ) -> Result<(usize, Option<G>)>
+    ) -> Result<(SysFd, Option<G>)>
     where
         B: AsOffsetLen + ?Sized,
         G: Guardable<DefaultSubmissionGuard, [u8]> + AsOffsetLen,
@@ -1560,7 +1560,7 @@ impl Handle {
         let cqe = fut.await?;
 
         let fd = Self::completion_as_rw_io_result(cqe)?;
-        Ok((fd, guardable))
+        Ok((fd as SysFd, guardable))
     }
 
     /// Open a path represented by a byte slice (NUL-terminated on Linux), returning a new file
@@ -1593,7 +1593,7 @@ impl Handle {
         path: &B,
         info: OpenInfo,
         at: SysFd,
-    ) -> Result<usize>
+    ) -> Result<SysFd>
     where
         B: AsOffsetLen + ?Sized,
     {
@@ -1668,7 +1668,7 @@ impl Handle {
         path: G,
         info: OpenInfo,
         at: SysFd,
-    ) -> Result<(usize, G)>
+    ) -> Result<(SysFd, G)>
     where
         G: Guardable<DefaultSubmissionGuard, [u8]> + AsOffsetLen,
     {
