@@ -1056,6 +1056,11 @@ pub enum SubmissionSync {
     Drain,
     /// Do a partial pipeline barrier, by requiring the SQE before this SQE to complete prior to
     /// handling this SQE.
+    // TODO: As per my understanding, Linux also has soft links and hard links (and maybe the word
+    // "link" is better than "chain". I simply chose "chain" because that's the terminology used in
+    // XHCI I/O queues). A soft link will terminate the entire chain upon a single cancellation or
+    // error, while a hard link will execute every command in the chain sequentially, but not
+    // cancel the entire chain immediately.
     Chain,
     // TODO: Add support for speculative (I hope I don't make io_uring Turing-complete and
     // vulnerable to Spectre) execution of subsequent SQEs, so long as they don't affect or are
@@ -1066,11 +1071,24 @@ impl SubmissionSync {
     /// Get the SQE flags that would be used for an SQE that has the same synchronization options
     /// as specified here. Note that the flags here only change the how the SQE is synchronized, so
     /// one might need to OR these flags with some other flags.
-    pub fn sqe_flags(self) -> IoUringSqeFlags {
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
+    pub fn redox_sqe_flags(self) -> IoUringSqeFlags {
         match self {
             Self::NoSync => IoUringSqeFlags::empty(),
             Self::Drain => IoUringSqeFlags::DRAIN,
             Self::Chain => IoUringSqeFlags::CHAIN,
+        }
+    }
+    /// Like with [`redox_sqe_flags`], retrieve the necessary flags to achieve the synchronization
+    /// needed.
+    #[cfg(any(doc, target_os = "linux"))]
+    #[doc(cfg(target_os = "linux"))]
+    pub fn linux_sqe_flags(self) -> iou::sqe::SubmissionFlags {
+        match self {
+            Self::NoSync => iou::sqe::SubmissionFlags::empty(),
+            Self::Drain => iou::sqe::SubmissionFlags::IO_DRAIN,
+            Self::Chain => iou::sqe::SubmissionContext::IO_LINK,
         }
     }
 }
@@ -1464,21 +1482,37 @@ impl Handle {
         mut buf: Either<B, G>,
     ) -> Result<(usize, Option<G>)>
     where
-        F: for<'ring> FnOnce(SysSqeRef<'ring>, SysFd, Either<B, &mut G>) -> Result<()>,
-        G: crate::memory::Guardable<DefaultSubmissionGuard, [u8]>,
+        F: for<'ring, 'tmp> FnOnce(&'tmp mut SysSqeRef<'ring>, SysFd, Either<B, &mut G>) -> Result<()> + Unpin,
+        G: crate::memory::Guardable<DefaultSubmissionGuard, [u8]> + Unpin,
+        B: Unpin,
     {
-        let fd: u64 = fd.try_into().or(Err(Error::new(EOVERFLOW)))?;
-
         let prepare_fn = |sqe: &mut SysSqeRef| {
             #[cfg(target_os = "redox")]
             {
+
+                let fd: u64 = fd.try_into().or(Err(Error::new(EOVERFLOW)))?;
+
                 let sqe = sqe.base(
-                    context.sync().sqe_flags(),
+                    context.sync().redox_sqe_flags(),
                     context.priority(),
                     (-1i64) as u64,
                 );
-                f(sqe, fd, buf.as_mut())?;
-                sqe
+                f(sqe, fd, buf.right_as_mut())?;
+            }
+
+            #[cfg(target_os = "linux")]
+            {
+                // TODO: ioprio on Linux; library support appears to be low
+
+                sqe.overwrite_flags(context.sync.linux_sqe_flags());
+
+                let result = match buf {
+                    Left(b) => f(sqe, fd, Left(b)),
+                    Right(ref mut g) => f(sqe, fd, Right(g)),
+                };
+
+                result
+                    .expect("TODO: Support errors in preparation fns, or move the fallible logic outside");
             }
         };
 
@@ -1977,7 +2011,7 @@ impl Handle {
         offset: u64,
     ) -> Result<(usize, G)>
     where
-        G: GuardableExclusive<DefaultSubmissionGuard, [u8]>,
+        G: GuardableExclusive<DefaultSubmissionGuard, [u8]> + Unpin,
     {
         let ring = ring.into();
 
@@ -2036,7 +2070,7 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |mut sqe: SysSqeRef, fd, bufs| {
+                |mut sqe: &mut SysSqeRef, fd, bufs| {
                     let bufs_unchecked = bufs.left().unwrap();
 
                     #[cfg(target_os = "redox")]
@@ -2213,7 +2247,7 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |mut sqe: SysSqeRef, fd, buf| {
+                |mut sqe: &mut SysSqeRef, fd, buf| {
                     let buf_unchecked = buf.left().unwrap();
 
                     #[cfg(target_os = "redox")]
@@ -2254,7 +2288,7 @@ impl Handle {
         offset: u64,
     ) -> Result<usize>
     where
-        G: GuardableShared<DefaultSubmissionGuard, [u8]>,
+        G: GuardableShared<DefaultSubmissionGuard, [u8]> + Unpin,
     {
         let ring = ring.into();
 
@@ -2263,7 +2297,7 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |mut sqe: SysSqeRef, fd, buf| {
+                |mut sqe: &mut SysSqeRef, fd, buf| {
                     let buf_checked = buf.right().unwrap();
 
                     #[cfg(target_os = "redox")]
@@ -2283,7 +2317,7 @@ impl Handle {
                     }
                     Ok(())
                 },
-                Either::<(), _>::Right(buf),
+                Either::<(), G>::Right(buf),
             )
         }
         .await?;
@@ -2311,7 +2345,7 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |mut sqe: SysSqeRef, fd, bufs| {
+                |mut sqe: &mut SysSqeRef, fd, bufs| {
                     let bufs_unchecked = bufs.left().unwrap();
 
                     #[cfg(target_os = "redox")]

@@ -184,7 +184,6 @@ impl Executor {
 
                 task::Poll::Pending => {
                     if let Some(reactor_wrapper) = self.reactor.as_ref() {
-                        reactor_wrapper.reactor.drive_primary(idx, &waker, false);
                         self.poll_spawned_futures();
                         reactor_wrapper.reactor.drive_primary(idx, &waker, true);
                     } else {
