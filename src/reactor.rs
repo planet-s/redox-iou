@@ -1473,7 +1473,7 @@ impl Handle {
         }
     }
     #[inline]
-    async unsafe fn rw_io<F, B, G>(
+    async unsafe fn rw_io<'buf, F, B, G, H>(
         &self,
         ring: impl Into<RingId>,
         context: SubmissionContext,
@@ -1482,14 +1482,18 @@ impl Handle {
         mut buf: Either<B, G>,
     ) -> Result<(usize, Option<G>)>
     where
-        F: for<'ring, 'tmp> FnOnce(&'tmp mut SysSqeRef<'ring>, SysFd, Either<B, &mut G>) -> Result<()> + Unpin,
-        G: crate::memory::Guardable<DefaultSubmissionGuard, [u8]> + Unpin,
-        B: Unpin,
+        F: FnOnce(SysFd, Either<B, &mut G>) -> Result<H>,
+        G: crate::memory::Guardable<DefaultSubmissionGuard, [u8]>,
+        H: Unpin + for<'ring, 'tmp> FnOnce(&'tmp mut SysSqeRef<'ring>),
     {
+        let h = match buf {
+            Left(b) => f(fd, Left(b))?,
+            Right(ref mut g) => f(fd, Right(g))?,
+        };
+
         let prepare_fn = |sqe: &mut SysSqeRef| {
             #[cfg(target_os = "redox")]
             {
-
                 let fd: u64 = fd.try_into().or(Err(Error::new(EOVERFLOW)))?;
 
                 let sqe = sqe.base(
@@ -1497,7 +1501,7 @@ impl Handle {
                     context.priority(),
                     (-1i64) as u64,
                 );
-                f(sqe, fd, buf.right_as_mut())?;
+                h(sqe);
             }
 
             #[cfg(target_os = "linux")]
@@ -1506,13 +1510,7 @@ impl Handle {
 
                 sqe.overwrite_flags(context.sync.linux_sqe_flags());
 
-                let result = match buf {
-                    Left(b) => f(sqe, fd, Left(b)),
-                    Right(ref mut g) => f(sqe, fd, Right(g)),
-                };
-
-                result
-                    .expect("TODO: Support errors in preparation fns, or move the fallible logic outside");
+                h(sqe);
             }
         };
 
@@ -1779,7 +1777,7 @@ impl Handle {
         fd: SysFd,
         flush: bool,
     ) -> Result<()> {
-        let prepare_fn = |mut sqe: &mut SysSqeRef| {
+        let prepare_fn = |sqe: &mut SysSqeRef| {
             #[cfg(target_os = "redox")]
             {
                 sqe.base(ctx.sync().sqe_flags(), ctx.priority(), (-1i64) as u64)
@@ -1977,20 +1975,24 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |mut sqe, fd, buf| {
+                |fd, buf| {
                     let buf_unchecked = buf.left().unwrap();
 
                     #[cfg(target_os = "redox")]
-                    sqe.sys_pread(
-                        fd,
-                        buf_unchecked
-                            .as_generic_slice_mut(ring.is_primary())
-                            .ok_or(Error::new(EFAULT))?,
-                        offset,
-                    );
-                    #[cfg(target_os = "linux")]
-                    sqe.prep_read(fd, buf_unchecked, offset);
-                    Ok(())
+                    let buf_unchecked =buf_unchecked
+                        .as_generic_slice_mut(ring.is_primary())
+                        .ok_or(Error::new(EFAULT))?;
+
+                    Ok(move |sqe: &mut SysSqeRef| {
+                        #[cfg(target_os = "redox")]
+                        sqe.sys_pread(
+                            fd,
+                            offset,
+                            buf_unchecked,
+                        );
+                        #[cfg(target_os = "linux")]
+                        sqe.prep_read(fd, buf_unchecked, offset);
+                    })
                 },
                 Either::<_, GuardedPlaceholder>::Left(buf),
             )
@@ -2020,24 +2022,26 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |mut sqe, fd, buf| {
+                |fd, buf| {
                     let buf_checked = buf.right().unwrap();
                     let data_mut = buf_checked
                         .try_get_data_mut()
                         .ok_or(Error::new(EADDRINUSE))?;
 
                     #[cfg(target_os = "redox")]
-                    sqe.sys_pread(
-                        fd,
-                        data_mut
-                            .as_generic_slice_mut(ring.is_primary())
-                            .ok_or(Error::new(EFAULT))?,
-                        offset,
-                    );
-                    #[cfg(target_os = "linux")]
-                    sqe.prep_read(fd, data_mut, offset);
+                    let data_mut = data_mut
+                        .as_generic_slice_mut(ring.is_primary())
+                        .ok_or(Error::new(EFAULT))?;
 
-                    Ok(())
+                    Ok(move |sqe: &mut SysSqeRef| {
+                        #[cfg(target_os = "redox")]
+                        sqe.sys_pread(
+                            fd,
+                            offset,
+                        );
+                        #[cfg(target_os = "linux")]
+                        sqe.prep_read(fd, data_mut, offset);
+                    })
                 },
                 Either::<(), _>::Right(buf),
             )
@@ -2070,28 +2074,27 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |mut sqe: &mut SysSqeRef, fd, bufs| {
+                |fd, bufs| {
                     let bufs_unchecked = bufs.left().unwrap();
 
-                    #[cfg(target_os = "redox")]
-                    {
-                        sqe.sys_preadv(fd, bufs_unchecked, offset);
-                    }
+                    Ok(move |sqe: &mut SysSqeRef| {
+                        #[cfg(target_os = "redox")]
+                        {
+                            sqe.sys_preadv(fd, bufs_unchecked, offset);
+                        }
 
-                    #[cfg(target_os = "linux")]
-                    {
-                        let mut bufs_unchecked = bufs_unchecked;
-                        // TODO
-                        let bufs_unchecked = unsafe {
-                            core::slice::from_raw_parts_mut(
-                                bufs_unchecked.as_mut_ptr() as *mut std::io::IoSliceMut,
-                                bufs_unchecked.len(),
-                            )
-                        };
-                        sqe.prep_read_vectored(fd, bufs_unchecked, offset);
-                    }
-
-                    Ok(())
+                        #[cfg(target_os = "linux")]
+                        {
+                            // TODO
+                            let bufs_unchecked = unsafe {
+                                core::slice::from_raw_parts_mut(
+                                    bufs_unchecked.as_mut_ptr() as *mut std::io::IoSliceMut,
+                                    bufs_unchecked.len(),
+                                )
+                            };
+                            sqe.prep_read_vectored(fd, bufs_unchecked, offset);
+                        }
+                    })
                 },
                 Either::<_, GuardedPlaceholder>::Left(bufs),
             )
@@ -2247,22 +2250,25 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |mut sqe: &mut SysSqeRef, fd, buf| {
+                |fd, buf| {
                     let buf_unchecked = buf.left().unwrap();
 
                     #[cfg(target_os = "redox")]
-                    sqe.pwrite(
-                        fd,
-                        buf_unchecked
-                            .as_generic_slice(ring.is_primary())
-                            .ok_or(Error::new(EFAULT))?,
-                        offset,
-                    );
+                    let buf_unchecked = buf_unchecked
+                        .as_generic_slice(ring.is_primary())
+                        .ok_or(Error::new(EFAULT))?;
 
-                    #[cfg(target_os = "linux")]
-                    sqe.prep_write(fd, buf_unchecked, offset);
+                    Ok(move |sqe: &mut SysSqeRef| {
+                        #[cfg(target_os = "redox")]
+                        sqe.pwrite(
+                            fd,
+                            buf_unchecked,
+                            offset,
+                        );
 
-                    Ok(())
+                        #[cfg(target_os = "linux")]
+                        sqe.prep_write(fd, buf_unchecked, offset);
+                    })
                 },
                 Either::<_, GuardedPlaceholder>::Left(buf),
             )
@@ -2297,25 +2303,29 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |mut sqe: &mut SysSqeRef, fd, buf| {
+                |fd, buf| {
                     let buf_checked = buf.right().unwrap();
 
                     #[cfg(target_os = "redox")]
-                    {
-                        sqe.sys_pwrite(
-                            fd,
-                            buf_checked
-                                .data_shared()
-                                .as_generic_slice(ring.is_primary())
-                                .ok_or(Error::new(EFAULT))?,
-                            offset,
-                        )
-                    }
-                    #[cfg(target_os = "linux")]
-                    {
-                        sqe.prep_write(fd, buf_checked.data_shared(), offset)
-                    }
-                    Ok(())
+                    let buf_checked = buf_checked
+                        .data_shared()
+                        .as_generic_slice(ring.is_primary())
+                        .ok_or(Error::new(EFAULT))?;
+
+                    Ok(move |sqe: &mut SysSqeRef| {
+                        #[cfg(target_os = "redox")]
+                        {
+                            sqe.sys_pwrite(
+                                fd,
+                                offset,
+                                buf_checked,
+                            )
+                        }
+                        #[cfg(target_os = "linux")]
+                        {
+                            sqe.prep_write(fd, buf_checked.data_shared(), offset)
+                        }
+                    })
                 },
                 Either::<(), G>::Right(buf),
             )
@@ -2345,29 +2355,29 @@ impl Handle {
                 ring,
                 ctx,
                 fd,
-                |mut sqe: &mut SysSqeRef, fd, bufs| {
+                |fd, bufs| {
                     let bufs_unchecked = bufs.left().unwrap();
 
-                    #[cfg(target_os = "redox")]
-                    {
-                        sqe.sys_pwritev(fd, bufs_unchecked, offset);
-                    }
-                    #[cfg(target_os = "linux")]
-                    {
-                        // TODO: Use the `ioslice` crate for safe casts. Otherwise, it will suffice
-                        // to simply cast the slice unsafely, by reinterpreting its type. They must
-                        // be valid since this is unsafe.
-                        let bufs_unchecked = unsafe {
-                            core::slice::from_raw_parts(
-                                bufs_unchecked.as_ptr() as *const std::io::IoSlice,
-                                bufs_unchecked.len(),
-                            )
-                        };
+                    Ok(move |sqe: &mut SysSqeRef| {
+                        #[cfg(target_os = "redox")]
+                        {
+                            sqe.sys_pwritev(fd, bufs_unchecked, offset);
+                        }
+                        #[cfg(target_os = "linux")]
+                        {
+                            // TODO: Use the `ioslice` crate for safe casts. Otherwise, it will suffice
+                            // to simply cast the slice unsafely, by reinterpreting its type. They must
+                            // be valid since this is unsafe.
+                            let bufs_unchecked = unsafe {
+                                core::slice::from_raw_parts(
+                                    bufs_unchecked.as_ptr() as *const std::io::IoSlice,
+                                    bufs_unchecked.len(),
+                                )
+                            };
 
-                        sqe.prep_write_vectored(fd as SysFd, bufs_unchecked, offset);
-                    }
-
-                    Ok(())
+                            sqe.prep_write_vectored(fd as SysFd, bufs_unchecked, offset);
+                        }
+                    })
                 },
                 Either::<_, GuardedPlaceholder>::Left(bufs),
             )
