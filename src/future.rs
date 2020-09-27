@@ -21,7 +21,7 @@ use crate::redox::instance::ConsumerInstance;
 #[cfg(target_os = "linux")]
 use crate::linux::ConsumerInstance;
 
-use crate::reactor::{Reactor, RingId, SysFd, SysSqeRef, SysCqe};
+use crate::reactor::{Reactor, RingId, SysCqe, SysFd, SysSqeRef};
 
 pub(crate) type Tag = u64;
 pub(crate) type AtomicTag = AtomicU64;
@@ -91,7 +91,7 @@ impl<F> fmt::Debug for CommandFuture<F> {
 fn try_submit(
     instance: &ConsumerInstance,
     state: &mut State,
-    prepare: impl FnOnce(SysSqeRef),
+    prepare: impl FnOnce(&mut SysSqeRef),
     user_data: Either<Weak<Mutex<State>>, Tag>,
     is_stream: bool,
     cx: &mut task::Context<'_>,
@@ -113,26 +113,41 @@ fn try_submit(
         }
     };
 
-    let sqe = match user_data {
+    prepare(&mut sqe);
+
+    let mut sqe = match user_data {
         Left(state_weak) => match (Weak::into_raw(state_weak) as usize).try_into() {
             Ok(ptr64) => {
                 #[cfg(target_os = "redox")]
-                { sqe.user_data = ptr64; }
+                {
+                    sqe.user_data = ptr64;
+                }
 
                 #[cfg(target_os = "linux")]
-                unsafe { sqe.set_user_data(ptr64) }
+                unsafe {
+                    sqe.set_user_data(ptr64)
+                }
+
+                sqe
             }
             Err(_) => return task::Poll::Ready(Error::new(EFAULT)),
         },
         Right(tag) => {
             #[cfg(target_os = "redox")]
-            { sqe.user_data = tag; }
+            {
+                sqe.user_data = tag;
+            }
 
             #[cfg(target_os = "linux")]
-            unsafe { sqe.set_user_data(tag) }
+            unsafe {
+                sqe.set_user_data(tag)
+            }
+
+            sqe
         }
     };
-    log::debug!("Sending SQE {:?}", sqe);
+
+    //log::debug!("Sending SQE {:?}", sqe);
 
     #[cfg(target_os = "redox")]
     match instance
@@ -164,8 +179,9 @@ fn try_submit(
     {
         if is_stream {
             todo!();
-            //state.inner = StateInner::ReceivingMulti(VecDeque::new(), cx.waker().clone());
+        //state.inner = StateInner::ReceivingMulti(VecDeque::new(), cx.waker().clone());
         } else {
+            log::debug!("Successfully sent command, awaiting CQE.");
             state.inner = StateInner::Completing(cx.waker().clone());
         }
         task::Poll::Pending
@@ -176,7 +192,7 @@ impl CommandFutureInner {
     fn poll(
         &mut self,
         is_stream: bool,
-        prepare_fn: Option<impl FnOnce(SysSqeRef)>,
+        prepare_fn: Option<impl FnOnce(&mut SysSqeRef)>,
         cx: &mut task::Context,
     ) -> task::Poll<Option<Result<SysCqe>>> {
         log::debug!("Polling future");
@@ -196,9 +212,7 @@ impl CommandFutureInner {
 
                 (state_lock, false, Some(tag))
             }
-            CommandFutureRepr::Direct(ref state) => {
-                (state, true, None)
-            }
+            CommandFutureRepr::Direct(ref state) => (state, true, None),
         };
 
         let mut state_guard = state_lock.lock();
@@ -211,8 +225,7 @@ impl CommandFutureInner {
             &mut StateInner::Initial | &mut StateInner::Submitting(_) => try_submit(
                 instance,
                 &mut *state_guard,
-                prepare_fn
-                    .expect("expected preparation function when the state was in initial"),
+                prepare_fn.expect("expected preparation function when the state was in initial"),
                 if is_direct {
                     Left(Arc::downgrade(&state_lock))
                 } else {
@@ -220,7 +233,9 @@ impl CommandFutureInner {
                 },
                 is_stream,
                 cx,
-            ).map(Err).map(Some),
+            )
+            .map(Err)
+            .map(Some),
             &mut StateInner::Completing(_) => task::Poll::Pending,
 
             #[cfg(target_os = "redox")]
@@ -293,7 +308,7 @@ impl<F> Drop for CommandFuture<F> {
 
 impl<F> Future for CommandFuture<F>
 where
-    F: for<'ring> FnOnce(SysSqeRef<'ring>) + Unpin,
+    F: for<'ring, 'tmp> FnOnce(&'tmp mut SysSqeRef<'ring>) + Unpin,
 {
     type Output = Result<SysCqe>;
 
@@ -334,11 +349,13 @@ impl Stream for FdEvents {
     ) -> task::Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        let prepare_fn = this.initial.take().map(|initial| |sqe| {
-            #[cfg(target_os = "redox")]
-            {
-                // TODO: Validate cast.
-                sqe.sys_register_events(initial.fd as u64, initial.event_flags, initial.oneshot)
+        let prepare_fn = this.initial.take().map(|initial| {
+            |sqe| {
+                #[cfg(target_os = "redox")]
+                {
+                    // TODO: Validate cast.
+                    sqe.sys_register_events(initial.fd as u64, initial.event_flags, initial.oneshot)
+                }
             }
         });
         this.inner.poll(true, prepare_fn, cx)

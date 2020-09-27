@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use guard_trait::Guarded;
 
-use redox_iou::reactor::{ReactorBuilder, Handle, OpenInfo, SubmissionContext};
 use redox_iou::executor::Executor;
+use redox_iou::reactor::{Handle, OpenInfo, ReactorBuilder, SubmissionContext};
 
 #[cfg(target_os = "linux")]
 use redox_iou::linux::ConsumerInstance;
@@ -14,6 +14,8 @@ use redox_iou::linux::ConsumerInstance;
 #[cfg(target_os = "linux")]
 #[test]
 fn basic_file_io() -> Result<(), Box<dyn Error + 'static>> {
+    env_logger::init();
+
     let io_uring = iou::IoUring::new(16)?;
     let instance = ConsumerInstance::from_iou(io_uring);
 
@@ -28,7 +30,15 @@ fn basic_file_io() -> Result<(), Box<dyn Error + 'static>> {
 
     executor.run(async move {
         // TODO: IntoGuardable trait?
-        let root_dir = handle.open_at(ring, SubmissionContext::default(), Guarded::wrap_static_slice(&b"assets/test.txt\0"[..]), OpenInfo::new(), libc::AT_FDCWD).await?;
+        let root_dir = handle
+            .open_at(
+                ring,
+                SubmissionContext::default(),
+                Guarded::wrap_static_slice(&b"assets/test.txt\0"[..]),
+                OpenInfo::new(),
+                libc::AT_FDCWD,
+            )
+            .await?;
 
         Ok(())
     })

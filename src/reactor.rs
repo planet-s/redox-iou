@@ -37,12 +37,12 @@ use parking_lot::{
     RwLockWriteGuard,
 };
 
-use crate::future::{
-    AtomicTag, CommandFuture, CommandFutureInner, CommandFutureRepr, FdEvents, FdEventsInitial, State, StateInner,
-    Tag,
-};
 #[cfg(any(doc, target_os = "redox"))]
 use crate::future::ProducerSqes;
+use crate::future::{
+    AtomicTag, CommandFuture, CommandFutureInner, CommandFutureRepr, FdEvents, FdEventsInitial,
+    State, StateInner, Tag,
+};
 
 #[cfg(target_os = "redox")]
 use crate::future::ProducerSqesState;
@@ -50,7 +50,7 @@ use crate::future::ProducerSqesState;
 use crate::executor::Runqueue;
 
 #[cfg(any(target_os = "redox"))]
-use crate::redox::instance::{ConsumerInstance, ConsumerGenericSender};
+use crate::redox::instance::{ConsumerGenericSender, ConsumerInstance};
 
 #[cfg(any(doc, target_os = "redox"))]
 use crate::redox::instance::ProducerInstance;
@@ -283,7 +283,10 @@ impl RingId {
     #[inline]
     pub fn try_into_primary(&self) -> Option<PrimaryRingId> {
         if self.is_primary() {
-            Some(PrimaryRingId { reactor: self.reactor, inner: self.inner })
+            Some(PrimaryRingId {
+                reactor: self.reactor,
+                inner: self.inner,
+            })
         } else {
             None
         }
@@ -294,7 +297,10 @@ impl RingId {
     #[doc(cfg(target_os = "redox"))]
     pub fn try_into_secondary(&self) -> Option<SecondaryRingId> {
         if self.is_secondary() {
-            Some(SecondaryRingId { reactor: self.reactor, inner: self.inner })
+            Some(SecondaryRingId {
+                reactor: self.reactor,
+                inner: self.inner,
+            })
         } else {
             None
         }
@@ -305,7 +311,10 @@ impl RingId {
     #[doc(cfg(target_os = "redox"))]
     pub fn try_into_producer(&self) -> Option<ProducerRingId> {
         if self.is_producer() {
-            Some(ProducerRingId { reactor: self.reactor, inner: self.inner })
+            Some(ProducerRingId {
+                reactor: self.reactor,
+                inner: self.inner,
+            })
         } else {
             None
         }
@@ -401,11 +410,20 @@ impl From<RingId> for RingIdKind {
     #[inline]
     fn from(id: RingId) -> Self {
         match id.ty {
-            RingTy::Primary => RingIdKind::Primary(PrimaryRingId { reactor: id.reactor, inner: id.inner }),
+            RingTy::Primary => RingIdKind::Primary(PrimaryRingId {
+                reactor: id.reactor,
+                inner: id.inner,
+            }),
             #[cfg(target_os = "redox")]
-            RingTy::Secondary => RingIdKind::Secondary(SecondaryRingId { reactor: id.reactor, inner: id.inner }),
+            RingTy::Secondary => RingIdKind::Secondary(SecondaryRingId {
+                reactor: id.reactor,
+                inner: id.inner,
+            }),
             #[cfg(target_os = "redox")]
-            RingTy::Producer => RingIdKind::Producer(ProducerRingId { reactor: id.reactor, inner: id.inner }),
+            RingTy::Producer => RingIdKind::Producer(ProducerRingId {
+                reactor: id.reactor,
+                inner: id.inner,
+            }),
         }
     }
 }
@@ -477,7 +495,11 @@ impl ReactorBuilder {
         self.with_primary_instance_generic(primary_instance, true)
     }
     #[allow(unused_variables)]
-    unsafe fn with_primary_instance_generic(mut self, primary_instance: ConsumerInstance, trusted: bool) -> Self {
+    unsafe fn with_primary_instance_generic(
+        mut self,
+        primary_instance: ConsumerInstance,
+        trusted: bool,
+    ) -> Self {
         self.primary_instances.push(ConsumerInstanceWrapper {
             consumer_instance: primary_instance,
             #[cfg(target_os = "redox")]
@@ -675,7 +697,10 @@ impl Reactor {
                 .upgrade()
                 .expect("failed to wake up executor: integrated reactor dead");
 
-            let instance = reactor.main_instances.get(index).expect("index passed to driving_waker shouldn't be invalid");
+            let instance = reactor
+                .main_instances
+                .get(index)
+                .expect("index passed to driving_waker shouldn't be invalid");
 
             if instance.dropped.load(Ordering::Acquire) {
                 return;
@@ -745,9 +770,7 @@ impl Reactor {
         #[cfg(target_os = "redox")]
         {
             let num_completed = if wait {
-                let sq_free_entry_count = instance
-                    .consumer_instance
-                    .sq_free_entry_count()?;
+                let sq_free_entry_count = instance.consumer_instance.sq_free_entry_count()?;
 
                 let flags = if free_entry_count > 0 {
                     IoUringEnterFlags::empty()
@@ -756,11 +779,7 @@ impl Reactor {
                     IoUringEnterFlags::WAKEUP_ON_SQ_AVAIL
                 };
                 log::debug!("Entering io_uring");
-                Some(
-                    instance
-                        .consumer_instance
-                        .enter(0, 0, flags)?
-                )
+                Some(instance.consumer_instance.enter(0, 0, flags)?)
             } else {
                 None
             };
@@ -768,7 +787,14 @@ impl Reactor {
 
             let mut receiver_intent_guard = instance.consumer_instance.receiver().upgradable_read();
 
-            for cqe_result in instance.consumer_instance.sender.write().as_64_mut().unwrap().try_iter() {
+            for cqe_result in instance
+                .consumer_instance
+                .sender
+                .write()
+                .as_64_mut()
+                .unwrap()
+                .try_iter()
+            {
                 #[cfg(target_os = "redox")]
                 if a.unwrap_or(0) > available_completions {
                     log::warn!("The kernel/other process gave us a higher number of available completions than present on the ring.");
@@ -789,14 +815,19 @@ impl Reactor {
             let mut guard = instance.consumer_instance.lock();
             let trusted = true;
 
-            for cqe_result in guard.cqes_blocking(1) {
-                match cqe_result {
-                    Ok(cqe) => self.drive_handle_cqe(primary, trusted, cqe, waker),
-                    Err(error) => {
-                        log::error!("Failed to pop CQE from CQ: {}", error);
-                        todo!("convert error");
-                    }
+            let min_complete = if wait { 1 } else { 0 };
+            // TODO: Map error correctly, with Linux error codes.
+            match guard.submit_sqes_and_wait(min_complete) {
+                Ok(_) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return Ok(()),
+                Err(error) => {
+                    log::error!("Failed to pop CQE from CQ: {}", error);
+                    todo!("convert error: {}", error);
                 }
+            }
+
+            for cqe in guard.cqes() {
+                self.drive_handle_cqe(primary, trusted, cqe, waker);
             }
             Ok(())
         }
@@ -804,7 +835,11 @@ impl Reactor {
     fn drive_handle_cqe(&self, primary: bool, trusted: bool, cqe: SysCqe, waker: &task::Waker) {
         log::debug!("Received CQE: {:?}", cqe);
         #[cfg(target_os = "redox")]
-        if IoUringCqeFlags::from_bits_truncate((cqe.flags & 0xFF) as u8).contains(IoUringCqeFlags::EVENT) && EventFlags::from_bits_truncate((cqe.flags >> 8) as usize).contains(EventFlags::EVENT_IO_URING) {
+        if IoUringCqeFlags::from_bits_truncate((cqe.flags & 0xFF) as u8)
+            .contains(IoUringCqeFlags::EVENT)
+            && EventFlags::from_bits_truncate((cqe.flags >> 8) as usize)
+                .contains(EventFlags::EVENT_IO_URING)
+        {
             // if this was an event, that was tagged io_uring, we can assume that the
             // event came from the kernel having polled some secondary io_urings. We'll
             // then drive those instances and wakeup futures.
@@ -834,12 +869,17 @@ impl Reactor {
                     return;
                 }
             };
-            match secondary_instances_guard.instances
+            match secondary_instances_guard
+                .instances
                 .get(secondary_instance_index)
                 .expect("fd backref BTreeMap corrupt, contains a file descriptor that was removed")
             {
-                SecondaryInstanceWrapper::ConsumerInstance(ref instance) => self.drive(instance, waker, false, false)?,
-                SecondaryInstanceWrapper::ProducerInstance(ref instance) => self.drive_producer_instance(&instance)?,
+                SecondaryInstanceWrapper::ConsumerInstance(ref instance) => {
+                    self.drive(instance, waker, false, false)?
+                }
+                SecondaryInstanceWrapper::ProducerInstance(ref instance) => {
+                    self.drive_producer_instance(&instance)?
+                }
             }
             return;
         }
@@ -1127,7 +1167,7 @@ impl Handle {
     /// is UB.
     pub unsafe fn send<F>(&self, ring: impl Into<RingId>, prepare_sqe: F) -> CommandFuture<F>
     where
-        F: for<'ring> FnOnce(SysSqeRef<'ring>),
+        F: for<'ring, 'tmp> FnOnce(&'tmp mut SysSqeRef<'ring>),
     {
         self.send_inner(ring, SendArg::Single(prepare_sqe))
             .left()
@@ -1216,19 +1256,21 @@ impl Handle {
             ring,
             reactor: Weak::clone(&self.reactor),
             repr: if trusted {
-                CommandFutureRepr::Direct(
-                    state_opt.unwrap(),
-                )
+                CommandFutureRepr::Direct(state_opt.unwrap())
             } else {
-                CommandFutureRepr::Tagged(
-                    tag_num_opt.unwrap(),
-                )
+                CommandFutureRepr::Tagged(tag_num_opt.unwrap())
             },
         };
 
         match send_arg {
-            SendArg::Stream(initial) => Right(FdEvents { inner, initial: Some(initial) }),
-            SendArg::Single(prepare_sqe) => Left(CommandFuture { inner, prepare_fn: Some(prepare_sqe) }),
+            SendArg::Stream(initial) => Right(FdEvents {
+                inner,
+                initial: Some(initial),
+            }),
+            SendArg::Single(prepare_sqe) => Left(CommandFuture {
+                inner,
+                prepare_fn: Some(prepare_sqe),
+            }),
         }
     }
     /// Send a Completion Queue Entry to the consumer, waking it up when the reactor enters the
@@ -1427,7 +1469,7 @@ impl Handle {
     {
         let fd: u64 = fd.try_into().or(Err(Error::new(EOVERFLOW)))?;
 
-        let prepare_fn = |sqe: SysSqeRef| {
+        let prepare_fn = |sqe: &mut SysSqeRef| {
             #[cfg(target_os = "redox")]
             {
                 let sqe = sqe.base(
@@ -1482,7 +1524,7 @@ impl Handle {
                     .as_static()
             }
         };
-        let prepare_fn = |mut sqe: SysSqeRef| {
+        let prepare_fn = |mut sqe: &mut SysSqeRef| {
             #[cfg(target_os = "redox")]
             {
                 let sqe = sqe.base(ctx.sync().sqe_flags(), ctx.priority(), (-1i64) as u64);
@@ -1498,7 +1540,10 @@ impl Handle {
             {
                 let (flags, mode) = info.inner;
 
-                let slice = std::slice::from_raw_parts(reference.offset() as usize as *const u8, reference.len() as usize);
+                let slice = std::slice::from_raw_parts(
+                    reference.offset() as usize as *const u8,
+                    reference.len() as usize,
+                );
 
                 #[cfg(debug_assertions)]
                 nul_check(slice);
@@ -1633,7 +1678,13 @@ impl Handle {
         }
 
         let (fd, guard_opt) = unsafe {
-            self.open_raw_unchecked_inner(ring, ctx, Either::<&[u8; 0], G>::Right(path), info, Some(at))
+            self.open_raw_unchecked_inner(
+                ring,
+                ctx,
+                Either::<&[u8; 0], G>::Right(path),
+                info,
+                Some(at),
+            )
         }
         .await?;
         let guard = guard_opt.expect(
@@ -1694,7 +1745,7 @@ impl Handle {
         fd: SysFd,
         flush: bool,
     ) -> Result<()> {
-        let prepare_fn = |mut sqe: SysSqeRef| {
+        let prepare_fn = |mut sqe: &mut SysSqeRef| {
             #[cfg(target_os = "redox")]
             {
                 sqe.base(ctx.sync().sqe_flags(), ctx.priority(), (-1i64) as u64)
@@ -1904,11 +1955,7 @@ impl Handle {
                         offset,
                     );
                     #[cfg(target_os = "linux")]
-                    sqe.prep_read(
-                        fd,
-                        buf_unchecked,
-                        offset,
-                    );
+                    sqe.prep_read(fd, buf_unchecked, offset);
                     Ok(())
                 },
                 Either::<_, GuardedPlaceholder>::Left(buf),
@@ -1941,7 +1988,8 @@ impl Handle {
                 fd,
                 |mut sqe, fd, buf| {
                     let buf_checked = buf.right().unwrap();
-                    let data_mut = buf_checked.try_get_data_mut()
+                    let data_mut = buf_checked
+                        .try_get_data_mut()
                         .ok_or(Error::new(EADDRINUSE))?;
 
                     #[cfg(target_os = "redox")]
@@ -1953,11 +2001,7 @@ impl Handle {
                         offset,
                     );
                     #[cfg(target_os = "linux")]
-                    sqe.prep_read(
-                        fd,
-                        data_mut,
-                        offset,
-                    );
+                    sqe.prep_read(fd, data_mut, offset);
 
                     Ok(())
                 },
@@ -2004,7 +2048,12 @@ impl Handle {
                     {
                         let mut bufs_unchecked = bufs_unchecked;
                         // TODO
-                        let bufs_unchecked = unsafe { core::slice::from_raw_parts_mut(bufs_unchecked.as_mut_ptr() as *mut std::io::IoSliceMut, bufs_unchecked.len()) };
+                        let bufs_unchecked = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                bufs_unchecked.as_mut_ptr() as *mut std::io::IoSliceMut,
+                                bufs_unchecked.len(),
+                            )
+                        };
                         sqe.prep_read_vectored(fd, bufs_unchecked, offset);
                     }
 
@@ -2177,11 +2226,7 @@ impl Handle {
                     );
 
                     #[cfg(target_os = "linux")]
-                    sqe.prep_write(
-                        fd,
-                        buf_unchecked,
-                        offset
-                    );
+                    sqe.prep_write(fd, buf_unchecked, offset);
 
                     Ok(())
                 },
@@ -2234,11 +2279,7 @@ impl Handle {
                     }
                     #[cfg(target_os = "linux")]
                     {
-                        sqe.prep_write(
-                            fd,
-                            buf_checked.data_shared(),
-                            offset,
-                        )
+                        sqe.prep_write(fd, buf_checked.data_shared(), offset)
                     }
                     Ok(())
                 },
@@ -2282,7 +2323,12 @@ impl Handle {
                         // TODO: Use the `ioslice` crate for safe casts. Otherwise, it will suffice
                         // to simply cast the slice unsafely, by reinterpreting its type. They must
                         // be valid since this is unsafe.
-                        let bufs_unchecked = unsafe { core::slice::from_raw_parts(bufs_unchecked.as_ptr() as *const std::io::IoSlice, bufs_unchecked.len()) };
+                        let bufs_unchecked = unsafe {
+                            core::slice::from_raw_parts(
+                                bufs_unchecked.as_ptr() as *const std::io::IoSlice,
+                                bufs_unchecked.len(),
+                            )
+                        };
 
                         sqe.prep_write_vectored(fd as SysFd, bufs_unchecked, offset);
                     }
@@ -2742,7 +2788,11 @@ where
 
 #[cfg(target_os = "linux")]
 fn nul_check(slice: &[u8]) {
-    assert_eq!(slice.last(), Some(&0), "path passed to open_raw_unchecked_inner was not NUL-terminated");
+    assert_eq!(
+        slice.last(),
+        Some(&0),
+        "path passed to open_raw_unchecked_inner was not NUL-terminated"
+    );
 }
 
 /// Extra information passed to the `open_at` system calls, with parameters such as file descriptor

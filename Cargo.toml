@@ -33,4 +33,5 @@ iou = { git = "https://github.com/4lDO2/iou", branch = "cqe-debug" }
 uring-sys = "0.7.4"
 
 [dev-dependencies]
+env_logger = "0.7"
 futures = "0.3"
