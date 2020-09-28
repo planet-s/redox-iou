@@ -17,6 +17,9 @@ use std::sync::atomic::{self, AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::{ops, task};
 
+#[cfg(target_os = "linux")]
+use std::ptr::NonNull;
+
 use syscall::data::IoVec;
 use syscall::error::{Error, Result};
 use syscall::error::{
@@ -1088,7 +1091,7 @@ impl SubmissionSync {
         match self {
             Self::NoSync => iou::sqe::SubmissionFlags::empty(),
             Self::Drain => iou::sqe::SubmissionFlags::IO_DRAIN,
-            Self::Chain => iou::sqe::SubmissionContext::IO_LINK,
+            Self::Chain => iou::sqe::SubmissionFlags::IO_LINK,
         }
     }
 }
@@ -1479,16 +1482,21 @@ impl Handle {
         context: SubmissionContext,
         fd: SysFd,
         f: F,
-        mut buf: Either<B, G>,
+        buf: Either<B, G>,
     ) -> Result<(usize, Option<G>)>
     where
         F: FnOnce(SysFd, Either<B, &mut G>) -> Result<H>,
         G: crate::memory::Guardable<DefaultSubmissionGuard, [u8]>,
         H: Unpin + for<'ring, 'tmp> FnOnce(&'tmp mut SysSqeRef<'ring>),
     {
+        let mut guardable = None;
+
         let h = match buf {
             Left(b) => f(fd, Left(b))?,
-            Right(ref mut g) => f(fd, Right(g))?,
+            Right(g) => {
+                guardable = Some(g);
+                f(fd, Right(guardable.as_mut().unwrap()))?
+            }
         };
 
         let prepare_fn = |sqe: &mut SysSqeRef| {
@@ -1516,14 +1524,14 @@ impl Handle {
 
         let fut = self.send(ring, prepare_fn);
 
-        if let Right(guardable) = buf.as_mut() {
+        if let Some(guardable) = guardable.as_mut() {
             fut.guard(guardable);
         }
 
         let cqe = fut.await?;
         let result = Self::completion_as_rw_io_result(cqe)?;
 
-        Ok((result, buf.right()))
+        Ok((result, guardable))
     }
     async unsafe fn open_raw_unchecked_inner<B, G>(
         &self,
@@ -2024,14 +2032,22 @@ impl Handle {
                 fd,
                 |fd, buf| {
                     let buf_checked = buf.right().unwrap();
+
                     let data_mut = buf_checked
                         .try_get_data_mut()
                         .ok_or(Error::new(EADDRINUSE))?;
 
+                    #[cfg(target_os = "linux")]
+                    // SAFETY: This is safe as we already own the guarded memory. We need to do
+                    // this unsafely because the guard is inserted directly after constructing the
+                    // future. (TODO: This is technically not needed, but should suffice for now.)
+                    let data_mut: &'static mut [u8] = &mut *NonNull::from(data_mut).as_ptr();
+
                     #[cfg(target_os = "redox")]
                     let data_mut = data_mut
                         .as_generic_slice_mut(ring.is_primary())
-                        .ok_or(Error::new(EFAULT))?;
+                        .ok_or(Error::new(EFAULT))?
+                        .as_static();
 
                     Ok(move |sqe: &mut SysSqeRef| {
                         #[cfg(target_os = "redox")]
@@ -2307,10 +2323,22 @@ impl Handle {
                     let buf_checked = buf.right().unwrap();
 
                     #[cfg(target_os = "redox")]
+                    // SAFETY: Same as on Linux; we are temporarily and locally upgrading a
+                    // lifetime-tracked generic slice, into a static slice.
                     let buf_checked = buf_checked
                         .data_shared()
                         .as_generic_slice(ring.is_primary())
-                        .ok_or(Error::new(EFAULT))?;
+                        .ok_or(Error::new(EFAULT))?
+                        .as_static();
+
+                    #[cfg(target_os = "linux")]
+                    // SAFETY: This is completely safe, since we are taking an __owned__ buffer
+                    // that we are borrowing (and the pointer will only be used by us until the
+                    // submission, where the prepare fn is dropped, and by the kernel until
+                    // completion). Remember, the guard trait forces our buffer to remain stable in
+                    // memory, and never being dropped, which allows us to temporarily and locally
+                    // upgrade the reference to `'static`.
+                    let data_shared: &'static [u8] = &*NonNull::from(buf_checked.data_shared()).as_ptr();
 
                     Ok(move |sqe: &mut SysSqeRef| {
                         #[cfg(target_os = "redox")]
@@ -2323,7 +2351,7 @@ impl Handle {
                         }
                         #[cfg(target_os = "linux")]
                         {
-                            sqe.prep_write(fd, buf_checked.data_shared(), offset)
+                            sqe.prep_write(fd, data_shared, offset)
                         }
                     })
                 },
