@@ -6,7 +6,7 @@ use std::sync::Arc;
 use guard_trait::Guarded;
 
 use redox_iou::executor::Executor;
-use redox_iou::reactor::{Handle, OpenInfo, ReactorBuilder, SubmissionContext, SubmissionSync};
+use redox_iou::reactor::{OpenInfo, ReactorBuilder, SubmissionContext, SubmissionSync};
 
 #[cfg(target_os = "linux")]
 use redox_iou::linux::ConsumerInstance;
@@ -40,10 +40,10 @@ fn basic_file_io() -> Result<(), Box<dyn Error + 'static>> {
             )
             .await?;
 
-        let mut buffer = vec! [0u8; 4096];
+        let buffer = vec! [0u8; 4096];
         let guarded_buffer = Guarded::new(buffer);
 
-        let (bytes_read, guarded_buffer) = handle.pread(
+        let (bytes_read, _guarded_buffer) = handle.pread(
             ring,
             SubmissionContext::new()
                 .with_sync(SubmissionSync::Drain),
@@ -51,6 +51,8 @@ fn basic_file_io() -> Result<(), Box<dyn Error + 'static>> {
             guarded_buffer,
             0,
         ).await?;
+
+        assert_eq!(bytes_read, 165);
 
         unsafe { handle.close(
             ring,
