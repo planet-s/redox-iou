@@ -1190,15 +1190,52 @@ impl Handle {
     where
         F: for<'ring, 'tmp> FnOnce(&'tmp mut SysSqeRef<'ring>),
     {
-        self.send_inner(ring, SendArg::Single(prepare_sqe))
+        type PlaceholderGuardable =
+            Guarded<DefaultSubmissionGuard, Vec<u8>, guard_trait::marker::Exclusive>;
+        type PlaceholderConstructorFn<F> = Box<dyn FnOnce(PlaceholderGuardable) -> F>;
+
+        self.send_inner(
+            ring,
+            SendArg::<F, PlaceholderGuardable, PlaceholderConstructorFn<F>>::Unguarded(prepare_sqe),
+        )
+        .left()
+        .expect("send_inner() must return CommandFuture if is_stream is set to false")
+    }
+
+    /// Get a which which represents submitting a command, and then waiting for it to complete.
+    /// Unlike [`send`], this will also protect a guardable, using the future as the guard.
+    ///
+    /// # Safety
+    ///
+    /// Refer to [`send`] for safety invariants.
+    ///
+    /// [`send`]: #method.send
+    pub unsafe fn send_and_protect<F, H, G, T>(
+        &self,
+        ring: impl Into<RingId>,
+        prep_fn_constructor: F,
+        guardable: G,
+    ) -> CommandFuture<H>
+    where
+        F: FnOnce(G) -> H,
+        H: for<'ring, 'tmp> FnOnce(&'tmp mut SysSqeRef<'ring>),
+        G: Guardable<DefaultSubmissionGuard, T>,
+        T: ?Sized,
+    {
+        self.send_inner(ring, SendArg::Guarded(guardable, prep_fn_constructor))
             .left()
             .expect("send_inner() must return CommandFuture if is_stream is set to false")
     }
-    unsafe fn send_inner<F>(
+    unsafe fn send_inner<F, G, C, T>(
         &self,
         ring: impl Into<RingId>,
-        send_arg: SendArg<F>,
-    ) -> Either<CommandFuture<F>, FdEvents> {
+        send_arg: SendArg<F, G, C>,
+    ) -> Either<CommandFuture<F>, FdEvents>
+    where
+        G: Guardable<DefaultSubmissionGuard, T>,
+        C: FnOnce(G) -> F,
+        T: ?Sized,
+    {
         let ring = ring.into();
 
         let reactor = self
@@ -1288,10 +1325,20 @@ impl Handle {
                 inner,
                 initial: Some(initial),
             }),
-            SendArg::Single(prepare_sqe) => Left(CommandFuture {
+            SendArg::Unguarded(prepare_sqe) => Left(CommandFuture {
                 inner,
                 prepare_fn: Some(prepare_sqe),
             }),
+            SendArg::Guarded(mut guardable, prep_fn_constructor) => {
+                let mut invalid_future = CommandFuture {
+                    inner,
+                    prepare_fn: None,
+                };
+                invalid_future.guard(&mut guardable);
+                invalid_future.prepare_fn = Some(prep_fn_constructor(guardable));
+
+                Left(invalid_future)
+            }
         }
     }
     /// Send a Completion Queue Entry to the consumer, waking it up when the reactor enters the
@@ -1987,17 +2034,13 @@ impl Handle {
                     let buf_unchecked = buf.left().unwrap();
 
                     #[cfg(target_os = "redox")]
-                    let buf_unchecked =buf_unchecked
+                    let buf_unchecked = buf_unchecked
                         .as_generic_slice_mut(ring.is_primary())
                         .ok_or(Error::new(EFAULT))?;
 
                     Ok(move |sqe: &mut SysSqeRef| {
                         #[cfg(target_os = "redox")]
-                        sqe.sys_pread(
-                            fd,
-                            offset,
-                            buf_unchecked,
-                        );
+                        sqe.sys_pread(fd, offset, buf_unchecked);
                         #[cfg(target_os = "linux")]
                         sqe.prep_read(fd, buf_unchecked, offset);
                     })
@@ -2051,10 +2094,7 @@ impl Handle {
 
                     Ok(move |sqe: &mut SysSqeRef| {
                         #[cfg(target_os = "redox")]
-                        sqe.sys_pread(
-                            fd,
-                            offset,
-                        );
+                        sqe.sys_pread(fd, offset);
                         #[cfg(target_os = "linux")]
                         sqe.prep_read(fd, data_mut, offset);
                     })
@@ -2276,11 +2316,7 @@ impl Handle {
 
                     Ok(move |sqe: &mut SysSqeRef| {
                         #[cfg(target_os = "redox")]
-                        sqe.pwrite(
-                            fd,
-                            buf_unchecked,
-                            offset,
-                        );
+                        sqe.pwrite(fd, buf_unchecked, offset);
 
                         #[cfg(target_os = "linux")]
                         sqe.prep_write(fd, buf_unchecked, offset);
@@ -2338,16 +2374,13 @@ impl Handle {
                     // completion). Remember, the guard trait forces our buffer to remain stable in
                     // memory, and never being dropped, which allows us to temporarily and locally
                     // upgrade the reference to `'static`.
-                    let data_shared: &'static [u8] = &*NonNull::from(buf_checked.data_shared()).as_ptr();
+                    let data_shared: &'static [u8] =
+                        &*NonNull::from(buf_checked.data_shared()).as_ptr();
 
                     Ok(move |sqe: &mut SysSqeRef| {
                         #[cfg(target_os = "redox")]
                         {
-                            sqe.sys_pwrite(
-                                fd,
-                                offset,
-                                buf_checked,
-                            )
+                            sqe.sys_pwrite(fd, offset, buf_checked)
                         }
                         #[cfg(target_os = "linux")]
                         {
@@ -2636,13 +2669,95 @@ impl Handle {
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
-        fd: usize,
+        fd: SysFd,
         flags: MapFlags,
         len: usize,
         offset: u64,
     ) -> Result<*const ()> {
         assert!(!flags.contains(MapFlags::MAP_FIXED));
         self.mmap2(ring, ctx, fd, flags, None, len, offset).await
+    }
+
+    /// Accept connections from a socket that has called _bind(2)_.
+    ///
+    /// # Safety
+    // TODO
+    #[cfg(any(doc, target_os = "linux"))]
+    #[doc(cfg(target_os = "linux"))]
+    // TODO: Some way to interface with the redox netstack.
+    pub async unsafe fn accept_unchecked(
+        &self,
+        ring: impl Into<RingId>,
+        ctx: SubmissionContext,
+        fd: SysFd,
+        sockaddr_storage: Option<&mut iou::sqe::SockAddrStorage>,
+        flags: iou::sqe::SockFlag,
+    ) -> Result<SysFd> {
+        let return_value = self
+            .send(ring, move |sqe: &mut SysSqeRef| {
+                sqe.set_flags(ctx.sync().linux_sqe_flags());
+                sqe.prep_accept(fd, sockaddr_storage, flags)
+            })
+            .await?;
+
+        // TODO: Proper error code handling.
+        Self::completion_as_rw_io_result(return_value).map(|retval| retval as SysFd)
+    }
+    /// Accept a connection from a socket, without being able to get the address where the incoming
+    /// connection originated from.
+    pub async fn accept_simple(
+        &self,
+        ring: impl Into<RingId>,
+        ctx: SubmissionContext,
+        fd: SysFd,
+        flags: iou::sqe::SockFlag,
+    ) -> Result<SysFd> {
+        // SAFETY: The only safety invariant in accept_unchecked comes from buffer usage, which we
+        // completely eliminate here.
+        unsafe { self.accept_unchecked(ring, ctx, fd, None, flags) }.await
+    }
+    // TODO: Wrap the `struct sockaddr` so that it can be known upon future completion, that the
+    // address can be read. We would probably take a maybe-uninit (the existing
+    // iou::sqe::SockAddrStorage), and return an initialized wrapper with a safe accessor function.
+    /// Accept a connection from a socket, with the address buffer being safely protected with a
+    /// guard.
+    #[cfg(any(doc, target_os = "linux"))]
+    #[doc(cfg(target_os = "linux"))]
+    pub async fn accept<G>(
+        &self,
+        ring: impl Into<RingId>,
+        ctx: SubmissionContext,
+        fd: SysFd,
+        sockaddr_storage: Option<G>,
+        flags: iou::sqe::SockFlag,
+    ) -> Result<SysFd>
+    where
+        G: GuardableExclusive<DefaultSubmissionGuard, iou::sqe::SockAddrStorage> + Unpin,
+    {
+        match sockaddr_storage {
+            Some(sockaddr_storage) => {
+                let future = unsafe {
+                    self.send_and_protect(
+                        ring,
+                        move |mut sockaddr_storage| {
+                            move |sqe: &mut SysSqeRef| {
+                                let sockaddr_storage_ref = sockaddr_storage
+                                    .try_get_data_mut()
+                                    .ok_or(Error::new(EADDRINUSE))
+                                    .expect("TODO: Handle EADDRINUSE error");
+
+                                sqe.set_flags(ctx.sync().linux_sqe_flags());
+                                sqe.prep_accept(fd, Some(sockaddr_storage_ref), flags)
+                            }
+                        },
+                        sockaddr_storage,
+                    )
+                };
+
+                Self::completion_as_rw_io_result(future.await?).map(|retval| retval as SysFd)
+            }
+            None => self.accept_simple(ring, ctx, fd, flags).await,
+        }
     }
 }
 
@@ -2892,7 +3007,8 @@ impl OpenInfo {
     }
 }
 
-enum SendArg<F> {
+enum SendArg<F, G, C> {
     Stream(FdEventsInitial),
-    Single(F),
+    Unguarded(F),
+    Guarded(G, C),
 }
