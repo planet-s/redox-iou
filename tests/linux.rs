@@ -41,9 +41,9 @@ fn basic_file_io() -> Result<(), Box<dyn Error + 'static>> {
             .await?;
 
         let buffer = vec! [0u8; 4096];
-        let guarded_buffer = Guarded::new(buffer);
+        let guarded_buffer = Guarded::new(buffer).try_map_mut(|buffer| Result::<_, std::convert::Infallible>::Ok(&mut buffer[..165]))?;
 
-        let (bytes_read, _guarded_buffer) = handle.pread(
+        let (bytes_read, guarded_buffer) = handle.pread(
             ring,
             SubmissionContext::new()
                 .with_sync(SubmissionSync::Drain),
@@ -52,7 +52,11 @@ fn basic_file_io() -> Result<(), Box<dyn Error + 'static>> {
             0,
         ).await?;
 
+        let (_buffer, _) = guarded_buffer.into_unmapped().try_into_inner().unwrap();
+
         assert_eq!(bytes_read, 165);
+
+        //println!("Content: {}", String::from_utf8_lossy(&buffer));
 
         unsafe { handle.close(
             ring,
