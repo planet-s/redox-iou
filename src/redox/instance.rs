@@ -1,10 +1,11 @@
 mod consumer_instance {
     use std::{mem, slice};
 
+    use either::*;
     use parking_lot::RwLock;
 
     use syscall::data::Map;
-    use syscall::error::EINVAL;
+    use syscall::error::{EINVAL, EIO};
     use syscall::error::{Error, Result};
     use syscall::flag::MapFlags;
     use syscall::flag::{O_CLOEXEC, O_CREAT, O_RDWR};
@@ -491,12 +492,12 @@ mod consumer_instance {
         ///
         /// This method will panic if the builder is not in the attaching state.
         pub fn attach_to_kernel(self) -> Result<Instance> {
-            self.attach_inner(b":")
+            self.attach_inner(b"io_uring:")
         }
-        /// Attach the ring to a userspace scheme, or the kernel with the scheme name ":" (in which
-        /// case [`attach_to_kernel`] is preferred). If this attaches to a userspace scheme, the
-        /// kernel will RPC into that process, with the [`SYS_RECV_IORING`] scheme handler,
-        /// creating a userspace-to-userspace ring.
+        /// Attach the ring to a userspace scheme, or the kernel with the scheme name "io_uring:"
+        /// (in which case [`attach_to_kernel`] is preferred). If this attaches to a userspace
+        /// scheme, the kernel will RPC into that process, with the [`SYS_RECV_IORING`] scheme
+        /// handler, creating a userspace-to-userspace ring.
         ///
         /// When this method is complete, the builder transitions from the attaching state into its
         /// finished state, yielding a ready-to-use consumer instance.
@@ -511,7 +512,7 @@ mod consumer_instance {
             self.attach_inner(scheme_name.as_ref())
         }
         fn attach_inner(self, scheme_name: &[u8]) -> Result<Instance> {
-            let kernel = scheme_name == b":";
+            let kernel = scheme_name == b"io_uring:";
 
             let sq_entry_count = self.submission_entry_count();
             let cq_entry_count = self.completion_entry_count();
@@ -628,6 +629,18 @@ mod consumer_instance {
                 _ => None,
             }
         }
+        pub fn notify_self_about_pop(&self) {
+            match self {
+                Self::Bits32(ref sender32) => sender32.notify_self_about_pop(),
+                Self::Bits64(ref sender64) => sender64.notify_self_about_pop(),
+            }
+        }
+        pub fn notify_about_push(&self) {
+            match self {
+                Self::Bits32(ref sender32) => sender32.notify_about_push(),
+                Self::Bits64(ref sender64) => sender64.notify_about_push(),
+            }
+        }
     }
 
     /// The possible entry types that a consumer instance can use, for the receiver of a completion
@@ -679,6 +692,18 @@ mod consumer_instance {
             match self {
                 Self::Bits64(ref mut s) => Some(s),
                 _ => None,
+            }
+        }
+        pub fn notify_self_about_push(&self) {
+            match self {
+                Self::Bits32(ref sender32) => sender32.notify_self_about_push(),
+                Self::Bits64(ref sender64) => sender64.notify_self_about_push(),
+            }
+        }
+        pub fn notify_self_pop(&self) {
+            match self {
+                Self::Bits32(ref sender32) => sender32.notify_about_pop(),
+                Self::Bits64(ref sender64) => sender64.notify_about_pop(),
             }
         }
     }
@@ -759,33 +784,33 @@ mod consumer_instance {
         /// Retrieve the number of free SQEs, that can be _pushed_.
         #[inline]
         pub fn sq_free_entry_count(&self) -> Result<usize> {
-            match self.sender.read() {
-                Either::Left(ref sender) => sender.free_entry_count(),
-                Either::Right(ref sender) => sender.free_entry_count(),
+            match &*self.sender.read() {
+                GenericSender::Bits32(ref sender) => sender.free_entry_count().map_err(|BrokenRing| Error::new(EIO)),
+                GenericSender::Bits64(ref sender) => sender.free_entry_count().map_err(|BrokenRing| Error::new(EIO)),
             }
         }
         /// Retrieve the number of free SQEs, that can be _popped_.
         #[inline]
         pub fn sq_available_entry_count(&self) -> Result<usize> {
-            match self.sender.read() {
-                Either::Left(ref sender) => sender.available_entry_count(),
-                Either::Right(ref sender) => sender.available_entry_count(),
+            match &*self.sender.read() {
+                GenericSender::Bits32(ref sender) => sender.available_entry_count().map_err(|BrokenRing| Error::new(EIO)),
+                GenericSender::Bits64(ref sender) => sender.available_entry_count().map_err(|BrokenRing| Error::new(EIO)),
             }
         }
         /// Retrieve the number of free CQEs, that can be _pushed_.
         #[inline]
         pub fn cq_free_entry_count(&self) -> Result<usize> {
-            match self.receiver.read() {
-                Either::Left(ref receiver) => receiver.free_entry_count(),
-                Either::Right(ref receiver) => receiver.free_entry_count(),
+            match &*self.receiver.read() {
+                GenericReceiver::Bits32(ref receiver) => receiver.free_entry_count().map_err(|BrokenRing| Error::new(EIO)),
+                GenericReceiver::Bits64(ref receiver) => receiver.free_entry_count().map_err(|BrokenRing| Error::new(EIO)),
             }
         }
         /// Retrieve the number of available CQEs, that can be _popped_.
         #[inline]
         pub fn cq_available_entry_count(&self) -> Result<usize> {
-            match self.receiver.read() {
-                Either::Left(ref receiver) => receiver.available_entry_count(),
-                Either::Right(ref receiver) => receiver.available_entry_count(),
+            match &*self.receiver.read() {
+                GenericReceiver::Bits32(ref receiver) => receiver.available_entry_count().map_err(|BrokenRing| Error::new(EIO)),
+                GenericReceiver::Bits64(ref receiver) => receiver.available_entry_count().map_err(|BrokenRing| Error::new(EIO)),
             }
         }
     }
@@ -809,6 +834,7 @@ pub use consumer_instance::{
 };
 
 mod producer_instance {
+    use either::*;
     use parking_lot::RwLock;
 
     use syscall::io_uring::v1::{CqEntry32, CqEntry64, Ring, SqEntry32, SqEntry64};

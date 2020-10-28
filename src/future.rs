@@ -97,9 +97,9 @@ fn try_submit(
     cx: &mut task::Context<'_>,
 ) -> task::Poll<syscall::Error> {
     #[cfg(target_os = "redox")]
-    let mut sqe = SqEntry64::default();
+    let mut sqe_orig = SqEntry64::default();
     #[cfg(target_os = "redox")]
-    let sqe = &mut sqe;
+    let mut sqe = &mut sqe_orig;
 
     #[cfg(target_os = "linux")]
     let mut guard = instance.lock();
@@ -155,7 +155,7 @@ fn try_submit(
         .write()
         .as_64_mut()
         .expect("expected instance with 64-bit SQEs")
-        .try_send(sqe)
+        .try_send(sqe_orig)
     {
         Ok(()) => {
             if is_stream {
@@ -338,6 +338,7 @@ pub(crate) struct FdEventsInitial {
     pub(crate) fd: SysFd,
     pub(crate) event_flags: EventFlags,
     pub(crate) oneshot: bool,
+    // TODO: Submission context
 }
 
 #[cfg(target_os = "redox")]
@@ -352,15 +353,16 @@ impl Stream for FdEvents {
         let this = self.get_mut();
 
         let prepare_fn = this.initial.take().map(|initial| {
-            |sqe| {
+            move |sqe: &mut SysSqeRef| {
                 #[cfg(target_os = "redox")]
                 {
-                    // TODO: Validate cast.
-                    sqe.sys_register_events(initial.fd as u64, initial.event_flags, initial.oneshot)
+                    // TODO: Validate fd cast.
+                    sqe.sys_register_events(initial.fd as u64, initial.event_flags, initial.oneshot);
                 }
             }
         });
-        this.inner.poll(true, prepare_fn, cx)
+        let is_stream = true;
+        this.inner.poll(is_stream, prepare_fn, cx)
     }
 }
 

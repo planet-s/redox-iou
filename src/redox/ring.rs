@@ -150,12 +150,24 @@ impl<T> SpscSender<T> {
     }
 
     /// Wake the receiver up if it was blocking on a new message, without sending anything.
+    ///
     /// This is useful when building a [`core::future::Future`] executor, for the
     /// [`core::task::Waker`].
     #[inline]
-    pub fn notify(&self) {
+    pub fn notify_about_push(&self) {
         let ring = unsafe { self.ring_header() };
         let _ = ring.push_epoch.fetch_add(1, Ordering::Relaxed);
+        // TODO: Syscall here?
+    }
+    /// Wake up this sender if it was blocking on send, by pretending that a new entry has been
+    /// popped.
+    ///
+    /// This is useful when building a [`core::future::Future`] executor, for the
+    /// [`core::task::Waker`].
+    #[inline]
+    pub fn notify_self_about_pop(&self) {
+        let ring = unsafe { self.ring_header() };
+        let _ = ring.pop_epoch.fetch_add(1, Ordering::Relaxed);
         // TODO: Syscall here?
     }
 
@@ -165,6 +177,15 @@ impl<T> SpscSender<T> {
     /// This is fallible, and an error is returned if the ring is no longer in a correct state.
     #[inline]
     pub fn free_entry_count(&self) -> Result<usize> {
+        unsafe {
+            self.ring_header()
+                .available_entry_count(self.log2_entry_count as usize)
+                .map_err(|_| Error::new(EIO))
+        }
+    }
+    /// Get the number of available entry slots for the other side of the ring, to pop from.
+    #[inline]
+    pub fn available_entry_count(&self) -> Result<usize> {
         unsafe {
             self.ring_header()
                 .available_entry_count(self.log2_entry_count as usize)
@@ -279,10 +300,12 @@ impl<T> SpscReceiver<T> {
             }
         }
     }
-    /// Create an iterator over the currently available items, that does not block.
+    /// Create an endless iterator that continues to `try_recv`.
     #[inline]
-    pub fn try_iter(&mut self) -> impl Iterator<Item = T> + '_ {
-        core::iter::from_fn(move || self.try_recv().ok())
+    pub fn try_iter(&mut self) -> impl Iterator<Item = Result<T, RingPopError>> + '_ {
+        core::iter::from_fn(move || {
+            Some(self.try_recv())
+        })
     }
 
     /// Deallocate the receiver, unmapping the memory used by it, together with a shutdown.
@@ -333,6 +356,33 @@ impl<T> SpscReceiver<T> {
             self.ring_header()
                 .available_entry_count(self.log2_entry_count as usize)
         }
+    }
+    /// Get the number of free entries to for the other side of the ring, to push to, at the time
+    /// this method was called.
+    #[inline]
+    pub fn free_entry_count(&self) -> Result<usize, BrokenRing> {
+        unsafe {
+            self.ring_header()
+                .free_entry_count(self.log2_entry_count as usize)
+        }
+    }
+    /// Wake the sender up if it was blocking on a space for new messages, without having to send
+    /// anything as part of the wakeup.
+    #[inline]
+    pub fn notify_about_pop(&self) {
+        let ring = unsafe { self.ring_header() };
+        let _ = ring.pop_epoch.fetch_add(1, Ordering::Relaxed);
+        // TODO: Syscall here?
+    }
+    /// Increment the push epoch to pretend that there has been a new entry pushed.
+    ///
+    /// This is useful when building a [`core::future::Future`] executor, for the
+    /// [`core::task::Waker`].
+    #[inline]
+    pub fn notify_self_about_push(&self) {
+        let ring = unsafe { self.ring_header() };
+        let _ = ring.pop_epoch.fetch_add(1, Ordering::Relaxed);
+        // TODO: Syscall here?
     }
 }
 impl<T> Drop for SpscReceiver<T> {

@@ -7,7 +7,7 @@ use syscall::data::Map as Mmap;
 use syscall::error::{Error, Result};
 use syscall::error::{EFAULT, ENOMEM, EOVERFLOW};
 use syscall::flag::MapFlags;
-use syscall::io_uring::v1::operation::DupFlags;
+use syscall::io_uring::v1::operation::{CloseFlags, DupFlags};
 use syscall::io_uring::v1::{PoolFdEntry, Priority};
 
 use parking_lot::Mutex;
@@ -77,10 +77,11 @@ impl BufferPoolHandle {
             Some(ref h) => unsafe {
                 // Closing will automagically unmap all mmaps.
                 h.close(
-                    h.reactor().primary_instance(),
+                    // TODO
+                    h.reactor().primary_instances().next().unwrap(),
                     SubmissionContext::new().with_sync(SubmissionSync::Drain),
                     self.fd,
-                    false,
+                    CloseFlags::empty(),
                 )
                 .await?;
             },
@@ -114,7 +115,7 @@ impl Handle {
             let secondary_instances = reactor.secondary_instances.read();
             let instance = secondary_instances
                 .instances
-                .get(secondary_instance.inner.get() - 1)
+                .get(secondary_instance.inner)
                 .expect("invalid secondary ring id");
 
             if producer {
@@ -139,11 +140,12 @@ impl Handle {
         log::debug!("Running dup");
         let (fd, _) = self
             .dup(
-                reactor.primary_instance(),
+                // TODO
+                reactor.primary_instances().next().unwrap(),
                 SubmissionContext::default(),
                 ringfd,
                 DupFlags::PARAM,
-                Some(Guarded::wrap_static_slice(&b"pool"[..])),
+                Some(&b"pool"[..]),
             )
             .await?;
         log::debug!("Ran dup");
@@ -207,7 +209,8 @@ pub async fn expand(handle: &BufferPoolHandle, offset: u64, len: usize) -> Resul
     match handle.reactor {
         Some(ref h) => unsafe {
             h.mmap(
-                h.reactor().primary_instance(),
+                // TODO
+                h.reactor().primary_instances().next().unwrap(),
                 SubmissionContext::default(),
                 handle.fd,
                 map_flags,

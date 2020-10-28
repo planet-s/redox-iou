@@ -27,7 +27,7 @@ use syscall::error::{
     E2BIG, EADDRINUSE, EBADF, ECANCELED, EFAULT, EINVAL, EIO, EOPNOTSUPP, EOVERFLOW,
 };
 use syscall::flag::{EventFlags, MapFlags};
-use syscall::io_uring::operation::{DupFlags, RegisterEventsFlags};
+use syscall::io_uring::v1::operation::{CloseFlags, DupFlags, OpenFlags, ReadFlags, RegisterEventsFlags, WriteFlags};
 use syscall::io_uring::v1::{
     CqEntry64, IoUringCqeFlags, IoUringSqeFlags, Priority, RingPopError, RingPushError, SqEntry64,
     StandardOpcode,
@@ -93,7 +93,8 @@ pub struct Reactor {
     pub(crate) main_instances: Vec<ConsumerInstanceWrapper>,
 
     // The secondary instances, which are typically userspace-to-userspace, for schemes I/O or IPC.
-    // These are not blocked on using the `SYS_ENTER_IORING` syscall; instead, they use FilesUpdate
+    // These are not blocked on using the `SYS_ENTER_IORING` syscall; instead, they use
+    // RegisterEvents.
     // on the main instance (which __must__ be attached to the kernel for secondary instances to
     // exist whatsoever), and then pops the entries of that ring separately, precisely like with
     // the primary ring.
@@ -119,7 +120,7 @@ pub struct Reactor {
     reusable_tags: ArrayQueue<(Tag, Arc<Mutex<State>>)>,
 
     // This is a weak backref to the reactor itself, allowing handles to be obtained.
-    weak_ref: Weak<Reactor>,
+    weak_ref: Option<Weak<Reactor>>,
 }
 
 #[derive(Debug)]
@@ -474,6 +475,27 @@ pub type SysIoVec = IoVec;
 #[cfg(target_os = "linux")]
 pub type SysIoVec = libc::iovec;
 
+/// The system type for pwritev2 flags.
+#[cfg(target_os = "redox")]
+pub type SysWriteFlags = WriteFlags;
+/// The system type for pwritev2 flags.
+#[cfg(target_os = "linux")]
+pub type SysWriteFlags = ();
+
+/// The system type for pread2 flags.
+#[cfg(target_os = "redox")]
+pub type SysReadFlags = ReadFlags;
+/// The system type for pread2 flags.
+#[cfg(target_os = "linux")]
+pub type SysReadFlags = ();
+
+/// The system type for close flags.
+#[cfg(target_os = "redox")]
+pub type SysCloseFlags = CloseFlags;
+/// The system type for close flags.
+#[cfg(target_os = "linux")]
+pub type SysCloseFlags = ();
+
 /// A builder that configures the reactor.
 #[derive(Debug)]
 pub struct ReactorBuilder {
@@ -556,7 +578,33 @@ impl ReactorBuilder {
 }
 impl Reactor {
     fn new(main_instances: Vec<ConsumerInstanceWrapper>) -> Arc<Self> {
-        Arc::new_cyclic(|weak_ref| Reactor {
+
+        let reactor = Reactor {
+            id: ReactorId {
+                inner: LAST_REACTOR_ID.fetch_add(1, atomic::Ordering::Relaxed),
+            },
+            main_instances,
+
+            #[cfg(target_os = "redox")]
+            secondary_instances: RwLock::new(SecondaryInstancesWrapper {
+                instances: Vec::new(),
+                fds_backref: BTreeMap::new(),
+            }),
+
+            tag_map: RwLock::new(BTreeMap::new()),
+            next_tag: AtomicTag::new(1),
+            reusable_tags: ArrayQueue::new(512),
+            weak_ref: None,
+        };
+
+        let mut arc = Arc::new(reactor);
+        let weak = Arc::downgrade(&arc);
+        unsafe { Arc::get_mut_unchecked(&mut arc).weak_ref = Some(weak); }
+
+        arc
+
+        // TODO: Update Redox compiler version!
+        /*Arc::new_cyclic(|weak_ref| Reactor {
             id: ReactorId {
                 inner: LAST_REACTOR_ID.fetch_add(1, atomic::Ordering::Relaxed),
             },
@@ -572,7 +620,7 @@ impl Reactor {
             next_tag: AtomicTag::new(1),
             reusable_tags: ArrayQueue::new(512),
             weak_ref: Weak::clone(weak_ref),
-        })
+        })*/
     }
     /// Retrieve the ring ID of the primary instance, which must be a userspace-to-kernel ring if
     /// there are more than one rings in the reactor.
@@ -588,7 +636,7 @@ impl Reactor {
     /// be weakly owned, and panic on regular operations if this reactor is dropped.
     pub fn handle(&self) -> Handle {
         Handle {
-            reactor: Weak::clone(&self.weak_ref),
+            reactor: Weak::clone(self.weak_ref.as_ref().unwrap()),
         }
     }
     /// Add an additional secondary instance to the reactor, waking up the executor to include it
@@ -606,6 +654,7 @@ impl Reactor {
             SecondaryInstanceWrapper::ConsumerInstance(ConsumerInstanceWrapper {
                 consumer_instance: instance,
                 dropped: AtomicBool::new(false),
+                trusted: false, // TODO
             }),
             ringfd,
             priority,
@@ -626,20 +675,21 @@ impl Reactor {
         {
             let fd64 = ringfd.try_into().or(Err(Error::new(EBADF)))?;
 
-            self.main_instance
+            self.main_instances
+                .get(0).unwrap()
                 .consumer_instance
                 .sender()
                 .write()
                 .as_64_mut()
                 .expect("expected SqEntry64")
                 .try_send(SqEntry64 {
-                    opcode: StandardOpcode::FilesUpdate as u8,
+                    opcode: StandardOpcode::RegisterEvents as u8,
                     priority,
                     flags: IoUringSqeFlags::SUBSCRIBE.bits(),
                     // not used since the driver will know that it's an io_uring being updated
                     user_data: 0,
 
-                    syscall_flags: (FilesUpdateFlags::READ | FilesUpdateFlags::IO_URING).bits(),
+                    syscall_flags: (RegisterEventsFlags::READ | RegisterEventsFlags::IO_URING).bits(),
                     addr: 0, // unused
                     fd: fd64,
                     offset: 0, // unused
@@ -657,7 +707,7 @@ impl Reactor {
 
         Ok(SecondaryRingId {
             reactor: self.id,
-            inner: NonZeroUsize::new(guard.instances.len()).unwrap(),
+            inner: guard.instances.len(),
         })
     }
     /// Add a producer instance (the producer of a userspace-to-userspace or kernel-to-userspace
@@ -735,12 +785,9 @@ impl Reactor {
                 // is only true for certain higher-priority processes), there are probably no major
                 // benefits in addition to that.
 
-                let consumer_instance = &reactor.main_instance.consumer_instance;
+                let consumer_instance = &reactor.main_instances.get(0).unwrap().consumer_instance;
 
-                match &*consumer_instance.receiver().read() {
-                    ConsumerGenericSender::Bits32(ref sender32) => sender32.notify(),
-                    ConsumerGenericSender::Bits64(ref sender64) => sender64.notify(),
-                }
+                consumer_instance.receiver().read().notify_self_about_push();
 
                 // TODO: Only enter for rings that are not polled by the kernel when scheduling.
                 consumer_instance
@@ -787,7 +834,7 @@ impl Reactor {
             let num_completed = if wait {
                 let sq_free_entry_count = instance.consumer_instance.sq_free_entry_count()?;
 
-                let flags = if free_entry_count > 0 {
+                let flags = if sq_free_entry_count > 0 {
                     IoUringEnterFlags::empty()
                 } else {
                     // TODO: ... and has entries that need to be pushed?
@@ -804,22 +851,19 @@ impl Reactor {
 
             for cqe_result in instance
                 .consumer_instance
-                .sender
+                .receiver()
                 .write()
                 .as_64_mut()
                 .unwrap()
                 .try_iter()
             {
-                #[cfg(target_os = "redox")]
-                if a.unwrap_or(0) > available_completions {
-                    log::warn!("The kernel/other process gave us a higher number of available completions than present on the ring.");
-                }
                 match cqe_result {
-                    Ok(cqe) => self.drive_handle_cqe(primary, cqe, waker),
-                    Err(RingPopError::Empty { .. }) => panic!("the kernel gave us a higher number of available completions than actually available (at {}/{})", i, available_completions),
+                    Ok(cqe) => self.drive_handle_cqe(primary, instance.trusted, cqe, waker),
+                    Err(RingPopError::Empty { .. }) => break,
                     Err(RingPopError::Shutdown) => { instance.dropped.store(true, std::sync::atomic::Ordering::Release); break },
                     Err(RingPopError::Broken) => {
                         log::error!("Ring (instance: {:?}) was not able to pop, as it had entered an inconsistent state. This is either a bug in the producer, a bug in the io_uring management of this process, or a kernel bug.", instance);
+                        return Err(Error::new(EIO));
                     }
                 }
             }
@@ -887,16 +931,17 @@ impl Reactor {
                     return;
                 }
             };
+            let primary_instance = self.main_instances.get(0).expect("expected primary instance to exist");
             match secondary_instances_guard
                 .instances
                 .get(secondary_instance_index)
                 .expect("fd backref BTreeMap corrupt, contains a file descriptor that was removed")
             {
                 SecondaryInstanceWrapper::ConsumerInstance(ref instance) => {
-                    self.drive(instance, waker, false, false)?
+                    self.drive(instance, waker, false, false).expect("failed to drive consumer instance");
                 }
                 SecondaryInstanceWrapper::ProducerInstance(ref instance) => {
-                    self.drive_producer_instance(&instance)?
+                    self.drive_producer_instance(primary_instance, &instance).expect("failed to drive producer instance");
                 }
             }
             return;
@@ -905,10 +950,10 @@ impl Reactor {
         let _ = Self::handle_cqe(trusted, self.tag_map.read(), waker, cqe);
     }
     #[cfg(target_os = "redox")]
-    fn drive_producer_instance(&self, instance: &ProducerInstanceWrapper) -> Result<()> {
+    fn drive_producer_instance(&self, primary_instance: &ConsumerInstanceWrapper, instance: &ProducerInstanceWrapper) -> Result<()> {
         log::debug!("Event was an external producer io_uring, thus polling the ring itself");
         loop {
-            assert!(self.trusted_main_instance);
+            assert!(primary_instance.trusted);
 
             let state_lock = match instance.stream_state {
                 Some(ref s) => s,
@@ -1199,14 +1244,14 @@ impl Handle {
     }
     /// Shorthand for send(), but where the submission context is applied to the preparation
     /// function, before calling the inner.
-    pub unsafe fn send_with_ctx<F>(&self, ring: impl Into<RingId>, _ctx: SubmissionContext, prepare_sqe: F) -> CommandFuture<impl FnOnce(&mut SysSqeRef)>
+    pub unsafe fn send_with_ctx<F>(&self, ring: impl Into<RingId>, ctx: SubmissionContext, prepare_sqe: F) -> CommandFuture<impl FnOnce(&mut SysSqeRef)>
     where
         F: for<'ring, 'tmp> FnOnce(&'tmp mut SysSqeRef<'ring>)
     {
         let prepare_sqe_wrapper = move |sqe: &mut SysSqeRef| {
             #[cfg(target_os = "redox")]
             {
-                sqe.base(ctx.sync().sqe_flags(), ctx.priority(), (-1i64) as u64)
+                sqe.base(ctx.sync().redox_sqe_flags(), ctx.priority(), (-1i64) as u64);
             }
             #[cfg(target_os = "linux")]
             {
@@ -1222,10 +1267,7 @@ impl Handle {
         &self,
         ring: impl Into<RingId>,
         send_arg: SendArg<F>,
-    ) -> Either<CommandFuture<F>, FdEvents>
-    where
-        F: for<'ring, 'tmp> FnOnce(&'tmp mut SysSqeRef<'ring>),
-    {
+    ) -> Either<CommandFuture<F>, FdEvents> {
         let ring = ring.into();
 
         let reactor = self
@@ -1347,7 +1389,7 @@ impl Handle {
 
         let producer_instance = match guard
             .instances
-            .get(instance.inner.get() - 1)
+            .get(instance.inner)
             .expect("invalid SecondaryRingId: non-existent instance")
         {
             SecondaryInstanceWrapper::ProducerInstance(ref instance) => instance,
@@ -1398,13 +1440,12 @@ impl Handle {
             .expect("failed to send producer CQE: reactor is dead");
 
         assert_eq!(reactor.id(), ring_id.reactor);
-        assert!(reactor.trusted_main_instance);
 
         let secondary_instances = reactor.secondary_instances.upgradable_read();
 
         let state_opt = match secondary_instances
             .instances
-            .get(ring_id.inner.get() - 1)
+            .get(ring_id.inner)
             .unwrap()
         {
             SecondaryInstanceWrapper::ConsumerInstance(_) => {
@@ -1423,7 +1464,7 @@ impl Handle {
                     RwLockUpgradableReadGuard::upgrade(secondary_instances);
                 match secondary_instances
                     .instances
-                    .get_mut(ring_id.inner.get() - 1)
+                    .get_mut(ring_id.inner)
                     .unwrap()
                 {
                     SecondaryInstanceWrapper::ConsumerInstance(_) => unreachable!(),
@@ -1447,7 +1488,7 @@ impl Handle {
     /// Create an asynchronous stream that represents the events coming from one of more file
     /// descriptors that are triggered when e.g. the file has changed, or is capable of reading new
     /// data, etc.
-    // TODO: Is there an equivalent here for Redox?
+    // TODO: Is there an equivalent here for Linux?
     #[cfg(any(doc, target_os = "redox"))]
     #[doc(cfg(target_os = "redox"))]
     pub unsafe fn fd_events(
@@ -1458,17 +1499,16 @@ impl Handle {
         oneshot: bool,
     ) -> FdEvents {
         assert!(!event_flags.contains(EventFlags::EVENT_IO_URING), "only the redox_iou reactor is allowed to use this flag unless io_uring API is used directly");
-        let prepare_sqe = move |sqe: SysSqeRef| {
-            {
-                sqe.base(
-                    IoUringSqeFlags::SUBSCRIBE,
-                    Priority::default(),
-                    (-1i64) as u64,
-                )
-                .sys_files_update(fds, event_flags, oneshot)
-            }
+
+        let initial = FdEventsInitial {
+            fd,
+            event_flags,
+            oneshot,
         };
-        self.send_inner(ring, prepare_sqe, true)
+
+        type PlaceholderPrepareFn = ();
+
+        self.send_inner(ring, SendArg::<PlaceholderPrepareFn>::Stream(initial))
             .right()
             .expect("send_inner must return Right if is_stream is set to true")
     }
@@ -1532,9 +1572,9 @@ impl Handle {
             #[cfg(target_os = "redox")]
             {
                 if let Some(fd64) = at_fd64 {
-                    sqe_base.open_at(fd64, reference, flags)
+                    sqe.sys_openat(fd64, reference, info.inner.0);
                 } else {
-                    sqe_base.open(reference, flags)
+                    sqe.sys_open(reference, info.inner.0);
                 }
             }
             #[cfg(target_os = "linux")]
@@ -1715,7 +1755,7 @@ impl Handle {
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
         fd: SysFd,
-        flush: bool,
+        flags: SysCloseFlags,
     ) -> Result<()> {
         #[cfg(target_os = "redox")]
         let fd64 = fd.try_into().map_err(|_| Error::new(EBADF))?;
@@ -1723,13 +1763,12 @@ impl Handle {
         let prepare_fn = |sqe: &mut SysSqeRef| {
             #[cfg(target_os = "redox")]
             {
-                sqe.close(fd64, flush)
+                sqe.sys_close(fd64, flags);
             }
             #[cfg(target_os = "linux")]
             {
-                // TODO: flush
-                let _flush = flush;
-                sqe.prep_close(fd)
+                let _ = flags;
+                sqe.prep_close(fd);
             }
         };
         let cqe = self.send_with_ctx(ring, ctx, prepare_fn).await?;
@@ -1765,17 +1804,16 @@ impl Handle {
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
         range: std::ops::Range<usize>,
-        flush: bool,
+        flags: CloseFlags,
     ) -> Result<()> {
         let start: u64 = range.start.try_into().or(Err(Error::new(EOVERFLOW)))?;
         let end: u64 = range.end.try_into().or(Err(Error::new(EOVERFLOW)))?;
         let count = end.checked_sub(start).ok_or(Error::new(EINVAL))?;
 
-        let prepare_fn = |sqe: SysSqeRef| {
-            sqe.base(ctx.sync.sqe_flags(), ctx.priority(), (-1i64) as u64)
-                .sys_close_many(start, count, flush);
+        let prepare_fn = |sqe: &mut SysSqeRef| {
+            sqe.sys_close_range(start, count, flags);
         };
-        let cqe = self.send(ring, prepare_fn).await?;
+        let cqe = self.send_with_ctx(ring, ctx, prepare_fn).await?;
 
         Self::completion_as_rw_io_result(cqe)?;
 
@@ -1801,24 +1839,30 @@ impl Handle {
         ctx: SubmissionContext,
         fd: SysFd,
         buf: &mut [u8],
+        flags: ReadFlags,
     ) -> Result<usize> {
         let ring = ring.into();
+        let buf = buf
+            .as_generic_slice_mut(ring.is_primary())
+            .ok_or(Error::new(EFAULT))?;
 
-        let (bytes_read, _) = self
-            .send(
+        let fd64 = u64::try_from(fd).map_err(|_| Error::new(EBADF))?;
+
+        let cqe = self
+            .send_with_ctx(
                 ring,
-                |sqe| {
+                ctx,
+                |sqe: &mut SysSqeRef| {
                     sqe.sys_read(
-                        fd,
-                        buf
-                            .as_generic_slice_mut(ring.is_primary())
-                            .ok_or(Error::new(EFAULT))?,
+                        fd64,
+                        buf,
+                        flags,
                     );
                 },
-                Either::<_, GuardedPlaceholder>::Left(buf),
             )
             .await?;
-        Ok(bytes_read)
+
+        Self::completion_as_rw_io_result(cqe)
     }
     /// Read bytes, returning the number of bytes read, or zero if no more bytes are available.
     ///
@@ -1834,29 +1878,18 @@ impl Handle {
         ctx: SubmissionContext,
         fd: usize,
         buf: B,
+        flags: ReadFlags,
     ) -> Result<(usize, B)>
     where
         // TODO: Uninitialized memory and `ioslice`.
-        B: Guarded<Target = [u8]> + AsOffsetLen,
+        B: GuardedMut<Target = [u8]> + AsOffsetLen,
     {
         let ring = ring.into();
-        let buf = ManuallyDrop::new(buf);
+        let mut buf = ManuallyDrop::new(buf);
 
-        let prepare_fn = |sqe| {
-            sqe.sys_read(
-                fd,
-                buf
-            );
-            Ok(())
-        };
-        let bytes_read = unsafe {
-            self.send(
-                ring,
-                buf,
-            )
-            .await?
-        };
-        Ok((bytes_read, guard))
+        let bytes_read = unsafe { self.read_unchecked(ring, ctx, fd, buf.borrow_guarded_mut(), flags).await? };
+
+        Ok((bytes_read, ManuallyDrop::into_inner(buf)))
     }
     /// Read bytes, vectored.
     ///
@@ -1870,28 +1903,30 @@ impl Handle {
     // TODO: safe wrapper
     // TODO: Linux?
     #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "reodx"))]
     pub async unsafe fn readv_unchecked(
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
         fd: usize,
         bufs: &[IoVec],
+        flags: ReadFlags,
     ) -> Result<usize> {
         let ring = ring.into();
 
-        let (bytes_read, _) = self
-            .rw_io(
+        let fd64 = u64::try_from(fd).map_err(|_| Error::new(EBADF))?;
+
+        let cqe = self
+            .send_with_ctx(
                 ring,
                 ctx,
-                fd,
-                |sqe, fd, bufs| {
-                    sqe.sys_readv(fd, bufs.left().unwrap());
-                    Ok(())
+                |sqe: &mut SysSqeRef| {
+                    sqe.sys_readv(fd64, bufs, flags);
                 },
-                Either::<_, GuardedPlaceholder>::Left(bufs),
             )
             .await?;
-        Ok(bytes_read)
+
+        Self::completion_as_rw_io_result(cqe)
     }
 
     /// Read bytes from a specific offset. Does not change the file offset.
@@ -1911,64 +1946,33 @@ impl Handle {
         fd: SysFd,
         buf: &mut [u8],
         offset: u64,
+        flags: SysReadFlags,
     ) -> Result<usize> {
         let ring = ring.into();
 
-        let cqe = self
-            .send_with_ctx(
-                ring,
-                ctx,
-                |sqe: &mut SysSqeRef| {
-                    #[cfg(target_os = "redox")]
-                    let buf = buf
-                        .as_generic_slice_mut(ring.is_primary())
-                        .ok_or(Error::new(EFAULT))?;
+        let data_mut = buf;
 
-                    #[cfg(target_os = "redox")]
-                    sqe.sys_pread(fd, offset, buf);
-                    #[cfg(target_os = "linux")]
-                    sqe.prep_read(fd, buf, offset);
-                },
-            )
-            .await?;
-
-        let bytes_read = Self::completion_as_rw_io_result(cqe)?;
-        Ok(bytes_read as usize)
-    }
-    /// Read bytes from a specific offset. Does not change the file offset.
-    ///
-    /// This is the safe variant of [`pread_unchecked`].
-    ///
-    /// [`pread_unchecked`]: #method.pread_unchecked
-    // TODO: Uninitialized buffers.
-    pub async fn pread<B>(
-        &self,
-        ring: impl Into<RingId>,
-        ctx: SubmissionContext,
-        fd: SysFd,
-        buf: B,
-        offset: u64,
-    ) -> Result<(usize, B)>
-    where
-        B: GuardedMut<Target = [u8]>,
-    {
-        let ring = ring.into();
-        let mut buf = ManuallyDrop::new(buf);
-
-        let prepare_fn = |sqe: &mut SysSqeRef| {
-            let data_mut = buf
-                .borrow_guarded_mut();
-
-            #[cfg(target_os = "redox")]
+        #[cfg(target_os = "redox")]
+        let (fd64, data_mut) = {
+            let fd64 = u64::try_from(fd).map_err(|_| Error::new(EBADF))?;
             let data_mut = data_mut
                 .as_generic_slice_mut(ring.is_primary())
                 .ok_or(Error::new(EFAULT))?;
 
+            (fd64, data_mut)
+        };
+
+        let prepare_fn = |sqe: &mut SysSqeRef| {
             unsafe {
                 #[cfg(target_os = "redox")]
-                sqe.sys_pread(fd, offset);
+                {
+                    sqe.sys_pread(fd64, data_mut, offset, flags);
+                }
                 #[cfg(target_os = "linux")]
-                sqe.prep_read(fd, data_mut, offset);
+                {
+                    let _ = flags;
+                    sqe.prep_read(fd, data_mut, offset);
+                }
             }
         };
 
@@ -1981,6 +1985,32 @@ impl Handle {
             .await?
         };
         let bytes_read = Self::completion_as_rw_io_result(cqe)? as usize;
+        Ok(bytes_read as usize)
+    }
+    /// Read bytes from a specific offset. Does not change the file offset.
+    ///
+    /// This is the safe variant of [`pread_unchecked`].
+    ///
+    /// [`pread_unchecked`]: #method.pread_unchecked
+    // TODO: Uninitialized buffers.
+    // TODO: AsOffsetLenMut.
+    pub async fn pread<B>(
+        &self,
+        ring: impl Into<RingId>,
+        ctx: SubmissionContext,
+        fd: SysFd,
+        buf: B,
+        offset: u64,
+        flags: SysReadFlags,
+    ) -> Result<(usize, B)>
+    where
+        B: GuardedMut<Target = [u8]>,
+    {
+        let ring = ring.into();
+        let mut buf = ManuallyDrop::new(buf);
+
+        let bytes_read = unsafe { self.pread_unchecked(ring, ctx, fd, buf.borrow_guarded_mut(), offset, flags).await? };
+
         Ok((bytes_read, ManuallyDrop::into_inner(buf)))
     }
 
@@ -2000,11 +2030,15 @@ impl Handle {
         fd: SysFd,
         bufs: &mut [SysIoVec],
         offset: u64,
+        flags: SysReadFlags,
     ) -> Result<usize> {
+        #[cfg(target_os = "redox")]
+        let fd64 = u64::try_from(fd).map_err(|_| Error::new(EBADF))?;
+
         let prepare_fn = |sqe: &mut SysSqeRef| {
             #[cfg(target_os = "redox")]
             {
-                sqe.sys_preadv(fd, bufs_unchecked, offset);
+                sqe.sys_preadv(fd64, bufs, offset, flags);
             }
 
             #[cfg(target_os = "linux")]
@@ -2045,34 +2079,38 @@ impl Handle {
     // TODO: On Linux?
     #[cfg(any(doc, target_os = "redox"))]
     #[doc(cfg(target_os = "redox"))]
-    pub async unsafe fn write_unchecked(
+    pub async unsafe fn write_unchecked<B>(
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
         fd: SysFd,
-        buf: &[u8],
-    ) -> Result<usize> {
+        buf: &B,
+        flags: WriteFlags,
+    ) -> Result<usize>
+    where
+        B: AsOffsetLen,
+    {
         let ring = ring.into();
+        let buf = buf
+            .as_generic_slice(ring.is_primary())
+            .ok_or(Error::new(EFAULT))?;
+        let fd64 = u64::try_from(fd).map_err(|_| Error::new(EBADF))?;
 
-        let (bytes_written, _) = self
-            .rw_io(
+        let cqe = self
+            .send_with_ctx(
                 ring,
                 ctx,
-                fd,
-                |mut sqe, fd, buf| {
+                |sqe: &mut SysSqeRef| {
                     sqe.sys_write(
-                        fd,
-                        buf.left()
-                            .unwrap()
-                            .as_generic_slice(ring.is_primary())
-                            .ok_or(Error::new(EFAULT))?,
+                        fd64,
+                        buf,
+                        flags,
                     );
-                    Ok(())
                 },
-                Either::<_, GuardedPlaceholder>::Left(buf),
             )
             .await?;
-        Ok(bytes_written)
+
+        Self::completion_as_rw_io_result(cqe)
     }
     /// Write bytes. Returns the number of bytes written, or zero if no more bytes could be
     /// written.
@@ -2082,42 +2120,22 @@ impl Handle {
     /// [`write_unchecked`]: #method.write_unchecked
     #[cfg(any(doc, target_os = "redox"))]
     #[doc(cfg(target_os = "redox"))]
-    pub async fn write<G>(
+    pub async fn write<B>(
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
         fd: SysFd,
-        buf: G,
-    ) -> Result<(usize, G)>
+        buf: B,
+        flags: WriteFlags,
+    ) -> Result<(usize, B)>
     where
-        G: Guarded<Target = [u8]>,
+        B: Guarded<Target = [u8]> + AsOffsetLen,
     {
         let ring = ring.into();
+        let buf = ManuallyDrop::new(buf);
 
-        let (bytes_written, guard_opt) = unsafe {
-            self.rw_io(
-                ring,
-                ctx,
-                fd,
-                |sqe, fd, buf| {
-                    #[cfg(target_os = "redox")]
-                    sqe.sys_write(
-                        fd,
-                        buf.right()
-                            .unwrap()
-                            .data_shared()
-                            .as_generic_slice(ring.is_primary())
-                            .ok_or(Error::new(EFAULT))?,
-                    );
-
-                    Ok(())
-                },
-                Either::<(), _>::Right(buf),
-            )
-            .await?
-        };
-        let guard = guard_opt.unwrap();
-        Ok((bytes_written, guard))
+        let bytes_written = unsafe { self.write_unchecked(ring, ctx, fd, &*buf, flags).await? };
+        Ok((bytes_written, ManuallyDrop::into_inner(buf)))
     }
 
     /// Write bytes, vectored.
@@ -2132,29 +2150,31 @@ impl Handle {
     // TODO: Does Linux support system calls that change the file offset, when using io_uring?
     #[cfg(any(doc, target_os = "redox"))]
     #[doc(cfg(target_os = "redox"))]
-    pub async unsafe fn writev(
+    pub async unsafe fn writev_unchecked(
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
         fd: SysFd,
         bufs: &[IoVec],
+        flags: SysWriteFlags,
     ) -> Result<usize> {
-        let (bytes_written, _) = self
-            .rw_io(
+        let fd64 = u64::try_from(fd).map_err(|_| Error::new(EBADF))?;
+
+        let cqe = self
+            .send_with_ctx(
                 ring,
                 ctx,
-                fd,
-                |mut sqe, fd, bufs| {
-                    sqe.sys_writev(fd, bufs.left().unwrap());
-                    Ok(())
+                |sqe: &mut SysSqeRef| {
+                    sqe.sys_writev(fd64, bufs, flags);
                 },
-                Either::<_, GuardedPlaceholder>::Left(bufs),
             )
             .await?;
-        Ok(bytes_written)
+
+        Self::completion_as_rw_io_result(cqe)
     }
 
-    /// Write bytes to a specific offset. Does not change the file offset.
+    /// Write bytes to a specific offset, with an optional set of flags. Does not change the file
+    /// offset.
     ///
     /// This is the unsafe variant of the [`pwrite`] method.
     ///
@@ -2164,22 +2184,41 @@ impl Handle {
     /// not reclaimed until the command is either complete or cancelled.
     ///
     /// [`pwrite`]: #method.pwrite
-    pub async unsafe fn pwrite_unchecked(
+    pub async unsafe fn pwrite_unchecked<B>(
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
         fd: SysFd,
-        buf: &[u8],
+        buf: &B,
         offset: u64,
-    ) -> Result<usize> {
+        flags: SysWriteFlags,
+    ) -> Result<usize>
+    where
+        B: AsOffsetLen + ?Sized,
+    {
         let ring = ring.into();
+
+        #[cfg(target_os = "redox")]
+        let (fd64, buf) = {
+            let fd64 = u64::try_from(fd).map_err(|_| Error::new(EBADF))?;
+            let buf = buf.as_generic_slice(ring.is_primary()).ok_or(Error::new(EFAULT))?;
+
+            (fd64, buf)
+        };
+        #[cfg(target_os = "linux")]
+        let buf = buf.slice();
 
         let prepare_fn = |sqe: &mut SysSqeRef| {
             #[cfg(target_os = "redox")]
-            sqe.pwrite(fd, buf, offset);
+            {
+                sqe.sys_pwrite(fd64, buf, offset, flags);
+            }
 
             #[cfg(target_os = "linux")]
-            sqe.prep_write(fd, buf, offset);
+            {
+                let _ = flags;
+                sqe.prep_write(fd, buf, offset);
+            }
         };
 
         let cqe = {
@@ -2210,6 +2249,7 @@ impl Handle {
         fd: SysFd,
         buf: B,
         offset: u64,
+        flags: SysWriteFlags,
     ) -> Result<(usize, B)>
     where
         // TODO: Support MaybeUninit via the `ioslice` crate.
@@ -2218,29 +2258,13 @@ impl Handle {
         let ring = ring.into();
         let buf = ManuallyDrop::new(buf);
 
-        let prepare_fn = |sqe: &mut SysSqeRef| {
-            #[cfg(target_os = "redox")]
-            {
-                sqe.sys_pwrite(fd, offset, buf)
-            }
-            #[cfg(target_os = "linux")]
-            unsafe {
-                sqe.prep_write(fd, buf.borrow_guarded(), offset)
-            }
-        };
-
-        let cqe = unsafe {
-            self.send_with_ctx(
-                ring,
-                ctx,
-                prepare_fn
-            ).await?
-        };
-        let bytes_written = Self::completion_as_rw_io_result(cqe)?;
+        let bytes_written = unsafe { self.pwrite_unchecked(ring, ctx, fd, buf.borrow_guarded(), offset, flags).await? };
 
         Ok((bytes_written as usize, ManuallyDrop::into_inner(buf)))
     }
-    /// Write bytes to a specific offset, vectored. Does not change the file offset.
+
+    /// Write bytes to a specific offset, vectored, with an optional set of flags. Does not change
+    /// the file offset.
     ///
     /// At the moment there is no safe counterpart for this unchecked method, since this passes a
     /// list of buffers, rather than one single buffer.
@@ -2256,14 +2280,19 @@ impl Handle {
         fd: SysFd,
         bufs: &[IoVec],
         offset: u64,
+        flags: SysWriteFlags,
     ) -> Result<usize> {
+        #[cfg(target_os = "redox")]
+        let fd64 = u64::try_from(fd).map_err(|_| Error::new(EBADF))?;
+
         let prep_fn = move |sqe: &mut SysSqeRef| {
             #[cfg(target_os = "redox")]
             {
-                sqe.sys_pwritev(fd, bufs_unchecked, offset);
+                sqe.sys_pwritev(fd64, bufs, offset, flags);
             }
             #[cfg(target_os = "linux")]
             {
+                let _ = flags;
                 // TODO: Use the `ioslice` crate for safe casts. Otherwise, it will suffice
                 // to simply cast the slice unsafely, by reinterpreting its type. They must
                 // be valid since this is unsafe.
@@ -2274,6 +2303,7 @@ impl Handle {
                     )
                 };
 
+                // TODO: flags
                 sqe.prep_write_vectored(fd as SysFd, bufs_unchecked, offset);
             }
         };
@@ -2304,27 +2334,26 @@ impl Handle {
     /// data race.
     #[cfg(any(doc, target_os = "redox"))]
     #[doc(cfg(target_os = "redox"))]
-    pub async unsafe fn dup_unchecked<Id, P>(
+    pub async unsafe fn dup_unchecked<P>(
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
         fd: usize,
         flags: DupFlags,
-        param: Option<P>,
+        param: Option<&P>,
     ) -> Result<usize>
     where
-        P: AsOffsetLen,
+        P: AsOffsetLen + ?Sized,
     {
-        let (fd, _) = self
+        self
             .dup_unchecked_inner(
                 ring,
                 ctx,
                 fd,
                 flags,
-                param.map(Either::<_, GuardedPlaceholder>::Left),
+                param,
             )
-            .await?;
-        Ok(fd)
+            .await
     }
     /// "Duplicate" a file descriptor, returning a new one based on the old one.
     ///
@@ -2351,10 +2380,12 @@ impl Handle {
     where
         G: Guarded<Target = [u8]> + AsOffsetLen,
     {
-        unsafe {
-            self.dup_unchecked_inner(id, ctx, fd, flags, param.map(Either::<[u8; 0], _>::Right))
-                .await
-        }
+        let mut param = param.map(ManuallyDrop::new);
+        let fd = unsafe {
+            self.dup_unchecked_inner(id, ctx, fd, flags, param.as_deref())
+                .await?
+        };
+        Ok((fd, param.map(ManuallyDrop::into_inner)))
     }
     /// "Duplicate" a file descriptor, returning a new one based on the old one.
     ///
@@ -2381,62 +2412,48 @@ impl Handle {
                 ctx,
                 fd,
                 flags,
-                Option::<GuardedPlaceholder>::None,
+                Option::<&'static [u8]>::None,
             )
             .await?;
         Ok(fd)
     }
     #[cfg(target_os = "redox")]
-    async unsafe fn dup_unchecked_inner<P, G>(
+    async unsafe fn dup_unchecked_inner<B>(
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
         fd: usize,
         flags: DupFlags,
-        mut param: Option<Either<P, G>>,
-    ) -> Result<(usize, Option<G>)>
+        param: Option<&B>,
+    ) -> Result<SysFd>
     where
-        P: AsOffsetLen,
-        G: GuardableShared<DefaultSubmissionGuard, [u8]> + AsOffsetLen,
+        B: AsOffsetLen + ?Sized,
     {
         let ring = ring.into();
 
         let fd64 = u64::try_from(fd).or(Err(Error::new(EBADF)))?;
 
-        let slice = match param {
-            Some(Left(ref direct)) => Some(if ring.is_primary() {
-                direct
-                    .as_pointer_generic_slice()
-                    .ok_or(Error::new(EFAULT))?
-            } else {
-                direct.as_offset_generic_slice().ok_or(Error::new(EFAULT))?
-            }),
-            Some(Right(ref guardable)) => Some(if ring.is_primary() {
-                guardable
-                    .as_pointer_generic_slice()
-                    .ok_or(Error::new(EFAULT))?
-            } else {
-                guardable
-                    .as_offset_generic_slice()
-                    .ok_or(Error::new(EFAULT))?
-            }),
-            None => None,
+        let slice = param.map(|param| {
+            param
+                .as_offset_generic_slice()
+                .ok_or(Error::new(EFAULT))
+        }).transpose()?;
+
+        let prepare_fn = move |sqe: &mut SysSqeRef| {
+            sqe.sys_dup(fd64, flags, slice);
         };
 
-        let fut = self.send(
+        let fut = self.send_with_ctx(
             ring,
-            SqEntry64::new(ctx.sync().sqe_flags(), ctx.priority(), (-1i64) as u64)
-                .dup(fd64, flags, slice),
+            ctx,
+            prepare_fn,
         );
-        if let Some(Right(ref mut guardable)) = param {
-            fut.guard(guardable);
-        }
         let cqe = fut.await?;
 
         let res_fd = Error::demux64(cqe.status)?;
         let res_fd = usize::try_from(res_fd).or(Err(Error::new(EOVERFLOW)))?;
 
-        Ok((res_fd, param.and_then(|p| p.right())))
+        Ok(res_fd)
     }
 
     /// Create a memory map from an offset+len pair inside a file descriptor, with an optional hint
@@ -2457,6 +2474,7 @@ impl Handle {
     #[doc(cfg(target_os = "redox"))]
     pub async unsafe fn mmap2(
         &self,
+        // TODO: Simply function parameters with something like MmapInfo?
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
         fd: usize,
@@ -2474,18 +2492,22 @@ impl Handle {
         let addr_hint = addr_hint.unwrap_or(0);
         let addr_hint64 = u64::try_from(addr_hint).or(Err(Error::new(EOPNOTSUPP)))?;
 
+        let prep_fn = move |sqe: &mut SysSqeRef| {
+            sqe.sys_mmap(
+                fd64,
+                flags,
+                addr_hint64,
+                len64,
+                offset,
+            );
+        };
+
         let cqe = self
-            .send(
+            .send_with_ctx(
                 ring,
-                SqEntry64::new(ctx.sync().sqe_flags(), ctx.priority(), (-1i64) as u64).mmap(
-                    fd64,
-                    flags,
-                    addr_hint64,
-                    len64,
-                    offset,
-                ),
-            )
-            .await?;
+                ctx,
+                prep_fn,
+            ).await?;
 
         let pointer = Error::demux64(cqe.status)?;
         Ok(pointer as *const ())
@@ -2548,6 +2570,8 @@ impl Handle {
     }
     /// Accept a connection from a socket, without being able to get the address where the incoming
     /// connection originated from.
+    #[cfg(any(doc, target_os = "linux"))]
+    #[doc(cfg(target_os = "linux"))]
     pub async fn accept_simple(
         &self,
         ring: impl Into<RingId>,
@@ -2709,6 +2733,9 @@ trait AsOffsetLenExt: AsOffsetLen + private2::Sealed {
             self.as_offset_generic_slice()
         }
     }
+    fn slice(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.addr() as *const u8, self.len().unwrap().try_into().unwrap()) }
+    }
 }
 trait AsOffsetLenMutExt: AsOffsetLenMut + private2::Sealed {
     fn as_offset_generic_slice_mut(&mut self) -> Option<GenericSliceMut<'_>> {
@@ -2729,6 +2756,9 @@ trait AsOffsetLenMutExt: AsOffsetLenMut + private2::Sealed {
         } else {
             self.as_offset_generic_slice_mut()
         }
+    }
+    fn slice_mut(&mut self) -> &mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(self.addr() as *mut u8, self.len_mut().unwrap().try_into().unwrap()) }
     }
 }
 impl<T> AsOffsetLenExt for T where T: AsOffsetLen + ?Sized {}
@@ -2802,7 +2832,7 @@ fn nul_check(slice: &[u8]) {
 #[derive(Debug)]
 pub struct OpenInfo {
     #[cfg(target_os = "redox")]
-    inner: u64,
+    inner: (u64, OpenFlags),
 
     #[cfg(target_os = "linux")]
     inner: (iou::sqe::OFlag, iou::sqe::Mode),
@@ -2814,7 +2844,7 @@ impl OpenInfo {
     pub fn new() -> Self {
         Self {
             #[cfg(target_os = "redox")]
-            inner: 0,
+            inner: (0, OpenFlags::empty()),
 
             #[cfg(target_os = "linux")]
             inner: (iou::sqe::OFlag::O_CLOEXEC, iou::sqe::Mode::empty()),
