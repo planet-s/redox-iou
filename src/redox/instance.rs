@@ -11,13 +11,10 @@ mod consumer_instance {
     use syscall::flag::{O_CLOEXEC, O_CREAT, O_RDWR};
 
     use syscall::io_uring::v1::{
-        CqEntry32, CqEntry64, IoUringCreateFlags, Ring, SqEntry32, SqEntry64,
-    };
-    use syscall::io_uring::v1::{
+        BrokenRing, CqEntry32, CqEntry64, IoUringCreateFlags, Ring, SqEntry32, SqEntry64,
         CQ_ENTRIES_MMAP_OFFSET, CQ_HEADER_MMAP_OFFSET, SQ_ENTRIES_MMAP_OFFSET,
-        SQ_HEADER_MMAP_OFFSET,
+        SQ_HEADER_MMAP_OFFSET, CURRENT_MINOR, CURRENT_PATCH,
     };
-    use syscall::io_uring::v1::{CURRENT_MINOR, CURRENT_PATCH};
     use syscall::io_uring::{IoUringCreateInfo, IoUringEnterFlags, IoUringVersion};
 
     use crate::redox::ring::{SpscReceiver, SpscSender};
@@ -629,12 +626,15 @@ mod consumer_instance {
                 _ => None,
             }
         }
+        /// Notify ourselves (the sender) that new entries can be pushed, by pretending that
+        /// entries have been popped.
         pub fn notify_self_about_pop(&self) {
             match self {
                 Self::Bits32(ref sender32) => sender32.notify_self_about_pop(),
                 Self::Bits64(ref sender64) => sender64.notify_self_about_pop(),
             }
         }
+        /// Notify the receiver that new entries have been pushed.
         pub fn notify_about_push(&self) {
             match self {
                 Self::Bits32(ref sender32) => sender32.notify_about_push(),
@@ -694,13 +694,16 @@ mod consumer_instance {
                 _ => None,
             }
         }
+        /// Notify to ourselves (the receiver) that there are new entries, by pretending that a
+        /// push has occured when it has not.
         pub fn notify_self_about_push(&self) {
             match self {
                 Self::Bits32(ref sender32) => sender32.notify_self_about_push(),
                 Self::Bits64(ref sender64) => sender64.notify_self_about_push(),
             }
         }
-        pub fn notify_self_pop(&self) {
+        /// Notify the other side of the ring, that this receives has popped entries.
+        pub fn notify_about_pop(&self) {
             match self {
                 Self::Bits32(ref sender32) => sender32.notify_about_pop(),
                 Self::Bits64(ref sender64) => sender64.notify_about_pop(),
@@ -783,34 +786,34 @@ mod consumer_instance {
 
         /// Retrieve the number of free SQEs, that can be _pushed_.
         #[inline]
-        pub fn sq_free_entry_count(&self) -> Result<usize> {
+        pub fn sq_free_entry_count(&self) -> Result<usize, BrokenRing> {
             match &*self.sender.read() {
-                GenericSender::Bits32(ref sender) => sender.free_entry_count().map_err(|BrokenRing| Error::new(EIO)),
-                GenericSender::Bits64(ref sender) => sender.free_entry_count().map_err(|BrokenRing| Error::new(EIO)),
+                GenericSender::Bits32(ref sender) => sender.free_entry_count(),
+                GenericSender::Bits64(ref sender) => sender.free_entry_count(),
             }
         }
         /// Retrieve the number of free SQEs, that can be _popped_.
         #[inline]
-        pub fn sq_available_entry_count(&self) -> Result<usize> {
+        pub fn sq_available_entry_count(&self) -> Result<usize, BrokenRing> {
             match &*self.sender.read() {
-                GenericSender::Bits32(ref sender) => sender.available_entry_count().map_err(|BrokenRing| Error::new(EIO)),
-                GenericSender::Bits64(ref sender) => sender.available_entry_count().map_err(|BrokenRing| Error::new(EIO)),
+                GenericSender::Bits32(ref sender) => sender.available_entry_count(),
+                GenericSender::Bits64(ref sender) => sender.available_entry_count(),
             }
         }
         /// Retrieve the number of free CQEs, that can be _pushed_.
         #[inline]
-        pub fn cq_free_entry_count(&self) -> Result<usize> {
+        pub fn cq_free_entry_count(&self) -> Result<usize, BrokenRing> {
             match &*self.receiver.read() {
-                GenericReceiver::Bits32(ref receiver) => receiver.free_entry_count().map_err(|BrokenRing| Error::new(EIO)),
-                GenericReceiver::Bits64(ref receiver) => receiver.free_entry_count().map_err(|BrokenRing| Error::new(EIO)),
+                GenericReceiver::Bits32(ref receiver) => receiver.free_entry_count(),
+                GenericReceiver::Bits64(ref receiver) => receiver.free_entry_count(),
             }
         }
         /// Retrieve the number of available CQEs, that can be _popped_.
         #[inline]
-        pub fn cq_available_entry_count(&self) -> Result<usize> {
+        pub fn cq_available_entry_count(&self) -> Result<usize, BrokenRing> {
             match &*self.receiver.read() {
-                GenericReceiver::Bits32(ref receiver) => receiver.available_entry_count().map_err(|BrokenRing| Error::new(EIO)),
-                GenericReceiver::Bits64(ref receiver) => receiver.available_entry_count().map_err(|BrokenRing| Error::new(EIO)),
+                GenericReceiver::Bits32(ref receiver) => receiver.available_entry_count(),
+                GenericReceiver::Bits64(ref receiver) => receiver.available_entry_count(),
             }
         }
     }

@@ -176,20 +176,18 @@ impl<T> SpscSender<T> {
     ///
     /// This is fallible, and an error is returned if the ring is no longer in a correct state.
     #[inline]
-    pub fn free_entry_count(&self) -> Result<usize> {
+    pub fn free_entry_count(&self) -> Result<usize, BrokenRing> {
         unsafe {
             self.ring_header()
                 .available_entry_count(self.log2_entry_count as usize)
-                .map_err(|_| Error::new(EIO))
         }
     }
     /// Get the number of available entry slots for the other side of the ring, to pop from.
     #[inline]
-    pub fn available_entry_count(&self) -> Result<usize> {
+    pub fn available_entry_count(&self) -> Result<usize, BrokenRing> {
         unsafe {
             self.ring_header()
                 .available_entry_count(self.log2_entry_count as usize)
-                .map_err(|_| Error::new(EIO))
         }
     }
 }

@@ -29,8 +29,8 @@ use syscall::error::{
 use syscall::flag::{EventFlags, MapFlags};
 use syscall::io_uring::v1::operation::{CloseFlags, DupFlags, OpenFlags, ReadFlags, RegisterEventsFlags, WriteFlags};
 use syscall::io_uring::v1::{
-    CqEntry64, IoUringCqeFlags, IoUringSqeFlags, Priority, RingPopError, RingPushError, SqEntry64,
-    StandardOpcode,
+    BrokenRing, CqEntry64, IoUringCqeFlags, IoUringSqeFlags, Priority, RingPopError, RingPushError,
+    SqEntry64, StandardOpcode,
 };
 use syscall::io_uring::{GenericSlice, GenericSliceMut, IoUringEnterFlags};
 
@@ -442,6 +442,7 @@ impl From<RingIdKind> for RingId {
     }
 }
 
+/// A reference with lifetime `'ring` to the system type for Submission Queue Entries.
 #[cfg(target_os = "redox")]
 pub type SysSqeRef<'ring> = &'ring mut SqEntry64;
 #[cfg(target_os = "linux")]
@@ -449,6 +450,7 @@ pub type SysSqeRef<'ring> = &'ring mut SqEntry64;
 /// current platform.
 pub type SysSqeRef<'ring> = iou::SQE<'ring>;
 
+/// The system Completion Queue Entry type.
 #[cfg(target_os = "redox")]
 pub type SysCqe = CqEntry64;
 #[cfg(target_os = "linux")]
@@ -458,6 +460,7 @@ pub type SysCqe = iou::CQE;
 #[cfg(target_os = "linux")]
 /// The system file descriptor type.
 pub type SysFd = std::os::unix::io::RawFd;
+/// The system file descriptor type. On redox, this is `usize`.
 #[cfg(target_os = "redox")]
 pub type SysFd = usize;
 
@@ -832,7 +835,9 @@ impl Reactor {
         #[cfg(target_os = "redox")]
         {
             let num_completed = if wait {
-                let sq_free_entry_count = instance.consumer_instance.sq_free_entry_count()?;
+                let sq_free_entry_count = instance.consumer_instance
+                    .sq_free_entry_count()
+                    .map_err(|BrokenRing| Error::new(EIO))?;
 
                 let flags = if sq_free_entry_count > 0 {
                     IoUringEnterFlags::empty()
