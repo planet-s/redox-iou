@@ -848,6 +848,9 @@ impl Reactor {
         }
     }
     fn drive_handle_cqe(&self, primary: bool, trusted: bool, cqe: SysCqe, waker: &task::Waker) {
+        #[cfg(target_os = "linux")]
+        let _primary = primary;
+
         log::debug!("Received CQE: {:?}", cqe);
         #[cfg(target_os = "redox")]
         if IoUringCqeFlags::from_bits_truncate((cqe.flags & 0xFF) as u8)
@@ -1194,6 +1197,26 @@ impl Handle {
         .left()
         .expect("send_inner() must return CommandFuture if is_stream is set to false")
     }
+    /// Shorthand for send(), but where the submission context is applied to the preparation
+    /// function, before calling the inner.
+    pub unsafe fn send_with_ctx<F>(&self, ring: impl Into<RingId>, _ctx: SubmissionContext, prepare_sqe: F) -> CommandFuture<impl FnOnce(&mut SysSqeRef)>
+    where
+        F: for<'ring, 'tmp> FnOnce(&'tmp mut SysSqeRef<'ring>)
+    {
+        let prepare_sqe_wrapper = move |sqe: &mut SysSqeRef| {
+            #[cfg(target_os = "redox")]
+            {
+                sqe.base(ctx.sync().sqe_flags(), ctx.priority(), (-1i64) as u64)
+            }
+            #[cfg(target_os = "linux")]
+            {
+            }
+
+            prepare_sqe(sqe)
+        };
+
+        self.send(ring, prepare_sqe_wrapper)
+    }
 
     unsafe fn send_inner<F>(
         &self,
@@ -1500,16 +1523,15 @@ impl Handle {
         B: AsOffsetLen + ?Sized,
     {
         let ring = ring.into();
+        #[cfg(target_os = "redox")]
+        let at_fd64 = at.map(|at_fd| u64::try_from(at_fd)).transpose()?;
 
         let reference = path.as_generic_slice(ring.is_primary()).ok_or(Error::new(EFAULT))?;
 
-        let prepare_fn = |mut sqe: &mut SysSqeRef| {
+        let prepare_fn = |sqe: &mut SysSqeRef| {
             #[cfg(target_os = "redox")]
             {
-                let sqe = sqe.base(ctx.sync().sqe_flags(), ctx.priority(), (-1i64) as u64);
-
-                if let Some(at_fd) = at {
-                    let fd64 = u64::try_from(at_fd)?;
+                if let Some(fd64) = at_fd64 {
                     sqe_base.open_at(fd64, reference, flags)
                 } else {
                     sqe_base.open(reference, flags)
@@ -1532,7 +1554,7 @@ impl Handle {
             }
         };
 
-        let cqe = self.send(ring, prepare_fn).await?;
+        let cqe = self.send_with_ctx(ring, ctx, prepare_fn).await?;
 
         let fd = Self::completion_as_rw_io_result(cqe)?;
         Ok(fd as SysFd)
@@ -1695,19 +1717,22 @@ impl Handle {
         fd: SysFd,
         flush: bool,
     ) -> Result<()> {
+        #[cfg(target_os = "redox")]
+        let fd64 = fd.try_into().map_err(|_| Error::new(EBADF))?;
+
         let prepare_fn = |sqe: &mut SysSqeRef| {
             #[cfg(target_os = "redox")]
             {
-                sqe.base(ctx.sync().sqe_flags(), ctx.priority(), (-1i64) as u64)
-                    .close(fd.try_into().or(Err(Error::new(EOVERFLOW)))?, flush)
+                sqe.close(fd64, flush)
             }
             #[cfg(target_os = "linux")]
             {
                 // TODO: flush
+                let _flush = flush;
                 sqe.prep_close(fd)
             }
         };
-        let cqe = self.send(ring, prepare_fn).await?;
+        let cqe = self.send_with_ctx(ring, ctx, prepare_fn).await?;
 
         Self::completion_as_rw_io_result(cqe)?;
 
@@ -1890,8 +1915,9 @@ impl Handle {
         let ring = ring.into();
 
         let cqe = self
-            .send(
+            .send_with_ctx(
                 ring,
+                ctx,
                 |sqe: &mut SysSqeRef| {
                     #[cfg(target_os = "redox")]
                     let buf = buf
@@ -1947,8 +1973,9 @@ impl Handle {
         };
 
         let cqe = unsafe {
-            self.send(
+            self.send_with_ctx(
                 ring,
+                ctx,
                 prepare_fn,
             )
             .await?
@@ -1992,8 +2019,9 @@ impl Handle {
             }
         };
         let cqe = self
-            .send(
+            .send_with_ctx(
                 ring,
+                ctx,
                 prepare_fn,
             )
             .await?;
@@ -2156,8 +2184,9 @@ impl Handle {
 
         let cqe = {
             self
-            .send(
+            .send_with_ctx(
                 ring,
+                ctx,
                 prepare_fn,
             ).await?
         };
@@ -2201,8 +2230,9 @@ impl Handle {
         };
 
         let cqe = unsafe {
-            self.send(
+            self.send_with_ctx(
                 ring,
+                ctx,
                 prepare_fn
             ).await?
         };
@@ -2249,8 +2279,9 @@ impl Handle {
         };
 
         let cqe = self
-            .send(
+            .send_with_ctx(
                 ring,
+                ctx,
                 prep_fn,
             )
             .await?;

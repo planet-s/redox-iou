@@ -177,6 +177,8 @@ fn try_submit(
     }
     #[cfg(target_os = "linux")]
     {
+        let _ = sqe;
+
         if is_stream {
             todo!();
         //state.inner = StateInner::ReceivingMulti(VecDeque::new(), cx.waker().clone());
