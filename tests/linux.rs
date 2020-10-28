@@ -49,6 +49,7 @@ fn basic_file_io() -> Result<(), Box<dyn Error + 'static>> {
                 fd,
                 guarded_buffer,
                 0,
+                (),
             )
             .await?;
 
@@ -64,7 +65,7 @@ fn basic_file_io() -> Result<(), Box<dyn Error + 'static>> {
                     ring,
                     SubmissionContext::new().with_sync(SubmissionSync::Drain),
                     fd,
-                    false,
+                    (),
                 )
                 .await?;
         }
