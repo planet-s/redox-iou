@@ -115,7 +115,7 @@ fn try_submit(
 
     prepare(&mut sqe);
 
-    let mut sqe = match user_data {
+    let sqe = match user_data {
         Left(state_weak) => match (Weak::into_raw(state_weak) as usize).try_into() {
             Ok(ptr64) => {
                 #[cfg(target_os = "redox")]

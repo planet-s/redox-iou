@@ -3,7 +3,7 @@ extern crate redox_iou;
 use std::error::Error;
 use std::sync::Arc;
 
-use guard_trait::Guarded;
+use guard_trait::GuardedMutExt;
 
 use redox_iou::executor::Executor;
 use redox_iou::reactor::{OpenInfo, ReactorBuilder, SubmissionContext, SubmissionSync};
@@ -31,18 +31,16 @@ fn basic_file_io() -> Result<(), Box<dyn Error + 'static>> {
     executor.run(async move {
         // TODO: IntoGuardable trait?
         let (fd, _) = handle
-            .open_at(
+            .open(
                 ring,
                 SubmissionContext::default(),
-                Guarded::wrap_static_slice(&b"assets/test.txt\0"[..]),
+                &b"assets/test.txt\0"[..],
                 OpenInfo::new(),
-                libc::AT_FDCWD,
             )
             .await?;
 
         let buffer = vec![0u8; 4096];
-        let guarded_buffer = Guarded::new(buffer)
-            .try_map_mut(|buffer| Result::<_, std::convert::Infallible>::Ok(&mut buffer[..165]))?;
+        let guarded_buffer = GuardedMutExt::map_mut(buffer, |buffer| &mut buffer[..165]);
 
         let (bytes_read, guarded_buffer) = handle
             .pread(
@@ -54,7 +52,7 @@ fn basic_file_io() -> Result<(), Box<dyn Error + 'static>> {
             )
             .await?;
 
-        let (_buffer, _) = guarded_buffer.into_unmapped().try_into_inner().unwrap();
+        let _buffer = guarded_buffer.into_original();
 
         assert_eq!(bytes_read, 165);
 

@@ -12,7 +12,7 @@ use syscall::io_uring::v1::{PoolFdEntry, Priority};
 
 use parking_lot::Mutex;
 
-pub use guard_trait::{Guardable, GuardableExclusive, GuardableShared, Guarded};
+pub use guard_trait::{Guarded, GuardedMut};
 
 pub use redox_buffer_pool as pool;
 
@@ -32,7 +32,7 @@ pub type BufferSlice<
     'pool,
     I = u32,
     E = BufferPoolHandle,
-    G = CommandFutureGuard,
+    G = pool::marker::Guard,
     H = BufferPoolHandle,
     C = BufferPool<I, H, E>,
 > = pool::BufferSlice<'pool, I, H, E, G, C>;
@@ -92,39 +92,6 @@ impl BufferPoolHandle {
     }
 }
 
-impl<F> CommandFuture<F> {
-    /// Protect a slice with a future guard, preventing the memory from being reclaimed until the
-    /// future has completed. This will cause the buffer slice to leak memory if dropped too early,
-    /// but prevents undefined behavior.
-    pub fn guard<G, T>(&self, slice: &mut G)
-    where
-        G: Guardable<CommandFutureGuard, T>,
-        T: ?Sized,
-    {
-        let guard_inner = match self.inner.repr {
-            CommandFutureRepr::Direct(ref state) => Arc::clone(state),
-            CommandFutureRepr::Tagged(tag) => {
-                if let Some(reactor) = self.inner.reactor.upgrade() {
-                    if let Some(state) = reactor.tag_map.read().get(&tag) {
-                        Arc::clone(state)
-                    } else {
-                        return;
-                    }
-                } else {
-                    return;
-                }
-            }
-        };
-        let epoch = guard_inner.lock().epoch;
-        let guard = CommandFutureGuard {
-            inner: guard_inner,
-            epoch,
-        };
-        slice
-            .try_guard(guard)
-            .expect("cannot guard using future: another guard already present");
-    }
-}
 impl Handle {
     #[cfg(target_os = "redox")]
     async fn create_buffer_pool_inner<I, E>(
@@ -323,39 +290,25 @@ pub async fn import<I: pool::Integer + TryFrom<u64> + TryInto<usize>>(
     Ok(additional_bytes)
 }
 
+// TODO: This should also exist on Linux.
+#[cfg(target_os = "redox")]
 unsafe fn expand_blocking<I: TryInto<usize>>(
     fd: usize,
     offset: I,
     len: usize,
     map_flags: MapFlags,
 ) -> Result<*mut u8> {
-    syscall::fmap(
-        fd,
-        &Mmap {
-            address: 0, // unused
-            offset: offset.try_into().or(Err(Error::new(EOVERFLOW)))?,
-            size: len,
-            flags: map_flags,
-        },
-    )
-    .map(|addr| addr as *mut u8)
-}
-
-/// A guard type that protects a buffer until a future has been canceled (and the cancel has been
-/// acknowledged by the producer), or finished.
-#[derive(Debug)]
-pub struct CommandFutureGuard {
-    inner: Arc<Mutex<CommandFutureState>>,
-    epoch: usize,
-}
-impl guard_trait::Guard for CommandFutureGuard {
-    fn try_release(&mut self) -> bool {
-        let state_guard = self.inner.lock();
-
-        // Only allow reclaiming buffer slices when their guarded future has actually
-        // completed, or if the epoch has been increment, meaning that the reactor has started
-        // using the state for something else.
-        state_guard.epoch != self.epoch
-            || matches!(state_guard.inner, CommandFutureStateInner::Cancelled | CommandFutureStateInner::Completed(_))
+    #[cfg(target_os = "redox")]
+    {
+        syscall::fmap(
+            fd,
+            &Mmap {
+                address: 0, // unused
+                offset: offset.try_into().or(Err(Error::new(EOVERFLOW)))?,
+                size: len,
+                flags: map_flags,
+            },
+        )
+        .map(|addr| addr as *mut u8)
     }
 }

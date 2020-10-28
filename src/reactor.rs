@@ -13,6 +13,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::{TryFrom, TryInto};
 use std::num::NonZeroUsize;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::sync::atomic::{self, AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::{ops, task};
@@ -62,12 +63,7 @@ use crate::redox::instance::ProducerInstance;
 #[cfg(any(doc, target_os = "linux"))]
 use crate::linux::ConsumerInstance;
 
-use crate::memory::{Guardable, GuardableExclusive, GuardableShared, Guarded};
-
-pub use redox_buffer_pool::NoGuard;
-
-type GuardedPlaceholder =
-    Guarded<DefaultSubmissionGuard, &'static [u8], guard_trait::marker::Shared>;
+use crate::memory::{Guarded, GuardedMut};
 
 /// A unique ID that every reactor gets upon initialization.
 ///
@@ -155,16 +151,17 @@ pub(crate) struct ProducerInstanceWrapper {
     stream_state: Option<Arc<Mutex<ProducerSqesState>>>,
     dropped: AtomicBool,
 }
+#[cfg(target_os = "redox")]
 #[derive(Debug)]
 pub(crate) enum SecondaryInstanceWrapper {
     // Since this is a secondary instance, a userspace-to-userspace consumer.
     ConsumerInstance(ConsumerInstanceWrapper),
 
-    #[cfg(target_os = "redox")]
     // Either a kernel-to-userspace producer, or a userspace-to-userspace producer.
     ProducerInstance(ProducerInstanceWrapper),
 }
 
+#[cfg(target_os = "redox")]
 impl SecondaryInstanceWrapper {
     pub(crate) fn as_consumer_instance(&self) -> Option<&ConsumerInstanceWrapper> {
         match self {
@@ -183,6 +180,7 @@ impl SecondaryInstanceWrapper {
     }
 }
 
+#[cfg(target_os = "redox")]
 #[derive(Debug)]
 pub(crate) struct SecondaryInstancesWrapper {
     pub(crate) instances: Vec<SecondaryInstanceWrapper>,
@@ -462,6 +460,20 @@ pub type SysFd = std::os::unix::io::RawFd;
 #[cfg(target_os = "redox")]
 pub type SysFd = usize;
 
+/// The return value in CQEs. On Redox, this is `usize`.
+#[cfg(target_os = "redox")]
+pub type SysRetval = usize;
+/// The return value in CQEs. On Linux, this is `i32`.
+#[cfg(target_os = "linux")]
+pub type SysRetval = i32;
+
+/// The system type for I/O vectors.
+#[cfg(target_os = "redox")]
+pub type SysIoVec = IoVec;
+/// The system type for I/O vectors.
+#[cfg(target_os = "linux")]
+pub type SysIoVec = libc::iovec;
+
 /// A builder that configures the reactor.
 #[derive(Debug)]
 pub struct ReactorBuilder {
@@ -523,7 +535,7 @@ impl ReactorBuilder {
     /// Add a primary instance to the reactor. Whether this is to be marked _trusted_ is determined
     /// based on platform (Linux is a monolithic kernel and thus only has the kernel as producer),
     /// and the type of the instance.
-    pub fn with_primary_instance(mut self, primary_instance: ConsumerInstance) -> Self {
+    pub fn with_primary_instance(self, primary_instance: ConsumerInstance) -> Self {
         #[cfg(target_os = "redox")]
         let trust = primary_instance.is_attached_to_kernel();
 
@@ -1141,21 +1153,6 @@ impl SubmissionContext {
     }
 }
 
-pub use crate::memory::CommandFutureGuard as DefaultSubmissionGuard;
-
-mod private {
-    pub trait Sealed {}
-}
-
-/// A trait for allowed submission guard types, restricted to either `NoGuard` and
-/// [`DefaultSubmissionGuard`].
-pub trait SubmissionGuard: private::Sealed + redox_buffer_pool::Guard {}
-
-impl private::Sealed for redox_buffer_pool::NoGuard {}
-impl private::Sealed for DefaultSubmissionGuard {}
-impl SubmissionGuard for redox_buffer_pool::NoGuard {}
-impl SubmissionGuard for DefaultSubmissionGuard {}
-
 /// A handle to the reactor, used for creating futures.
 #[derive(Clone, Debug)]
 pub struct Handle {
@@ -1190,51 +1187,21 @@ impl Handle {
     where
         F: for<'ring, 'tmp> FnOnce(&'tmp mut SysSqeRef<'ring>),
     {
-        type PlaceholderGuardable =
-            Guarded<DefaultSubmissionGuard, Vec<u8>, guard_trait::marker::Exclusive>;
-        type PlaceholderConstructorFn<F> = Box<dyn FnOnce(PlaceholderGuardable) -> F>;
-
         self.send_inner(
             ring,
-            SendArg::<F, PlaceholderGuardable, PlaceholderConstructorFn<F>>::Unguarded(prepare_sqe),
+            SendArg::<F>::Single(prepare_sqe),
         )
         .left()
         .expect("send_inner() must return CommandFuture if is_stream is set to false")
     }
 
-    /// Get a which which represents submitting a command, and then waiting for it to complete.
-    /// Unlike [`send`], this will also protect a guardable, using the future as the guard.
-    ///
-    /// # Safety
-    ///
-    /// Refer to [`send`] for safety invariants.
-    ///
-    /// [`send`]: #method.send
-    pub unsafe fn send_and_protect<F, H, G, T>(
+    unsafe fn send_inner<F>(
         &self,
         ring: impl Into<RingId>,
-        prep_fn_constructor: F,
-        guardable: G,
-    ) -> CommandFuture<H>
-    where
-        F: FnOnce(G) -> H,
-        H: for<'ring, 'tmp> FnOnce(&'tmp mut SysSqeRef<'ring>),
-        G: Guardable<DefaultSubmissionGuard, T>,
-        T: ?Sized,
-    {
-        self.send_inner(ring, SendArg::Guarded(guardable, prep_fn_constructor))
-            .left()
-            .expect("send_inner() must return CommandFuture if is_stream is set to false")
-    }
-    unsafe fn send_inner<F, G, C, T>(
-        &self,
-        ring: impl Into<RingId>,
-        send_arg: SendArg<F, G, C>,
+        send_arg: SendArg<F>,
     ) -> Either<CommandFuture<F>, FdEvents>
     where
-        G: Guardable<DefaultSubmissionGuard, T>,
-        C: FnOnce(G) -> F,
-        T: ?Sized,
+        F: for<'ring, 'tmp> FnOnce(&'tmp mut SysSqeRef<'ring>),
     {
         let ring = ring.into();
 
@@ -1321,23 +1288,19 @@ impl Handle {
         };
 
         match send_arg {
+            #[cfg(target_os = "redox")]
             SendArg::Stream(initial) => Right(FdEvents {
                 inner,
                 initial: Some(initial),
             }),
-            SendArg::Unguarded(prepare_sqe) => Left(CommandFuture {
-                inner,
-                prepare_fn: Some(prepare_sqe),
-            }),
-            SendArg::Guarded(mut guardable, prep_fn_constructor) => {
-                let mut invalid_future = CommandFuture {
+            SendArg::Single(prep_fn) => {
+                let mut future = CommandFuture {
                     inner,
                     prepare_fn: None,
                 };
-                invalid_future.guard(&mut guardable);
-                invalid_future.prepare_fn = Some(prep_fn_constructor(guardable));
+                future.prepare_fn = Some(prep_fn);
 
-                Left(invalid_future)
+                Left(future)
             }
         }
     }
@@ -1487,7 +1450,7 @@ impl Handle {
             .expect("send_inner must return Right if is_stream is set to true")
     }
 
-    fn completion_as_rw_io_result(cqe: SysCqe) -> Result<usize> {
+    fn completion_as_rw_io_result(cqe: SysCqe) -> Result<SysRetval> {
         // reinterpret the status as signed, to take an errors into account.
         #[cfg(target_os = "redox")]
         let signed = cqe.status as i64;
@@ -1503,7 +1466,7 @@ impl Handle {
                 #[cfg(target_os = "linux")]
                 {
                     if s >= 0 {
-                        Ok(s as usize)
+                        Ok(s as i32)
                     } else {
                         // TODO: Cross-platform error type.
                         Err(Error::new(s as i32))
@@ -1516,101 +1479,30 @@ impl Handle {
                     let trunc =
                         std::cmp::min(isize::max_value() as u64, actual_bytes_read) as usize;
                     log::warn!("Truncating the number of bytes/written read as it could not fit usize, from {} to {}", signed, trunc);
+                    #[cfg(target_os = "redox")]
                     return Ok(trunc as usize);
+                    #[cfg(target_os = "linux")]
+                    return Ok(trunc as i32);
                 }
                 Err(Error::new(EOVERFLOW))
             }
         }
     }
-    #[inline]
-    async unsafe fn rw_io<'buf, F, B, G, H>(
-        &self,
-        ring: impl Into<RingId>,
-        context: SubmissionContext,
-        fd: SysFd,
-        f: F,
-        buf: Either<B, G>,
-    ) -> Result<(usize, Option<G>)>
-    where
-        F: FnOnce(SysFd, Either<B, &mut G>) -> Result<H>,
-        G: crate::memory::Guardable<DefaultSubmissionGuard, [u8]>,
-        H: Unpin + for<'ring, 'tmp> FnOnce(&'tmp mut SysSqeRef<'ring>),
-    {
-        let mut guardable = None;
-
-        let h = match buf {
-            Left(b) => f(fd, Left(b))?,
-            Right(g) => {
-                guardable = Some(g);
-                f(fd, Right(guardable.as_mut().unwrap()))?
-            }
-        };
-
-        let prepare_fn = |sqe: &mut SysSqeRef| {
-            #[cfg(target_os = "redox")]
-            {
-                let fd: u64 = fd.try_into().or(Err(Error::new(EOVERFLOW)))?;
-
-                let sqe = sqe.base(
-                    context.sync().redox_sqe_flags(),
-                    context.priority(),
-                    (-1i64) as u64,
-                );
-                h(sqe);
-            }
-
-            #[cfg(target_os = "linux")]
-            {
-                // TODO: ioprio on Linux; library support appears to be low
-
-                sqe.overwrite_flags(context.sync.linux_sqe_flags());
-
-                h(sqe);
-            }
-        };
-
-        let fut = self.send(ring, prepare_fn);
-
-        if let Some(guardable) = guardable.as_mut() {
-            fut.guard(guardable);
-        }
-
-        let cqe = fut.await?;
-        let result = Self::completion_as_rw_io_result(cqe)?;
-
-        Ok((result, guardable))
-    }
-    async unsafe fn open_raw_unchecked_inner<B, G>(
+    async unsafe fn open_raw_unchecked_inner<B>(
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
-        path: Either<&B, G>,
+        path: &B,
         info: OpenInfo,
         at: Option<SysFd>,
-    ) -> Result<(SysFd, Option<G>)>
+    ) -> Result<SysFd>
     where
         B: AsOffsetLen + ?Sized,
-        G: Guardable<DefaultSubmissionGuard, [u8]> + AsOffsetLen,
     {
         let ring = ring.into();
 
-        let mut guardable = None;
+        let reference = path.as_generic_slice(ring.is_primary()).ok_or(Error::new(EFAULT))?;
 
-        let reference = match path {
-            Left(r) => r
-                .as_generic_slice(ring.is_primary())
-                .ok_or(Error::new(EFAULT))?
-                .as_static(),
-            Right(r) => {
-                guardable = Some(r);
-                guardable
-                    .as_ref()
-                    .unwrap()
-                    .as_generic_slice(ring.is_primary())
-                    .ok_or(Error::new(EFAULT))?
-                    .as_static()
-            }
-        };
         let prepare_fn = |mut sqe: &mut SysSqeRef| {
             #[cfg(target_os = "redox")]
             {
@@ -1636,18 +1528,14 @@ impl Handle {
                 nul_check(slice);
 
                 let cstr = std::ffi::CStr::from_bytes_with_nul_unchecked(slice);
-                sqe.prep_openat(at.unwrap(), cstr, flags, mode)
+                sqe.prep_openat(at.unwrap_or(libc::AT_FDCWD), cstr, flags, mode)
             }
         };
 
-        let fut = self.send(ring, prepare_fn);
-        if let Some(ref mut guardable) = guardable {
-            fut.guard(guardable);
-        }
-        let cqe = fut.await?;
+        let cqe = self.send(ring, prepare_fn).await?;
 
         let fd = Self::completion_as_rw_io_result(cqe)?;
-        Ok((fd as SysFd, guardable))
+        Ok(fd as SysFd)
     }
 
     /// Open a path represented by a byte slice (NUL-terminated on Linux), returning a new file
@@ -1655,19 +1543,12 @@ impl Handle {
     ///
     /// # Safety
     ///
-    /// For this to be safe, the memory range that provides the path, must not be reclaimed until
-    /// the future is complete. This means that one must make sure, that between all await yield
-    /// points in the future invoking this function, the path cannot be reclaimed and used for
-    /// something else. As a general recommendation, only use this together with a
-    /// [`std::mem::ManuallyDrop`], or with references which lifetimes you otherwise know will outlive
-    /// the entire submission.
-    ///
-    /// ## Platform-specific invariants
-    ///
     /// An additional safety invariant is that on Linux, the buffer passed to the system call,
     /// _must_ be NUL-terminated, as the open(2), openat(2) and even openat2(2) all take a pointer
     /// to a NUL-terminated string (somehow). Since Rust does the right thing and also stores the
     /// length of all dynamically-sized data, this is checked _when debug assertions are enabled_.
+    ///
+    /// This invariant has no effect on Redox, which passes the length of the path to open.
     ///
     /// It is highly recommended that the regular [`open_at`] call be used instead, which takes
     /// care of guarding the memory until completion.
@@ -1679,135 +1560,117 @@ impl Handle {
         ctx: SubmissionContext,
         path: &B,
         info: OpenInfo,
-        at: SysFd,
+        at: Option<SysFd>,
     ) -> Result<SysFd>
     where
         B: AsOffsetLen + ?Sized,
     {
         let ring = ring.into();
 
-        let (fd, _) = self
+        self
             .open_raw_unchecked_inner(
                 ring,
                 ctx,
-                Either::<&B, GuardedPlaceholder>::Left(path),
+                path,
                 info,
-                Some(at),
+                at,
             )
-            .await?;
-        Ok(fd)
+            .await
     }
 
-    #[cfg(any(doc, target_os = "redox"))]
-    #[doc(cfg(target_os = "redox"))]
     /// Open a file in a similar way to how [`open_unchecked_at`] works, but without the need to
     /// specify a file descriptor to initially search from, with `/` being the default.
     ///
-    /// This is Redox-only, since Linux only has `IORING_OP_OPENAT`, which always requires a file
-    /// descriptor. For maximum portability, prefer to manually open a file descriptor for the root
-    /// directory, and using that fd.
-    ///
     /// # Safety
     ///
-    /// This being safe relies on the runtime lifetime invariant, meaning that the buffer stays in
-    /// memory until the future has completed, or successfully been cancelled.
-    // TODO: Support Linux, by using AT_FDCWD.
+    /// On Linux, this method will skip the check that the last byte of the path needs to be the
+    /// NUL character.
     pub async unsafe fn open_unchecked<B>(
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
         path: &B,
         info: OpenInfo,
-        at: Option<SysFd>,
-    ) -> Result<usize>
+    ) -> Result<SysFd>
     where
         B: AsOffsetLen + ?Sized,
     {
         let ring = ring.into();
 
-        let (fd, _) = self
+        self
             .open_raw_unchecked_inner(
                 ring,
                 ctx,
-                Either::<&B, GuardedPlaceholder>::Left(path),
+                path,
                 info,
-                at,
+                None,
             )
-            .await?;
-        Ok(fd)
+            .await
     }
 
     /// Open a path represented by a byte slice, returning a new file descriptor for the file at
     /// that path.
     ///
     /// This is the safe version of [`open_unchecked`], but requires the path type to implement
-    /// [`Guardable`], which only applies for [`Guarded`] types on the heap, or static references.
-    /// An optional `at` argument can also be specified, which will base the path on an open file
+    /// [`Guarded`], which only applies for owned pointers on the heap, or static references.  An
+    /// optional `at` argument can also be specified, which will base the path on an open file
     /// descriptor of a directory, similar to _openat(2)_.
     ///
     /// [`open_unchecked`]: #method.open_unchecked
     /// [`Guarded`]: ../memory/struct.Guarded.html
     /// [`Guardable`]: ../memory/trait.Guardable.html
-    pub async fn open_at<G>(
+    pub async fn open_at<B>(
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
-        path: G,
+        path_buf: B,
         info: OpenInfo,
-        at: SysFd,
-    ) -> Result<(SysFd, G)>
+        at: Option<SysFd>,
+    ) -> Result<(SysFd, B)>
     where
-        G: Guardable<DefaultSubmissionGuard, [u8]> + AsOffsetLen,
+        B: Guarded<Target = [u8]> + AsOffsetLen,
     {
-        #[cfg(target_os = "linux")]
-        if let Some(slice) = path.try_get_data() {
-            nul_check(slice);
-        }
+        let path_buf = ManuallyDrop::new(path_buf);
 
-        let (fd, guard_opt) = unsafe {
+        #[cfg(target_os = "linux")]
+        nul_check((&*path_buf).borrow_guarded());
+
+        let fd = unsafe {
             self.open_raw_unchecked_inner(
                 ring,
                 ctx,
-                Either::<&[u8; 0], G>::Right(path),
+                &*path_buf,
                 info,
-                Some(at),
+                at,
             )
         }
         .await?;
-        let guard = guard_opt.expect(
-            "expected returned guard to be present returning from open_raw_unchecked_inner",
-        );
-        Ok((fd, guard))
+        Ok((fd, ManuallyDrop::into_inner(path_buf)))
     }
 
-    /// Open a file in a similar way to how [`open_at`] works, but without having to necessarily
-    /// specify a file descriptor.
-    #[cfg(any(doc, target_os = "redox"))]
-    #[doc(target_os = "redox")]
-    pub async fn open<G>(
+    /// Open a file in a similar way to how [`open_at`] works, but without specifying a file
+    /// descriptor.
+    pub async fn open<B>(
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
-        path: G,
+        path_buf: B,
         info: OpenInfo,
-        at: Option<SysFd>,
-    ) -> Result<(usize, G)>
+    ) -> Result<(SysFd, B)>
     where
-        G: Guardable<DefaultSubmissionGuard, [u8]> + AsOffsetLen,
+        B: Guarded<Target = [u8]> + AsOffsetLen,
     {
-        #[cfg(target_os = "linux")]
-        if let Some(slice) = path.try_get_data() {
-            nul_check(slice);
-        }
+        let path_buf = ManuallyDrop::new(path_buf);
 
-        let (fd, guard_opt) = unsafe {
-            self.open_raw_unchecked_inner(ring, ctx, Either::<&[u8; 0], G>::Right(path), info, at)
-        }
-        .await?;
-        let guard = guard_opt.expect(
-            "expected returned guard to be present returning from open_raw_unchecked_inner",
-        );
-        Ok((fd, guard))
+        #[cfg(target_os = "linux")]
+        nul_check((&*path_buf).borrow_guarded());
+
+        let fd = unsafe {
+            self.open_raw_unchecked_inner(ring, ctx, &*path_buf, info, None)
+                .await?
+        };
+
+        Ok((fd, ManuallyDrop::into_inner(path_buf)))
     }
 
     /// Close a file descriptor, optionally flushing it if necessary. This will only complete when
@@ -1854,6 +1717,16 @@ impl Handle {
     /// Close a range of file descriptors, optionally flushing them if necessary. This functions
     /// exactly like multiple invocations of the [`close`] call, with the difference of only taking
     /// up one SQE and thus being more efficient when closing many adjacent file descriptors.
+    ///
+    /// This is a rare system call, but is useful for example when preparing a process when it is
+    /// going to be cloned, since file descriptors in the range that are not open, will be ignored.
+    ///
+    /// ## Platform availability
+    ///
+    /// At the moment, this system call is only supported on Redox, but a blocking version of it is
+    /// coming to Linux
+    /// ([Close_Range](http://lkml.iu.edu/hypermail/linux/kernel/2008.0/03248.html)).
+    ///
     ///
     /// # Safety
     ///
@@ -1907,15 +1780,12 @@ impl Handle {
         let ring = ring.into();
 
         let (bytes_read, _) = self
-            .rw_io(
+            .send(
                 ring,
-                ctx,
-                fd,
-                |sqe, fd, buf| {
+                |sqe| {
                     sqe.sys_read(
                         fd,
-                        buf.left()
-                            .unwrap()
+                        buf
                             .as_generic_slice_mut(ring.is_primary())
                             .ok_or(Error::new(EFAULT))?,
                     );
@@ -1933,40 +1803,34 @@ impl Handle {
     // TODO: Linux?
     #[cfg(any(doc, target_os = "redox"))]
     #[doc(cfg(target_os = "redox"))]
-    pub async fn read<G>(
+    pub async fn read<B>(
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
         fd: usize,
-        buf: G,
-    ) -> Result<(usize, G)>
+        buf: B,
+    ) -> Result<(usize, B)>
     where
-        G: GuardableExclusive<DefaultSubmissionGuard, [u8]>,
+        // TODO: Uninitialized memory and `ioslice`.
+        B: Guarded<Target = [u8]> + AsOffsetLen,
     {
         let ring = ring.into();
+        let buf = ManuallyDrop::new(buf);
 
-        let (bytes_read, guard_opt) = unsafe {
-            self.rw_io(
-                ring,
-                ctx,
+        let prepare_fn = |sqe| {
+            sqe.sys_read(
                 fd,
-                |sqe, fd, buf| {
-                    sqe.sys_read(
-                        fd,
-                        buf.right()
-                            .unwrap()
-                            .try_get_data_mut()
-                            .ok_or(Error::new(EADDRINUSE))?
-                            .as_generic_slice_mut(ring.is_primary())
-                            .ok_or(Error::new(EFAULT))?,
-                    );
-                    Ok(())
-                },
-                Either::<(), _>::Right(buf),
+                buf
+            );
+            Ok(())
+        };
+        let bytes_read = unsafe {
+            self.send(
+                ring,
+                buf,
             )
             .await?
         };
-        let guard = guard_opt.unwrap();
         Ok((bytes_read, guard))
     }
     /// Read bytes, vectored.
@@ -2025,86 +1889,72 @@ impl Handle {
     ) -> Result<usize> {
         let ring = ring.into();
 
-        let (bytes_read, _) = self
-            .rw_io(
+        let cqe = self
+            .send(
                 ring,
-                ctx,
-                fd,
-                |fd, buf| {
-                    let buf_unchecked = buf.left().unwrap();
-
+                |sqe: &mut SysSqeRef| {
                     #[cfg(target_os = "redox")]
-                    let buf_unchecked = buf_unchecked
+                    let buf = buf
                         .as_generic_slice_mut(ring.is_primary())
                         .ok_or(Error::new(EFAULT))?;
 
-                    Ok(move |sqe: &mut SysSqeRef| {
-                        #[cfg(target_os = "redox")]
-                        sqe.sys_pread(fd, offset, buf_unchecked);
-                        #[cfg(target_os = "linux")]
-                        sqe.prep_read(fd, buf_unchecked, offset);
-                    })
+                    #[cfg(target_os = "redox")]
+                    sqe.sys_pread(fd, offset, buf);
+                    #[cfg(target_os = "linux")]
+                    sqe.prep_read(fd, buf, offset);
                 },
-                Either::<_, GuardedPlaceholder>::Left(buf),
             )
             .await?;
-        Ok(bytes_read)
+
+        let bytes_read = Self::completion_as_rw_io_result(cqe)?;
+        Ok(bytes_read as usize)
     }
     /// Read bytes from a specific offset. Does not change the file offset.
     ///
     /// This is the safe variant of [`pread_unchecked`].
     ///
     /// [`pread_unchecked`]: #method.pread_unchecked
-    pub async fn pread<G>(
+    // TODO: Uninitialized buffers.
+    pub async fn pread<B>(
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
         fd: SysFd,
-        buf: G,
+        buf: B,
         offset: u64,
-    ) -> Result<(usize, G)>
+    ) -> Result<(usize, B)>
     where
-        G: GuardableExclusive<DefaultSubmissionGuard, [u8]> + Unpin,
+        B: GuardedMut<Target = [u8]>,
     {
         let ring = ring.into();
+        let mut buf = ManuallyDrop::new(buf);
 
-        let (bytes_read, guard_opt) = unsafe {
-            self.rw_io(
+        let prepare_fn = |sqe: &mut SysSqeRef| {
+            let data_mut = buf
+                .borrow_guarded_mut();
+
+            #[cfg(target_os = "redox")]
+            let data_mut = data_mut
+                .as_generic_slice_mut(ring.is_primary())
+                .ok_or(Error::new(EFAULT))?;
+
+            unsafe {
+                #[cfg(target_os = "redox")]
+                sqe.sys_pread(fd, offset);
+                #[cfg(target_os = "linux")]
+                sqe.prep_read(fd, data_mut, offset);
+            }
+        };
+
+        let cqe = unsafe {
+            self.send(
                 ring,
-                ctx,
-                fd,
-                |fd, buf| {
-                    let buf_checked = buf.right().unwrap();
-
-                    let data_mut = buf_checked
-                        .try_get_data_mut()
-                        .ok_or(Error::new(EADDRINUSE))?;
-
-                    #[cfg(target_os = "linux")]
-                    // SAFETY: This is safe as we already own the guarded memory. We need to do
-                    // this unsafely because the guard is inserted directly after constructing the
-                    // future. (TODO: This is technically not needed, but should suffice for now.)
-                    let data_mut: &'static mut [u8] = &mut *NonNull::from(data_mut).as_ptr();
-
-                    #[cfg(target_os = "redox")]
-                    let data_mut = data_mut
-                        .as_generic_slice_mut(ring.is_primary())
-                        .ok_or(Error::new(EFAULT))?
-                        .as_static();
-
-                    Ok(move |sqe: &mut SysSqeRef| {
-                        #[cfg(target_os = "redox")]
-                        sqe.sys_pread(fd, offset);
-                        #[cfg(target_os = "linux")]
-                        sqe.prep_read(fd, data_mut, offset);
-                    })
-                },
-                Either::<(), _>::Right(buf),
+                prepare_fn,
             )
             .await?
         };
-        let guard = guard_opt.unwrap();
-        Ok((bytes_read, guard))
+        let bytes_read = Self::completion_as_rw_io_result(cqe)? as usize;
+        Ok((bytes_read, ManuallyDrop::into_inner(buf)))
     }
 
     /// Read bytes from a specific offset, vectored. Does not change the file offset.
@@ -2121,41 +1971,36 @@ impl Handle {
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
         fd: SysFd,
-        // TODO: Support immutable slices of slices as well.
-        bufs: &mut [IoVec],
+        bufs: &mut [SysIoVec],
         offset: u64,
     ) -> Result<usize> {
-        let (bytes_read, _) = self
-            .rw_io(
+        let prepare_fn = |sqe: &mut SysSqeRef| {
+            #[cfg(target_os = "redox")]
+            {
+                sqe.sys_preadv(fd, bufs_unchecked, offset);
+            }
+
+            #[cfg(target_os = "linux")]
+            {
+                let bufs_unchecked = {
+                    core::slice::from_raw_parts_mut(
+                        bufs.as_mut_ptr() as *mut std::io::IoSliceMut,
+                        bufs.len(),
+                    )
+                };
+                sqe.prep_read_vectored(fd, bufs_unchecked, offset);
+            }
+        };
+        let cqe = self
+            .send(
                 ring,
-                ctx,
-                fd,
-                |fd, bufs| {
-                    let bufs_unchecked = bufs.left().unwrap();
-
-                    Ok(move |sqe: &mut SysSqeRef| {
-                        #[cfg(target_os = "redox")]
-                        {
-                            sqe.sys_preadv(fd, bufs_unchecked, offset);
-                        }
-
-                        #[cfg(target_os = "linux")]
-                        {
-                            // TODO
-                            let bufs_unchecked = unsafe {
-                                core::slice::from_raw_parts_mut(
-                                    bufs_unchecked.as_mut_ptr() as *mut std::io::IoSliceMut,
-                                    bufs_unchecked.len(),
-                                )
-                            };
-                            sqe.prep_read_vectored(fd, bufs_unchecked, offset);
-                        }
-                    })
-                },
-                Either::<_, GuardedPlaceholder>::Left(bufs),
+                prepare_fn,
             )
             .await?;
-        Ok(bytes_read)
+        
+        let bytes_read = Self::completion_as_rw_io_result(cqe)?;
+
+        Ok(bytes_read as usize)
     }
 
     /// Write bytes. Returns the number of bytes written, or zero if no more bytes could be
@@ -2217,7 +2062,7 @@ impl Handle {
         buf: G,
     ) -> Result<(usize, G)>
     where
-        G: GuardableShared<DefaultSubmissionGuard, [u8]>,
+        G: Guarded<Target = [u8]>,
     {
         let ring = ring.into();
 
@@ -2301,31 +2146,23 @@ impl Handle {
     ) -> Result<usize> {
         let ring = ring.into();
 
-        let (bytes_written, _) = self
-            .rw_io(
+        let prepare_fn = |sqe: &mut SysSqeRef| {
+            #[cfg(target_os = "redox")]
+            sqe.pwrite(fd, buf, offset);
+
+            #[cfg(target_os = "linux")]
+            sqe.prep_write(fd, buf, offset);
+        };
+
+        let cqe = {
+            self
+            .send(
                 ring,
-                ctx,
-                fd,
-                |fd, buf| {
-                    let buf_unchecked = buf.left().unwrap();
-
-                    #[cfg(target_os = "redox")]
-                    let buf_unchecked = buf_unchecked
-                        .as_generic_slice(ring.is_primary())
-                        .ok_or(Error::new(EFAULT))?;
-
-                    Ok(move |sqe: &mut SysSqeRef| {
-                        #[cfg(target_os = "redox")]
-                        sqe.pwrite(fd, buf_unchecked, offset);
-
-                        #[cfg(target_os = "linux")]
-                        sqe.prep_write(fd, buf_unchecked, offset);
-                    })
-                },
-                Either::<_, GuardedPlaceholder>::Left(buf),
-            )
-            .await?;
-        Ok(bytes_written)
+                prepare_fn,
+            ).await?
+        };
+        let bytes_written = Self::completion_as_rw_io_result(cqe)?;
+        Ok(bytes_written as usize)
     }
     /// Write bytes to a specific offset. Does not change the file offset.
     ///
@@ -2337,62 +2174,41 @@ impl Handle {
     /// not reclaimed until the command is either complete or cancelled.
     ///
     /// [`pwrite_unchecked`]: #method.pwrite_unchecked
-    pub async fn pwrite<G>(
+    pub async fn pwrite<B>(
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
         fd: SysFd,
-        buf: G,
+        buf: B,
         offset: u64,
-    ) -> Result<usize>
+    ) -> Result<(usize, B)>
     where
-        G: GuardableShared<DefaultSubmissionGuard, [u8]> + Unpin,
+        // TODO: Support MaybeUninit via the `ioslice` crate.
+        B: Guarded<Target = [u8]> + AsOffsetLen,
     {
         let ring = ring.into();
+        let buf = ManuallyDrop::new(buf);
 
-        let (bytes_written, _) = unsafe {
-            self.rw_io(
+        let prepare_fn = |sqe: &mut SysSqeRef| {
+            #[cfg(target_os = "redox")]
+            {
+                sqe.sys_pwrite(fd, offset, buf)
+            }
+            #[cfg(target_os = "linux")]
+            unsafe {
+                sqe.prep_write(fd, buf.borrow_guarded(), offset)
+            }
+        };
+
+        let cqe = unsafe {
+            self.send(
                 ring,
-                ctx,
-                fd,
-                |fd, buf| {
-                    let buf_checked = buf.right().unwrap();
+                prepare_fn
+            ).await?
+        };
+        let bytes_written = Self::completion_as_rw_io_result(cqe)?;
 
-                    #[cfg(target_os = "redox")]
-                    // SAFETY: Same as on Linux; we are temporarily and locally upgrading a
-                    // lifetime-tracked generic slice, into a static slice.
-                    let buf_checked = buf_checked
-                        .data_shared()
-                        .as_generic_slice(ring.is_primary())
-                        .ok_or(Error::new(EFAULT))?
-                        .as_static();
-
-                    #[cfg(target_os = "linux")]
-                    // SAFETY: This is completely safe, since we are taking an __owned__ buffer
-                    // that we are borrowing (and the pointer will only be used by us until the
-                    // submission, where the prepare fn is dropped, and by the kernel until
-                    // completion). Remember, the guard trait forces our buffer to remain stable in
-                    // memory, and never being dropped, which allows us to temporarily and locally
-                    // upgrade the reference to `'static`.
-                    let data_shared: &'static [u8] =
-                        &*NonNull::from(buf_checked.data_shared()).as_ptr();
-
-                    Ok(move |sqe: &mut SysSqeRef| {
-                        #[cfg(target_os = "redox")]
-                        {
-                            sqe.sys_pwrite(fd, offset, buf_checked)
-                        }
-                        #[cfg(target_os = "linux")]
-                        {
-                            sqe.prep_write(fd, data_shared, offset)
-                        }
-                    })
-                },
-                Either::<(), G>::Right(buf),
-            )
-        }
-        .await?;
-        Ok(bytes_written)
+        Ok((bytes_written as usize, ManuallyDrop::into_inner(buf)))
     }
     /// Write bytes to a specific offset, vectored. Does not change the file offset.
     ///
@@ -2411,39 +2227,35 @@ impl Handle {
         bufs: &[IoVec],
         offset: u64,
     ) -> Result<usize> {
-        let (bytes_written, _) = self
-            .rw_io(
+        let prep_fn = move |sqe: &mut SysSqeRef| {
+            #[cfg(target_os = "redox")]
+            {
+                sqe.sys_pwritev(fd, bufs_unchecked, offset);
+            }
+            #[cfg(target_os = "linux")]
+            {
+                // TODO: Use the `ioslice` crate for safe casts. Otherwise, it will suffice
+                // to simply cast the slice unsafely, by reinterpreting its type. They must
+                // be valid since this is unsafe.
+                let bufs_unchecked = {
+                    core::slice::from_raw_parts(
+                        bufs.as_ptr() as *const std::io::IoSlice,
+                        bufs.len(),
+                    )
+                };
+
+                sqe.prep_write_vectored(fd as SysFd, bufs_unchecked, offset);
+            }
+        };
+
+        let cqe = self
+            .send(
                 ring,
-                ctx,
-                fd,
-                |fd, bufs| {
-                    let bufs_unchecked = bufs.left().unwrap();
-
-                    Ok(move |sqe: &mut SysSqeRef| {
-                        #[cfg(target_os = "redox")]
-                        {
-                            sqe.sys_pwritev(fd, bufs_unchecked, offset);
-                        }
-                        #[cfg(target_os = "linux")]
-                        {
-                            // TODO: Use the `ioslice` crate for safe casts. Otherwise, it will suffice
-                            // to simply cast the slice unsafely, by reinterpreting its type. They must
-                            // be valid since this is unsafe.
-                            let bufs_unchecked = unsafe {
-                                core::slice::from_raw_parts(
-                                    bufs_unchecked.as_ptr() as *const std::io::IoSlice,
-                                    bufs_unchecked.len(),
-                                )
-                            };
-
-                            sqe.prep_write_vectored(fd as SysFd, bufs_unchecked, offset);
-                        }
-                    })
-                },
-                Either::<_, GuardedPlaceholder>::Left(bufs),
+                prep_fn,
             )
             .await?;
-        Ok(bytes_written)
+
+        Self::completion_as_rw_io_result(cqe).map(|bytes_written| bytes_written as usize)
     }
 
     /// "Duplicate" a file descriptor, returning a new one based on the old one.
@@ -2506,7 +2318,7 @@ impl Handle {
         param: Option<G>,
     ) -> Result<(usize, Option<G>)>
     where
-        G: GuardableShared<DefaultSubmissionGuard, [u8]> + AsOffsetLen,
+        G: Guarded<Target = [u8]> + AsOffsetLen,
     {
         unsafe {
             self.dup_unchecked_inner(id, ctx, fd, flags, param.map(Either::<[u8; 0], _>::Right))
@@ -2723,40 +2535,45 @@ impl Handle {
     /// guard.
     #[cfg(any(doc, target_os = "linux"))]
     #[doc(cfg(target_os = "linux"))]
-    pub async fn accept<G>(
+    pub async fn accept<B>(
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
         fd: SysFd,
-        sockaddr_storage: Option<G>,
+        sockaddr_storage: Option<B>,
         flags: iou::sqe::SockFlag,
-    ) -> Result<SysFd>
+    ) -> Result<(SysFd, Option<B>)>
     where
-        G: GuardableExclusive<DefaultSubmissionGuard, iou::sqe::SockAddrStorage> + Unpin,
+        B: GuardedMut<Target = iou::sqe::SockAddrStorage> + Unpin,
     {
         match sockaddr_storage {
             Some(sockaddr_storage) => {
-                let future = unsafe {
-                    self.send_and_protect(
-                        ring,
-                        move |mut sockaddr_storage| {
-                            move |sqe: &mut SysSqeRef| {
-                                let sockaddr_storage_ref = sockaddr_storage
-                                    .try_get_data_mut()
-                                    .ok_or(Error::new(EADDRINUSE))
-                                    .expect("TODO: Handle EADDRINUSE error");
+                let mut sockaddr_storage = ManuallyDrop::new(sockaddr_storage);
 
-                                sqe.set_flags(ctx.sync().linux_sqe_flags());
-                                sqe.prep_accept(fd, Some(sockaddr_storage_ref), flags)
-                            }
-                        },
-                        sockaddr_storage,
+                let prep_fn = |sqe: &mut SysSqeRef| {
+                    let sockaddr_storage_ref = (&mut *sockaddr_storage)
+                        .borrow_guarded_mut();
+
+                    sqe.set_flags(ctx.sync().linux_sqe_flags());
+                    unsafe {
+                        sqe.prep_accept(fd, Some(sockaddr_storage_ref), flags)
+                    }
+                };
+                let future = unsafe {
+                    self.send(
+                        ring,
+                        prep_fn,
                     )
                 };
+                let cqe = future.await?;
 
-                Self::completion_as_rw_io_result(future.await?).map(|retval| retval as SysFd)
+                let fd = Self::completion_as_rw_io_result(cqe)? as SysFd;
+                Ok((fd, Some(ManuallyDrop::into_inner(sockaddr_storage))))
             }
-            None => self.accept_simple(ring, ctx, fd, flags).await,
+            None => {
+                let fd = self.accept_simple(ring, ctx, fd, flags).await?;
+                Ok((fd, None))
+            }
         }
     }
 }
@@ -2808,7 +2625,7 @@ where
     I: redox_buffer_pool::Integer + Into<u64>,
     H: redox_buffer_pool::Handle<I, E>,
     E: Copy,
-    G: redox_buffer_pool::Guard,
+    G: redox_buffer_pool::marker::Marker,
     C: redox_buffer_pool::AsBufferPool<I, H, E>,
 {
     fn offset(&self) -> u64 {
@@ -2818,7 +2635,7 @@ where
         Some(redox_buffer_pool::BufferSlice::len(self).into())
     }
     fn addr(&self) -> usize {
-        redox_buffer_pool::BufferSlice::try_as_slice(self).expect("TODO: enforce in the type system that AsOffsetLen is only implemented for guardless types").as_ptr() as usize
+        redox_buffer_pool::BufferSlice::as_slice(self).as_ptr() as usize
     }
 }
 unsafe impl<'a, I, H, E, G, C> AsOffsetLenMut for crate::memory::BufferSlice<'a, I, E, G, H, C>
@@ -2826,7 +2643,7 @@ where
     I: redox_buffer_pool::Integer + Into<u64>,
     H: redox_buffer_pool::Handle<I, E>,
     E: Copy,
-    G: redox_buffer_pool::Guard,
+    G: redox_buffer_pool::marker::Marker,
     C: redox_buffer_pool::AsBufferPool<I, H, E>,
 {
     fn offset_mut(&mut self) -> u64 {
@@ -2836,7 +2653,7 @@ where
         Some(redox_buffer_pool::BufferSlice::len(self).into())
     }
     fn addr_mut(&mut self) -> usize {
-        redox_buffer_pool::BufferSlice::try_as_slice_mut(self).expect("TODO: Enforce in the type system that AsOffsetLenMut is only implemented where there is no guard").as_mut_ptr() as usize
+        redox_buffer_pool::BufferSlice::as_slice_mut(self).as_mut_ptr() as usize
     }
 }
 mod private2 {
@@ -2940,39 +2757,6 @@ slice_like!(&mut [u8; 0]);
 // (`String` is AsMut, but not for [u8] (due to UTF-8))
 // (`str` is AsMut, but not for [u8] (due to UTF-8))
 
-unsafe impl<G, T, M> AsOffsetLen for Guarded<G, T, M>
-where
-    G: redox_buffer_pool::Guard,
-    T: stable_deref_trait::StableDeref + ops::Deref<Target = [u8]>,
-    M: guard_trait::marker::Mode,
-{
-    fn addr(&self) -> usize {
-        unsafe { self.get_unchecked_ref().addr() }
-    }
-    fn len(&self) -> Option<u64> {
-        unsafe { self.get_unchecked_ref().len().try_into().ok() }
-    }
-    fn offset(&self) -> u64 {
-        unreachable!("the Guarded wrapper only works on primary rings")
-    }
-}
-unsafe impl<G, T, M> AsOffsetLenMut for Guarded<G, T, M>
-where
-    G: redox_buffer_pool::Guard,
-    T: stable_deref_trait::StableDeref + AsOffsetLenMut + ops::DerefMut<Target = [u8]>,
-    M: guard_trait::marker::Mode,
-{
-    fn addr_mut(&mut self) -> usize {
-        unsafe { self.get_unchecked_mut() }.addr()
-    }
-    fn len_mut(&mut self) -> Option<u64> {
-        unsafe { self.get_unchecked_mut() }.len().try_into().ok()
-    }
-    fn offset_mut(&mut self) -> u64 {
-        unreachable!("the Guarded wrapper only works on primary rings")
-    }
-}
-
 #[cfg(target_os = "linux")]
 fn nul_check(slice: &[u8]) {
     assert_eq!(
@@ -3007,8 +2791,8 @@ impl OpenInfo {
     }
 }
 
-enum SendArg<F, G, C> {
+enum SendArg<F> {
+    #[cfg(target_os = "redox")]
     Stream(FdEventsInitial),
-    Unguarded(F),
-    Guarded(G, C),
+    Single(F),
 }
