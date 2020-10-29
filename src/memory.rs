@@ -23,7 +23,7 @@ use crate::future::{
 use crate::reactor::{Handle, SubmissionContext, SubmissionSync};
 
 #[cfg(any(doc, target_os = "redox"))]
-use crate::reactor::SecondaryRingId;
+use crate::reactor::{ProducerRingId, SecondaryRingId};
 
 /// A buffer pool, with the default options for use by userspace-to-userspace rings.
 pub type BufferPool<I = u32, H = BufferPoolHandle, E = ()> = pool::BufferPool<I, H, E>;
@@ -97,7 +97,8 @@ impl Handle {
     #[cfg(target_os = "redox")]
     async fn create_buffer_pool_inner<I, E>(
         &self,
-        secondary_instance: SecondaryRingId,
+        inner_idx: usize,
+        inner_reactor_id: usize,
         producer: bool,
     ) -> Result<pool::BufferPool<I, BufferPoolHandle, E>>
     where
@@ -109,13 +110,13 @@ impl Handle {
             .upgrade()
             .expect("can't create_buffer_pool: reactor is dead");
 
-        assert_eq!(reactor.id(), secondary_instance.reactor);
+        assert_eq!(reactor.id().inner, inner_reactor_id);
 
         let ringfd = {
             let secondary_instances = reactor.secondary_instances.read();
             let instance = secondary_instances
                 .instances
-                .get(secondary_instance.inner)
+                .get(inner_idx)
                 .expect("invalid secondary ring id");
 
             if producer {
@@ -161,11 +162,13 @@ impl Handle {
     #[doc(cfg(target_os = "redox"))]
     pub async fn create_producer_buffer_pool<I: pool::Integer + TryFrom<u64> + TryInto<usize>>(
         &self,
-        secondary_instance: SecondaryRingId,
+        // TODO: Support passing the primary reactor to do the operation with.
+        secondary_instance: ProducerRingId,
+        // TODO: SubmissionContext
         _creation_command_priority: Priority,
     ) -> Result<pool::BufferPool<I, BufferPoolHandle, ()>> {
         let pool = self
-            .create_buffer_pool_inner(secondary_instance, true)
+            .create_buffer_pool_inner(secondary_instance.inner, secondary_instance.reactor.inner, true)
             .await?;
         import(pool.handle().unwrap(), &pool).await?;
         Ok(pool)
@@ -183,7 +186,7 @@ impl Handle {
         initial_extra: E,
     ) -> Result<pool::BufferPool<I, BufferPoolHandle, E>> {
         let pool = self
-            .create_buffer_pool_inner(secondary_instance, false)
+            .create_buffer_pool_inner(secondary_instance.inner, secondary_instance.reactor.inner, false)
             .await?;
 
         let expansion = pool.begin_expand(initial_len).or(Err(Error::new(ENOMEM)))?;

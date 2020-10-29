@@ -71,7 +71,7 @@ use crate::memory::{Guarded, GuardedMut};
 /// (reactors created later will have larger IDs), and hashed.
 #[derive(Clone, Copy, Debug, Hash, Ord, Eq, PartialEq, PartialOrd)]
 pub struct ReactorId {
-    inner: usize,
+    pub(crate) inner: usize,
 }
 
 static LAST_REACTOR_ID: AtomicUsize = AtomicUsize::new(0);
@@ -649,8 +649,8 @@ impl Reactor {
     #[doc(cfg(target_os = "redox"))]
     pub fn add_secondary_instance(
         &self,
+        ctx: SubmissionContext,
         instance: ConsumerInstance,
-        priority: Priority,
     ) -> Result<SecondaryRingId> {
         let ringfd = instance.ringfd();
         self.add_secondary_instance_generic(
@@ -660,16 +660,16 @@ impl Reactor {
                 trusted: false, // TODO
             }),
             ringfd,
-            priority,
-        )
+            ctx,
+        ).map(|instances_len| SecondaryRingId { inner: instances_len, reactor: self.id })
     }
     #[cfg(target_os = "redox")]
     fn add_secondary_instance_generic(
         &self,
         instance: SecondaryInstanceWrapper,
         ringfd: usize,
-        priority: Priority,
-    ) -> Result<SecondaryRingId> {
+        ctx: SubmissionContext,
+    ) -> Result<usize> {
         let mut guard = self.secondary_instances.write();
 
         // Tell the kernel to send us speciel event CQEs which indicate that other io_urings have
@@ -687,8 +687,8 @@ impl Reactor {
                 .expect("expected SqEntry64")
                 .try_send(SqEntry64 {
                     opcode: StandardOpcode::RegisterEvents as u8,
-                    priority,
-                    flags: IoUringSqeFlags::SUBSCRIBE.bits(),
+                    priority: ctx.priority(),
+                    flags: (IoUringSqeFlags::SUBSCRIBE | ctx.sync().redox_sqe_flags()).bits(),
                     // not used since the driver will know that it's an io_uring being updated
                     user_data: 0,
 
@@ -708,10 +708,7 @@ impl Reactor {
         guard.fds_backref.insert(ringfd, instances_len);
         guard.instances.push(instance);
 
-        Ok(SecondaryRingId {
-            reactor: self.id,
-            inner: guard.instances.len(),
-        })
+        Ok(instances_len)
     }
     /// Add a producer instance (the producer of a userspace-to-userspace or kernel-to-userspace
     /// instance). This will use the main ring to register interest in file updates on the file
@@ -720,9 +717,10 @@ impl Reactor {
     #[doc(cfg(target_os = "redox"))]
     pub fn add_producer_instance(
         &self,
+        // TODO: Support specifying a primary ring to do the operation on.
+        ctx: SubmissionContext,
         instance: ProducerInstance,
-        priority: Priority,
-    ) -> Result<SecondaryRingId> {
+    ) -> Result<ProducerRingId> {
         let ringfd = instance.ringfd();
         self.add_secondary_instance_generic(
             SecondaryInstanceWrapper::ProducerInstance(ProducerInstanceWrapper {
@@ -731,8 +729,8 @@ impl Reactor {
                 stream_state: None,
             }),
             ringfd,
-            priority,
-        )
+            ctx,
+        ).map(|instances_len| ProducerRingId { inner: instances_len, reactor: self.id })
     }
     /// Retrieve the unique ID of this reactor.
     #[inline]
@@ -1380,7 +1378,7 @@ impl Handle {
     #[doc(cfg(target_os = "redox"))]
     pub fn send_producer_cqe(
         &self,
-        instance: SecondaryRingId,
+        instance: ProducerRingId,
         cqe: CqEntry64,
     ) -> Result<(), RingPushError<CqEntry64>> {
         let reactor = self
@@ -1562,14 +1560,17 @@ impl Handle {
         ctx: SubmissionContext,
         path: &B,
         info: OpenInfo,
-        at: Option<SysFd>,
+        at: OpenFrom,
     ) -> Result<SysFd>
     where
         B: AsOffsetLen + ?Sized,
     {
         let ring = ring.into();
         #[cfg(target_os = "redox")]
-        let at_fd64 = at.map(|at_fd| u64::try_from(at_fd)).transpose()?;
+        let at_fd64 = match at {
+            OpenFrom::At(fd) => Some(u64::try_from(fd)?),
+            OpenFrom::CurrentDirectory => None,
+        };
 
         let reference = path.as_generic_slice(ring.is_primary()).ok_or(Error::new(EFAULT))?;
 
@@ -1595,7 +1596,7 @@ impl Handle {
                 nul_check(slice);
 
                 let cstr = std::ffi::CStr::from_bytes_with_nul_unchecked(slice);
-                sqe.prep_openat(at.unwrap_or(libc::AT_FDCWD), cstr, flags, mode)
+                sqe.prep_openat(at.linux_fd(), cstr, flags, mode)
             }
         };
 
@@ -1627,7 +1628,8 @@ impl Handle {
         ctx: SubmissionContext,
         path: &B,
         info: OpenInfo,
-        at: Option<SysFd>,
+        // TODO: Merge "at" into "info".
+        at: OpenFrom,
     ) -> Result<SysFd>
     where
         B: AsOffsetLen + ?Sized,
@@ -1670,7 +1672,7 @@ impl Handle {
                 ctx,
                 path,
                 info,
-                None,
+                OpenFrom::CurrentDirectory,
             )
             .await
     }
@@ -1692,7 +1694,7 @@ impl Handle {
         ctx: SubmissionContext,
         path_buf: B,
         info: OpenInfo,
-        at: Option<SysFd>,
+        at: OpenFrom,
     ) -> Result<(SysFd, B)>
     where
         B: Guarded<Target = [u8]> + AsOffsetLen,
@@ -1733,7 +1735,7 @@ impl Handle {
         nul_check((&*path_buf).borrow_guarded());
 
         let fd = unsafe {
-            self.open_raw_unchecked_inner(ring, ctx, &*path_buf, info, None)
+            self.open_raw_unchecked_inner(ring, ctx, &*path_buf, info, OpenFrom::CurrentDirectory)
                 .await?
         };
 
@@ -2093,7 +2095,7 @@ impl Handle {
         flags: WriteFlags,
     ) -> Result<usize>
     where
-        B: AsOffsetLen,
+        B: AsOffsetLen + ?Sized,
     {
         let ring = ring.into();
         let buf = buf
@@ -2842,6 +2844,21 @@ pub struct OpenInfo {
     #[cfg(target_os = "linux")]
     inner: (iou::sqe::OFlag, iou::sqe::Mode),
 }
+/// The origin from which the open system call begins. The system call allows a file descriptor
+/// that references an open directory, to be the base of the path resolution when opening.
+#[derive(Clone, Copy, Debug)]
+pub enum OpenFrom {
+    /// Open relative paths from the current directory. Absolute paths are not affected by this.
+    ///
+    /// On Linux, this will make the system calls use the file descriptor placeholder
+    /// [`libc::AT_FDCWD`].
+    ///
+    /// On Redox, this will set a flag to indicate that it is not opening from a file descriptor.
+    CurrentDirectory,
+
+    /// Open relative paths based on a directory at the file descriptor.
+    At(SysFd),
+}
 
 impl OpenInfo {
     /// Use the default parameters, meaning no special flags (other than O_CLOEXEC), and with a
@@ -2853,6 +2870,23 @@ impl OpenInfo {
 
             #[cfg(target_os = "linux")]
             inner: (iou::sqe::OFlag::O_CLOEXEC, iou::sqe::Mode::empty()),
+        }
+    }
+    /// Set the redox file mode.
+    #[cfg(target_os = "redox")]
+    pub fn with_redox_mode(self, mode: u64) -> Self {
+        Self {
+            inner: (mode, self.inner.1),
+        }
+    }
+}
+impl OpenFrom {
+    /// Get the fd or placeholder which this wrapper corresponds to.
+    #[cfg(target_os = "linux")]
+    pub fn linux_fd(self) -> SysFd {
+        match self {
+            Self::CurrentDirectory => libc::AT_FDCWD,
+            Self::At(at) => at,
         }
     }
 }
