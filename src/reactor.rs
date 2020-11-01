@@ -1876,7 +1876,7 @@ impl Handle {
         fd: usize,
         buf: B,
         flags: ReadFlags,
-    ) -> Result<(usize, B)>
+    ) -> (Result<usize>, B)
     where
         // TODO: Uninitialized memory and `ioslice`.
         B: GuardedMut<Target = [u8]> + AsOffsetLen,
