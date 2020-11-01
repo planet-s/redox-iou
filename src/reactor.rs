@@ -2899,3 +2899,46 @@ enum SendArg<F> {
     Stream(FdEventsInitial),
     Single(F),
 }
+
+unsafe impl<T> AsOffsetLen for guard_trait::Mapped<T, [u8]>
+where
+    T: Guarded,
+{
+    fn offset(&self) -> u64 {
+        unreachable!()
+    }
+    fn len(&self) -> Option<u64> {
+        self.get_ref().len().try_into().ok()
+    }
+    fn addr(&self) -> usize {
+        self.get_ref().as_ptr() as usize
+    }
+}
+unsafe impl<T> AsOffsetLen for guard_trait::MappedMut<T, [u8]>
+where
+    T: GuardedMut,
+{
+    fn offset(&self) -> u64 {
+        unreachable!()
+    }
+    fn len(&self) -> Option<u64> {
+        self.get_ref().len().try_into().ok()
+    }
+    fn addr(&self) -> usize {
+        self.get_ref().as_ptr() as usize
+    }
+}
+unsafe impl<T> AsOffsetLenMut for guard_trait::MappedMut<T, [u8]>
+where
+    T: GuardedMut,
+{
+    fn offset_mut(&mut self) -> u64 {
+        unreachable!()
+    }
+    fn len_mut(&mut self) -> Option<u64> {
+        self.get_mut().len().try_into().ok()
+    }
+    fn addr_mut(&mut self) -> usize {
+        self.get_mut().as_mut_ptr() as usize
+    }
+}
