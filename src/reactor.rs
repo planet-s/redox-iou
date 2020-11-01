@@ -2942,3 +2942,31 @@ where
         self.get_mut().as_mut_ptr() as usize
     }
 }
+unsafe impl<T> AsOffsetLen for guard_trait::AssertSafe<T>
+where
+    T: ops::Deref<Target = [u8]>,
+{
+    fn offset(&self) -> u64 {
+        unreachable!()
+    }
+    fn len(&self) -> Option<u64> {
+        self.borrow_guarded().len().try_into().ok()
+    }
+    fn addr(&self) -> usize {
+        self.borrow_guarded().as_ptr() as usize
+    }
+}
+unsafe impl<T> AsOffsetLenMut for guard_trait::AssertSafe<T>
+where
+    T: ops::Deref<Target = [u8]> + ops::DerefMut,
+{
+    fn offset_mut(&mut self) -> u64 {
+        unreachable!()
+    }
+    fn len_mut(&mut self) -> Option<u64> {
+        self.borrow_guarded_mut().len().try_into().ok()
+    }
+    fn addr_mut(&mut self) -> usize {
+        self.borrow_guarded_mut().as_mut_ptr() as usize
+    }
+}
