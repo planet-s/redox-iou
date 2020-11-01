@@ -517,9 +517,6 @@ mod consumer_instance {
             assert!(sq_entry_count.is_power_of_two());
             assert!(cq_entry_count.is_power_of_two());
 
-            let sq_log2_entry_count = sq_entry_count.trailing_zeros();
-            let cq_log2_entry_count = cq_entry_count.trailing_zeros();
-
             let init_flags = self.flags();
             let attach_info = self
                 .consume_attach_state()
@@ -529,27 +526,27 @@ mod consumer_instance {
 
             fn init_sender<Sqe>(
                 info: &InstanceBuilderAttachStageInfo,
-                sq_log2_entry_count: u32,
+                sq_entry_count: usize,
             ) -> SpscSender<Sqe> {
                 unsafe {
                     SpscSender::from_raw(
                         info.sr_virtaddr as *const Ring<Sqe>,
                         4096, // TODO
                         info.se_virtaddr as *mut Sqe,
-                        sq_log2_entry_count,
+                        sq_entry_count,
                     )
                 }
             }
             fn init_receiver<Cqe>(
                 info: &InstanceBuilderAttachStageInfo,
-                cq_log2_entry_count: u32,
+                cq_entry_count: usize,
             ) -> SpscReceiver<Cqe> {
                 unsafe {
                     SpscReceiver::from_raw(
                         info.cr_virtaddr as *const Ring<Cqe>,
                         4096, // TODO
                         info.ce_virtaddr as *const Cqe,
-                        cq_log2_entry_count,
+                        cq_entry_count,
                     )
                 }
             }
@@ -558,14 +555,14 @@ mod consumer_instance {
                 with_kernel: kernel,
                 ringfd: attach_info.ringfd,
                 sender: RwLock::new(if init_flags.contains(IoUringCreateFlags::BITS_32) {
-                    GenericSender::Bits32(init_sender(&attach_info, sq_log2_entry_count))
+                    GenericSender::Bits32(init_sender(&attach_info, sq_entry_count))
                 } else {
-                    GenericSender::Bits64(init_sender(&attach_info, sq_log2_entry_count))
+                    GenericSender::Bits64(init_sender(&attach_info, sq_entry_count))
                 }),
                 receiver: RwLock::new(if init_flags.contains(IoUringCreateFlags::BITS_32) {
-                    GenericReceiver::Bits32(init_receiver(&attach_info, cq_log2_entry_count))
+                    GenericReceiver::Bits32(init_receiver(&attach_info, cq_entry_count))
                 } else {
-                    GenericReceiver::Bits64(init_receiver(&attach_info, cq_log2_entry_count))
+                    GenericReceiver::Bits64(init_receiver(&attach_info, cq_entry_count))
                 }),
             })
         }
@@ -977,7 +974,7 @@ mod producer_instance {
                         info.ce_virtaddr as *mut C,
                         {
                             assert!(info.sq_entry_count.is_power_of_two());
-                            info.sq_entry_count.trailing_zeros()
+                            info.sq_entry_count
                         },
                     )
                 }
@@ -990,7 +987,7 @@ mod producer_instance {
                         info.se_virtaddr as *mut S,
                         {
                             assert!(info.cq_entry_count.is_power_of_two());
-                            info.cq_entry_count.trailing_zeros()
+                            info.cq_entry_count
                         },
                     )
                 }

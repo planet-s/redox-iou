@@ -25,8 +25,10 @@ pub struct SpscSender<T> {
     /// Size of the ring header, in bytes.
     ring_size: u32,
 
-    /// The log2 of the size in bytes of the entries array.
-    log2_entry_count: u32,
+    /// The number of entries for the ring.
+    entry_count: usize,
+
+    // TODO: Cache the tail here.
 }
 
 unsafe impl<T: Send> Send for SpscSender<T> {}
@@ -45,30 +47,19 @@ impl<T> SpscSender<T> {
     /// Since munmap is called in the destructor, the sender must either be dropped manually, or be
     /// allocated using mmap.
     ///
-    /// The `log2_entry_count` must be the exact base-two logarithm of the entry count; that is,
-    /// the number of bits to shift one by, to obtain the number of entries. That number,
-    /// multiplied by the size of T, _must not_ overflow isize when added with the `entries_base`
-    /// pointer.
+    /// The `entry_count` must be a power of two.
     #[inline]
     pub unsafe fn from_raw(
         ring: *const Ring<T>,
         ring_size: usize,
         entries_base: *mut T,
-        log2_entry_count: u32,
+        entry_count: usize,
     ) -> Self {
         debug_assert!(!ring.is_null());
         debug_assert!((ring as usize)
             .checked_add(ring_size)
             .map_or(false, |added| isize::try_from(added).is_ok()));
         debug_assert!(!entries_base.is_null());
-        {
-            let entries_size = 1usize.checked_shl(log2_entry_count).expect(
-                "expected log2_entry_count not to be larger than the pointer width in bits",
-            );
-            debug_assert!((entries_base as usize)
-                .checked_add(entries_size)
-                .map_or(false, |added| isize::try_from(added).is_ok()));
-        }
         debug_assert_ne!(mem::size_of::<T>(), 0);
 
         let ring_size = u32::try_from(ring_size)
@@ -78,7 +69,7 @@ impl<T> SpscSender<T> {
             ring,
             entries_base,
             ring_size,
-            log2_entry_count,
+            entry_count,
         }
     }
     /// Attempt to send a new item to the ring, failing if the ring is shut down, or if the ring is
@@ -87,7 +78,7 @@ impl<T> SpscSender<T> {
     pub fn try_send(&mut self, item: T) -> Result<(), RingPushError<T>> {
         unsafe {
             let ring = self.ring_header();
-            ring.push_back(self.entries_base, self.log2_entry_count as usize, item)
+            ring.push_back(self.entries_base, self.entry_count, item)
         }
     }
     /// Busy-wait for the ring to no longer be full.
@@ -116,7 +107,7 @@ impl<T> SpscSender<T> {
                 ring,
                 entries_base,
                 ring_size,
-                log2_entry_count,
+                entry_count,
             } = self;
             mem::forget(self);
 
@@ -125,9 +116,7 @@ impl<T> SpscSender<T> {
                 .sts
                 .fetch_or(RingStatus::DROP.bits(), Ordering::Relaxed);
 
-            let entries_size = 1usize
-                .checked_shl(log2_entry_count)
-                .unwrap()
+            let entries_size = entry_count
                 .checked_mul(mem::size_of::<T>())
                 .unwrap();
 
@@ -179,7 +168,7 @@ impl<T> SpscSender<T> {
     pub fn free_entry_count(&self) -> Result<usize, BrokenRing> {
         unsafe {
             self.ring_header()
-                .available_entry_count(self.log2_entry_count as usize)
+                .available_entry_count(self.entry_count as usize)
         }
     }
     /// Get the number of available entry slots for the other side of the ring, to pop from.
@@ -187,7 +176,7 @@ impl<T> SpscSender<T> {
     pub fn available_entry_count(&self) -> Result<usize, BrokenRing> {
         unsafe {
             self.ring_header()
-                .available_entry_count(self.log2_entry_count as usize)
+                .available_entry_count(self.entry_count as usize)
         }
     }
 }
@@ -199,8 +188,7 @@ impl<T> Drop for SpscSender<T> {
             ring.sts
                 .fetch_or(RingStatus::DROP.bits(), Ordering::Release);
 
-            let entries_size = 1usize
-                .wrapping_shl(self.log2_entry_count)
+            let entries_size = self.entry_count
                 .wrapping_mul(mem::size_of::<T>());
 
             let _ = syscall::funmap(self.ring as *const _ as usize, self.ring_size as usize);
@@ -231,7 +219,8 @@ pub struct SpscReceiver<T> {
     ring: *const Ring<T>,
     entries_base: *const T,
     ring_size: u32,
-    log2_entry_count: u32,
+    entry_count: usize,
+    // TODO: Cache the head here.
 }
 unsafe impl<T: Send> Send for SpscReceiver<T> {}
 unsafe impl<T: Send> Sync for SpscReceiver<T> {}
@@ -247,21 +236,13 @@ impl<T> SpscReceiver<T> {
         ring: *const Ring<T>,
         ring_size: usize,
         entries_base: *const T,
-        log2_entry_count: u32,
+        entry_count: usize,
     ) -> Self {
         debug_assert!(!ring.is_null());
         debug_assert!((ring as usize)
             .checked_add(ring_size)
             .map_or(false, |added| isize::try_from(added).is_ok()));
         debug_assert!(!entries_base.is_null());
-        {
-            let entries_size = 1usize.checked_shl(log2_entry_count).expect(
-                "expected log2_entry_count not to be larger than the pointer width in bits",
-            );
-            debug_assert!((entries_base as usize)
-                .checked_add(entries_size)
-                .map_or(false, |added| isize::try_from(added).is_ok()));
-        }
         debug_assert_ne!(mem::size_of::<T>(), 0);
 
         let ring_size = u32::try_from(ring_size)
@@ -271,7 +252,7 @@ impl<T> SpscReceiver<T> {
             ring,
             entries_base,
             ring_size,
-            log2_entry_count,
+            entry_count,
         }
     }
 
@@ -280,7 +261,7 @@ impl<T> SpscReceiver<T> {
     pub fn try_recv(&mut self) -> Result<T, RingPopError> {
         unsafe {
             let ring = &*self.ring;
-            ring.pop_front(self.entries_base, self.log2_entry_count.try_into().unwrap())
+            ring.pop_front(self.entries_base, self.entry_count)
         }
     }
     /// Busy-wait while trying to receive a new item from the ring, or until shutdown.
@@ -315,7 +296,7 @@ impl<T> SpscReceiver<T> {
             let Self {
                 ring,
                 entries_base,
-                log2_entry_count,
+                entry_count,
                 ring_size,
             } = self;
             mem::forget(self);
@@ -326,8 +307,7 @@ impl<T> SpscReceiver<T> {
                 .sts
                 .fetch_or(RingStatus::DROP.bits(), Ordering::Relaxed);
 
-            let entries_size = 1usize
-                .wrapping_shl(log2_entry_count)
+            let entries_size = entry_count
                 .wrapping_mul(mem::size_of::<T>());
 
             syscall::funmap(ring as *const _ as usize, ring_size as usize)?;
@@ -352,7 +332,7 @@ impl<T> SpscReceiver<T> {
     pub fn available_entry_count(&self) -> Result<usize, BrokenRing> {
         unsafe {
             self.ring_header()
-                .available_entry_count(self.log2_entry_count as usize)
+                .available_entry_count(self.entry_count)
         }
     }
     /// Get the number of free entries to for the other side of the ring, to push to, at the time
@@ -361,7 +341,7 @@ impl<T> SpscReceiver<T> {
     pub fn free_entry_count(&self) -> Result<usize, BrokenRing> {
         unsafe {
             self.ring_header()
-                .free_entry_count(self.log2_entry_count as usize)
+                .free_entry_count(self.entry_count)
         }
     }
     /// Wake the sender up if it was blocking on a space for new messages, without having to send
@@ -387,8 +367,7 @@ impl<T> Drop for SpscReceiver<T> {
     #[cold]
     fn drop(&mut self) {
         unsafe {
-            let entries_size = 1usize
-                .wrapping_shl(self.log2_entry_count)
+            let entries_size = self.entry_count
                 .wrapping_mul(mem::size_of::<T>());
 
             let _ = syscall::funmap(self.ring as *const _ as usize, self.ring_size as usize);
@@ -483,7 +462,6 @@ mod tests {
         let base_size = count.checked_mul(mem::size_of::<CqEntry64>()).unwrap();
 
         assert!(count.is_power_of_two());
-        let log2_entry_count = count.trailing_zeros();
 
         let base = unsafe {
             alloc(Layout::from_size_align(base_size, mem::align_of::<CqEntry64>()).unwrap())
@@ -503,7 +481,7 @@ mod tests {
             },
             base,
             4096,
-            log2_entry_count,
+            entry_count,
         )
     }
 
@@ -564,19 +542,19 @@ mod tests {
 
     #[test]
     fn multithreaded_spsc() {
-        let (ring, entries_base, ring_size, log2_entry_count) = setup_ring(64);
+        let (ring, entries_base, ring_size, entry_count) = setup_ring(64);
         let ring = &ring;
         let mut sender = SpscSender {
             ring,
             entries_base,
             ring_size,
-            log2_entry_count,
+            entry_count,
         };
         let mut receiver = SpscReceiver {
             ring,
             entries_base,
             ring_size,
-            log2_entry_count,
+            entry_count,
         };
 
         simple_multithreaded_test!(sender, receiver);

@@ -147,7 +147,8 @@ fn try_submit(
         }
     };
 
-    //log::debug!("Sending SQE {:?}", sqe);
+    #[cfg(target_os = "redox")]
+    log::debug!("Sending SQE {:?}", sqe_orig);
 
     #[cfg(target_os = "redox")]
     match instance

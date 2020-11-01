@@ -850,12 +850,9 @@ impl Reactor {
             };
             log::debug!("Entered io_uring with num_completed {:?}", num_completed);
 
-            let mut receiver_intent_guard = instance.consumer_instance.receiver().upgradable_read();
+            let mut receiver_write_guard = instance.consumer_instance.receiver().write();
 
-            for cqe_result in instance
-                .consumer_instance
-                .receiver()
-                .write()
+            for cqe_result in receiver_write_guard
                 .as_64_mut()
                 .unwrap()
                 .try_iter()
@@ -895,6 +892,7 @@ impl Reactor {
         }
     }
     fn drive_handle_cqe(&self, primary: bool, trusted: bool, cqe: SysCqe, waker: &task::Waker) {
+        log::debug!("Handle CQE primary: {}, trusted: {}, cqe: {:?}, waker {:?}", primary, trusted, cqe, waker);
         #[cfg(target_os = "linux")]
         let _primary = primary;
 
@@ -1849,11 +1847,13 @@ impl Handle {
         flags: ReadFlags,
     ) -> Result<usize> {
         let ring = ring.into();
+        let fd64 = u64::try_from(fd).map_err(|_| Error::new(EBADF))?;
+
+        log::info!("READ_UNCHECKED ring {:?} ctx {:?} fd64 {} buf at {:?} len {}, flags {:?}", ring, ctx, fd64, buf.as_ptr(), buf.len(), flags);
+
         let buf = buf
             .as_generic_slice_mut(ring.is_primary())
             .ok_or(Error::new(EFAULT))?;
-
-        let fd64 = u64::try_from(fd).map_err(|_| Error::new(EBADF))?;
 
         let cqe = self
             .send_with_ctx(
@@ -2098,10 +2098,13 @@ impl Handle {
         B: AsOffsetLen + ?Sized,
     {
         let ring = ring.into();
+        let fd64 = u64::try_from(fd).map_err(|_| Error::new(EBADF))?;
+
+        log::info!("WRITE_UNCHECKED ring {:?} ctx {:?} fd64 {} len {:?}, flags {:?}", ring, ctx, fd64, buf.len(), flags);
+
         let buf = buf
             .as_generic_slice(ring.is_primary())
             .ok_or(Error::new(EFAULT))?;
-        let fd64 = u64::try_from(fd).map_err(|_| Error::new(EBADF))?;
 
         let cqe = self
             .send_with_ctx(
