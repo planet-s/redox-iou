@@ -1693,7 +1693,7 @@ impl Handle {
         path_buf: B,
         info: OpenInfo,
         at: OpenFrom,
-    ) -> Result<(SysFd, B)>
+    ) -> (Result<SysFd>, B)
     where
         B: Guarded<Target = [u8]> + AsOffsetLen,
     {
@@ -1702,7 +1702,7 @@ impl Handle {
         #[cfg(target_os = "linux")]
         nul_check((&*path_buf).borrow_guarded());
 
-        let fd = unsafe {
+        let result = unsafe {
             self.open_raw_unchecked_inner(
                 ring,
                 ctx,
@@ -1711,8 +1711,8 @@ impl Handle {
                 at,
             )
         }
-        .await?;
-        Ok((fd, ManuallyDrop::into_inner(path_buf)))
+        .await;
+        (result, ManuallyDrop::into_inner(path_buf))
     }
 
     /// Open a file in a similar way to how [`open_at`] works, but without specifying a file
@@ -1723,21 +1723,11 @@ impl Handle {
         ctx: SubmissionContext,
         path_buf: B,
         info: OpenInfo,
-    ) -> Result<(SysFd, B)>
+    ) -> (Result<SysFd>, B)
     where
         B: Guarded<Target = [u8]> + AsOffsetLen,
     {
-        let path_buf = ManuallyDrop::new(path_buf);
-
-        #[cfg(target_os = "linux")]
-        nul_check((&*path_buf).borrow_guarded());
-
-        let fd = unsafe {
-            self.open_raw_unchecked_inner(ring, ctx, &*path_buf, info, OpenFrom::CurrentDirectory)
-                .await?
-        };
-
-        Ok((fd, ManuallyDrop::into_inner(path_buf)))
+        self.open_at(ring.into(), ctx, path_buf, info, OpenFrom::CurrentDirectory).await
     }
 
     /// Close a file descriptor, optionally flushing it if necessary. This will only complete when
@@ -1894,9 +1884,9 @@ impl Handle {
         let ring = ring.into();
         let mut buf = ManuallyDrop::new(buf);
 
-        let bytes_read = unsafe { self.read_unchecked(ring, ctx, fd, buf.borrow_guarded_mut(), flags).await? };
+        let result = unsafe { self.read_unchecked(ring, ctx, fd, buf.borrow_guarded_mut(), flags).await };
 
-        Ok((bytes_read, ManuallyDrop::into_inner(buf)))
+        (result, ManuallyDrop::into_inner(buf))
     }
     /// Read bytes, vectored.
     ///
@@ -2009,16 +1999,16 @@ impl Handle {
         buf: B,
         offset: u64,
         flags: SysReadFlags,
-    ) -> Result<(usize, B)>
+    ) -> (Result<usize>, B)
     where
         B: GuardedMut<Target = [u8]>,
     {
         let ring = ring.into();
         let mut buf = ManuallyDrop::new(buf);
 
-        let bytes_read = unsafe { self.pread_unchecked(ring, ctx, fd, buf.borrow_guarded_mut(), offset, flags).await? };
+        let result = unsafe { self.pread_unchecked(ring, ctx, fd, buf.borrow_guarded_mut(), offset, flags).await };
 
-        Ok((bytes_read, ManuallyDrop::into_inner(buf)))
+        (result.map(|bytes_read| bytes_read as usize), ManuallyDrop::into_inner(buf))
     }
 
     /// Read bytes from a specific offset, vectored. Does not change the file offset.
@@ -2137,15 +2127,15 @@ impl Handle {
         fd: SysFd,
         buf: B,
         flags: WriteFlags,
-    ) -> Result<(usize, B)>
+    ) -> (Result<usize>, B)
     where
         B: Guarded<Target = [u8]> + AsOffsetLen,
     {
         let ring = ring.into();
         let buf = ManuallyDrop::new(buf);
 
-        let bytes_written = unsafe { self.write_unchecked(ring, ctx, fd, &*buf, flags).await? };
-        Ok((bytes_written, ManuallyDrop::into_inner(buf)))
+        let result = unsafe { self.write_unchecked(ring, ctx, fd, &*buf, flags).await };
+        (result, ManuallyDrop::into_inner(buf))
     }
 
     /// Write bytes, vectored.
@@ -2260,7 +2250,7 @@ impl Handle {
         buf: B,
         offset: u64,
         flags: SysWriteFlags,
-    ) -> Result<(usize, B)>
+    ) -> (Result<usize>, B)
     where
         // TODO: Support MaybeUninit via the `ioslice` crate.
         B: Guarded<Target = [u8]> + AsOffsetLen,
@@ -2268,9 +2258,9 @@ impl Handle {
         let ring = ring.into();
         let buf = ManuallyDrop::new(buf);
 
-        let bytes_written = unsafe { self.pwrite_unchecked(ring, ctx, fd, buf.borrow_guarded(), offset, flags).await? };
+        let result = unsafe { self.pwrite_unchecked(ring, ctx, fd, buf.borrow_guarded(), offset, flags).await };
 
-        Ok((bytes_written as usize, ManuallyDrop::into_inner(buf)))
+        (result.map(|bytes_written| bytes_written as usize), ManuallyDrop::into_inner(buf))
     }
 
     /// Write bytes to a specific offset, vectored, with an optional set of flags. Does not change

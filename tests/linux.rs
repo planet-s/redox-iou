@@ -30,19 +30,20 @@ fn basic_file_io() -> Result<(), Box<dyn Error + 'static>> {
 
     executor.run(async move {
         // TODO: IntoGuardable trait?
-        let (fd, _) = handle
+        let (fd_result, _) = handle
             .open(
                 ring,
                 SubmissionContext::default(),
                 &b"assets/test.txt\0"[..],
                 OpenInfo::new(),
             )
-            .await?;
+            .await;
+        let fd = fd_result?;
 
         let buffer = vec![0u8; 4096];
         let guarded_buffer = GuardedMutExt::map_mut(buffer, |buffer| &mut buffer[..165]);
 
-        let (bytes_read, guarded_buffer) = handle
+        let (bytes_read_result, guarded_buffer) = handle
             .pread(
                 ring,
                 SubmissionContext::new().with_sync(SubmissionSync::Drain),
@@ -51,7 +52,8 @@ fn basic_file_io() -> Result<(), Box<dyn Error + 'static>> {
                 0,
                 (),
             )
-            .await?;
+            .await;
+        let bytes_read = bytes_read_result?;
 
         let _buffer = guarded_buffer.into_original();
 
