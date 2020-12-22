@@ -168,7 +168,11 @@ impl Handle {
         _creation_command_priority: Priority,
     ) -> Result<pool::BufferPool<I, BufferPoolHandle, ()>> {
         let pool = self
-            .create_buffer_pool_inner(secondary_instance.inner, secondary_instance.reactor.inner, true)
+            .create_buffer_pool_inner(
+                secondary_instance.inner,
+                secondary_instance.reactor.inner,
+                true,
+            )
             .await?;
         import(pool.handle().unwrap(), &pool).await?;
         Ok(pool)
@@ -186,7 +190,11 @@ impl Handle {
         initial_extra: E,
     ) -> Result<pool::BufferPool<I, BufferPoolHandle, E>> {
         let pool = self
-            .create_buffer_pool_inner(secondary_instance.inner, secondary_instance.reactor.inner, false)
+            .create_buffer_pool_inner(
+                secondary_instance.inner,
+                secondary_instance.reactor.inner,
+                false,
+            )
             .await?;
 
         let expansion = pool.begin_expand(initial_len).or(Err(Error::new(ENOMEM)))?;

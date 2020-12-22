@@ -148,16 +148,18 @@ fn try_submit(
     };
 
     #[cfg(target_os = "redox")]
-    log::debug!("Sending SQE {:?}", sqe_orig);
+    let send_result = {
+        log::debug!("Sending SQE {:?}", sqe_orig);
 
+        instance
+            .sender()
+            .write()
+            .as_64_mut()
+            .expect("expected instance with 64-bit SQEs")
+            .try_send(sqe_orig)
+    };
     #[cfg(target_os = "redox")]
-    match instance
-        .sender()
-        .write()
-        .as_64_mut()
-        .expect("expected instance with 64-bit SQEs")
-        .try_send(sqe_orig)
-    {
+    match send_result {
         Ok(()) => {
             if is_stream {
                 log::debug!("Successfully sent stream command, awaiting CQEs.");
@@ -174,7 +176,13 @@ fn try_submit(
             task::Poll::Pending
         }
         Err(RingPushError::Shutdown(_)) => task::Poll::Ready(Error::new(ESHUTDOWN)),
-        Err(RingPushError::Broken(_)) => task::Poll::Ready(Error::new(EIO)),
+        Err(RingPushError::Broken(_)) => {
+            log::warn!(
+                "Failed to pop entry from instance {:?} due to a broken ring",
+                instance
+            );
+            return task::Poll::Ready(Error::new(EIO));
+        }
     }
     #[cfg(target_os = "linux")]
     {
@@ -358,7 +366,11 @@ impl Stream for FdEvents {
                 #[cfg(target_os = "redox")]
                 {
                     // TODO: Validate fd cast.
-                    sqe.sys_register_events(initial.fd as u64, initial.event_flags, initial.oneshot);
+                    sqe.sys_register_events(
+                        initial.fd as u64,
+                        initial.event_flags,
+                        initial.oneshot,
+                    );
                 }
             }
         });

@@ -27,7 +27,6 @@ pub struct SpscSender<T> {
 
     /// The number of entries for the ring.
     entry_count: usize,
-
     // TODO: Cache the tail here.
 }
 
@@ -116,9 +115,7 @@ impl<T> SpscSender<T> {
                 .sts
                 .fetch_or(RingStatus::DROP.bits(), Ordering::Relaxed);
 
-            let entries_size = entry_count
-                .checked_mul(mem::size_of::<T>())
-                .unwrap();
+            let entries_size = entry_count.checked_mul(mem::size_of::<T>()).unwrap();
 
             syscall::funmap(ring as *const _ as usize, ring_size as usize)?;
             syscall::funmap(entries_base as usize, entries_size)?;
@@ -188,8 +185,7 @@ impl<T> Drop for SpscSender<T> {
             ring.sts
                 .fetch_or(RingStatus::DROP.bits(), Ordering::Release);
 
-            let entries_size = self.entry_count
-                .wrapping_mul(mem::size_of::<T>());
+            let entries_size = self.entry_count.wrapping_mul(mem::size_of::<T>());
 
             let _ = syscall::funmap(self.ring as *const _ as usize, self.ring_size as usize);
             let _ = syscall::funmap(self.entries_base as usize, entries_size);
@@ -282,9 +278,7 @@ impl<T> SpscReceiver<T> {
     /// Create an endless iterator that continues to `try_recv`.
     #[inline]
     pub fn try_iter(&mut self) -> impl Iterator<Item = Result<T, RingPopError>> + '_ {
-        core::iter::from_fn(move || {
-            Some(self.try_recv())
-        })
+        core::iter::from_fn(move || Some(self.try_recv()))
     }
 
     /// Deallocate the receiver, unmapping the memory used by it, together with a shutdown.
@@ -307,8 +301,7 @@ impl<T> SpscReceiver<T> {
                 .sts
                 .fetch_or(RingStatus::DROP.bits(), Ordering::Relaxed);
 
-            let entries_size = entry_count
-                .wrapping_mul(mem::size_of::<T>());
+            let entries_size = entry_count.wrapping_mul(mem::size_of::<T>());
 
             syscall::funmap(ring as *const _ as usize, ring_size as usize)?;
             syscall::funmap(entries_base as usize, entries_size)?;
@@ -330,19 +323,13 @@ impl<T> SpscReceiver<T> {
     /// Get the number of available entries to pop, at the time this method was called.
     #[inline]
     pub fn available_entry_count(&self) -> Result<usize, BrokenRing> {
-        unsafe {
-            self.ring_header()
-                .available_entry_count(self.entry_count)
-        }
+        unsafe { self.ring_header().available_entry_count(self.entry_count) }
     }
     /// Get the number of free entries to for the other side of the ring, to push to, at the time
     /// this method was called.
     #[inline]
     pub fn free_entry_count(&self) -> Result<usize, BrokenRing> {
-        unsafe {
-            self.ring_header()
-                .free_entry_count(self.entry_count)
-        }
+        unsafe { self.ring_header().free_entry_count(self.entry_count) }
     }
     /// Wake the sender up if it was blocking on a space for new messages, without having to send
     /// anything as part of the wakeup.
@@ -367,8 +354,7 @@ impl<T> Drop for SpscReceiver<T> {
     #[cold]
     fn drop(&mut self) {
         unsafe {
-            let entries_size = self.entry_count
-                .wrapping_mul(mem::size_of::<T>());
+            let entries_size = self.entry_count.wrapping_mul(mem::size_of::<T>());
 
             let _ = syscall::funmap(self.ring as *const _ as usize, self.ring_size as usize);
             let _ = syscall::funmap(self.entries_base as usize, entries_size);

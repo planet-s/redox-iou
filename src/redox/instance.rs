@@ -5,15 +5,15 @@ mod consumer_instance {
     use parking_lot::RwLock;
 
     use syscall::data::Map;
-    use syscall::error::{EINVAL, EIO};
     use syscall::error::{Error, Result};
+    use syscall::error::{EINVAL, EIO};
     use syscall::flag::MapFlags;
     use syscall::flag::{O_CLOEXEC, O_CREAT, O_RDWR};
 
     use syscall::io_uring::v1::{
         BrokenRing, CqEntry32, CqEntry64, IoUringCreateFlags, Ring, SqEntry32, SqEntry64,
-        CQ_ENTRIES_MMAP_OFFSET, CQ_HEADER_MMAP_OFFSET, SQ_ENTRIES_MMAP_OFFSET,
-        SQ_HEADER_MMAP_OFFSET, CURRENT_MINOR, CURRENT_PATCH,
+        CQ_ENTRIES_MMAP_OFFSET, CQ_HEADER_MMAP_OFFSET, CURRENT_MINOR, CURRENT_PATCH,
+        SQ_ENTRIES_MMAP_OFFSET, SQ_HEADER_MMAP_OFFSET,
     };
     use syscall::io_uring::{IoUringCreateInfo, IoUringEnterFlags, IoUringVersion};
 

@@ -12,8 +12,8 @@
 /// count of the main ring, followed by a `SYS_ENTER_IORING` syscall.
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::{TryFrom, TryInto};
-use std::num::NonZeroUsize;
 use std::mem::{ManuallyDrop, MaybeUninit};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{self, AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::{ops, task};
@@ -27,7 +27,9 @@ use syscall::error::{
     E2BIG, EADDRINUSE, EBADF, ECANCELED, EFAULT, EINVAL, EIO, EOPNOTSUPP, EOVERFLOW,
 };
 use syscall::flag::{EventFlags, MapFlags};
-use syscall::io_uring::v1::operation::{CloseFlags, DupFlags, OpenFlags, ReadFlags, RegisterEventsFlags, WriteFlags};
+use syscall::io_uring::v1::operation::{
+    CloseFlags, DupFlags, OpenFlags, ReadFlags, RegisterEventsFlags, WriteFlags,
+};
 use syscall::io_uring::v1::{
     BrokenRing, CqEntry64, IoUringCqeFlags, IoUringSqeFlags, Priority, RingPopError, RingPushError,
     SqEntry64, StandardOpcode,
@@ -581,7 +583,6 @@ impl ReactorBuilder {
 }
 impl Reactor {
     fn new(main_instances: Vec<ConsumerInstanceWrapper>) -> Arc<Self> {
-
         let reactor = Reactor {
             id: ReactorId {
                 inner: LAST_REACTOR_ID.fetch_add(1, atomic::Ordering::Relaxed),
@@ -602,7 +603,9 @@ impl Reactor {
 
         let mut arc = Arc::new(reactor);
         let weak = Arc::downgrade(&arc);
-        unsafe { Arc::get_mut_unchecked(&mut arc).weak_ref = Some(weak); }
+        unsafe {
+            Arc::get_mut_unchecked(&mut arc).weak_ref = Some(weak);
+        }
 
         arc
 
@@ -661,7 +664,11 @@ impl Reactor {
             }),
             ringfd,
             ctx,
-        ).map(|instances_len| SecondaryRingId { inner: instances_len, reactor: self.id })
+        )
+        .map(|instances_len| SecondaryRingId {
+            inner: instances_len,
+            reactor: self.id,
+        })
     }
     #[cfg(target_os = "redox")]
     fn add_secondary_instance_generic(
@@ -679,7 +686,8 @@ impl Reactor {
             let fd64 = ringfd.try_into().or(Err(Error::new(EBADF)))?;
 
             self.main_instances
-                .get(0).unwrap()
+                .get(0)
+                .unwrap()
                 .consumer_instance
                 .sender()
                 .write()
@@ -692,7 +700,8 @@ impl Reactor {
                     // not used since the driver will know that it's an io_uring being updated
                     user_data: 0,
 
-                    syscall_flags: (RegisterEventsFlags::READ | RegisterEventsFlags::IO_URING).bits(),
+                    syscall_flags: (RegisterEventsFlags::READ | RegisterEventsFlags::IO_URING)
+                        .bits(),
                     addr: 0, // unused
                     fd: fd64,
                     offset: 0, // unused
@@ -730,7 +739,11 @@ impl Reactor {
             }),
             ringfd,
             ctx,
-        ).map(|instances_len| ProducerRingId { inner: instances_len, reactor: self.id })
+        )
+        .map(|instances_len| ProducerRingId {
+            inner: instances_len,
+            reactor: self.id,
+        })
     }
     /// Retrieve the unique ID of this reactor.
     #[inline]
@@ -832,10 +845,15 @@ impl Reactor {
     ) -> Result<()> {
         #[cfg(target_os = "redox")]
         {
+            fn warn_about_inconsistency(instance: &ConsumerInstanceWrapper) -> Error {
+                log::error!("Ring (instance: {:?}) was not able to pop, as it had entered an inconsistent state. This is either a bug in the producer, a bug in the io_uring management of this process, or a kernel bug.", instance);
+                Error::new(EIO)
+            }
             let num_completed = if wait {
-                let sq_free_entry_count = instance.consumer_instance
+                let sq_free_entry_count = instance
+                    .consumer_instance
                     .sq_free_entry_count()
-                    .map_err(|BrokenRing| Error::new(EIO))?;
+                    .map_err(|BrokenRing| warn_about_inconsistency(instance))?;
 
                 let flags = if sq_free_entry_count > 0 {
                     IoUringEnterFlags::empty()
@@ -852,18 +870,18 @@ impl Reactor {
 
             let mut receiver_write_guard = instance.consumer_instance.receiver().write();
 
-            for cqe_result in receiver_write_guard
-                .as_64_mut()
-                .unwrap()
-                .try_iter()
-            {
+            for cqe_result in receiver_write_guard.as_64_mut().unwrap().try_iter() {
                 match cqe_result {
                     Ok(cqe) => self.drive_handle_cqe(primary, instance.trusted, cqe, waker),
                     Err(RingPopError::Empty { .. }) => break,
-                    Err(RingPopError::Shutdown) => { instance.dropped.store(true, std::sync::atomic::Ordering::Release); break },
+                    Err(RingPopError::Shutdown) => {
+                        instance
+                            .dropped
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        break;
+                    }
                     Err(RingPopError::Broken) => {
-                        log::error!("Ring (instance: {:?}) was not able to pop, as it had entered an inconsistent state. This is either a bug in the producer, a bug in the io_uring management of this process, or a kernel bug.", instance);
-                        return Err(Error::new(EIO));
+                        return Err(warn_about_inconsistency(instance));
                     }
                 }
             }
@@ -892,7 +910,13 @@ impl Reactor {
         }
     }
     fn drive_handle_cqe(&self, primary: bool, trusted: bool, cqe: SysCqe, waker: &task::Waker) {
-        log::debug!("Handle CQE primary: {}, trusted: {}, cqe: {:?}, waker {:?}", primary, trusted, cqe, waker);
+        log::debug!(
+            "Handle CQE primary: {}, trusted: {}, cqe: {:?}, waker {:?}",
+            primary,
+            trusted,
+            cqe,
+            waker
+        );
         #[cfg(target_os = "linux")]
         let _primary = primary;
 
@@ -932,17 +956,22 @@ impl Reactor {
                     return;
                 }
             };
-            let primary_instance = self.main_instances.get(0).expect("expected primary instance to exist");
+            let primary_instance = self
+                .main_instances
+                .get(0)
+                .expect("expected primary instance to exist");
             match secondary_instances_guard
                 .instances
                 .get(secondary_instance_index)
                 .expect("fd backref BTreeMap corrupt, contains a file descriptor that was removed")
             {
                 SecondaryInstanceWrapper::ConsumerInstance(ref instance) => {
-                    self.drive(instance, waker, false, false).expect("failed to drive consumer instance");
+                    self.drive(instance, waker, false, false)
+                        .expect("failed to drive consumer instance");
                 }
                 SecondaryInstanceWrapper::ProducerInstance(ref instance) => {
-                    self.drive_producer_instance(primary_instance, &instance).expect("failed to drive producer instance");
+                    self.drive_producer_instance(primary_instance, &instance)
+                        .expect("failed to drive producer instance");
                 }
             }
             return;
@@ -951,7 +980,11 @@ impl Reactor {
         let _ = Self::handle_cqe(trusted, self.tag_map.read(), waker, cqe);
     }
     #[cfg(target_os = "redox")]
-    fn drive_producer_instance(&self, primary_instance: &ConsumerInstanceWrapper, instance: &ProducerInstanceWrapper) -> Result<()> {
+    fn drive_producer_instance(
+        &self,
+        primary_instance: &ConsumerInstanceWrapper,
+        instance: &ProducerInstanceWrapper,
+    ) -> Result<()> {
         log::debug!("Event was an external producer io_uring, thus polling the ring itself");
         loop {
             assert!(primary_instance.trusted);
@@ -1236,18 +1269,20 @@ impl Handle {
     where
         F: for<'ring, 'tmp> FnOnce(&'tmp mut SysSqeRef<'ring>),
     {
-        self.send_inner(
-            ring,
-            SendArg::<F>::Single(prepare_sqe),
-        )
-        .left()
-        .expect("send_inner() must return CommandFuture if is_stream is set to false")
+        self.send_inner(ring, SendArg::<F>::Single(prepare_sqe))
+            .left()
+            .expect("send_inner() must return CommandFuture if is_stream is set to false")
     }
     /// Shorthand for send(), but where the submission context is applied to the preparation
     /// function, before calling the inner.
-    pub unsafe fn send_with_ctx<F>(&self, ring: impl Into<RingId>, ctx: SubmissionContext, prepare_sqe: F) -> CommandFuture<impl FnOnce(&mut SysSqeRef)>
+    pub unsafe fn send_with_ctx<F>(
+        &self,
+        ring: impl Into<RingId>,
+        ctx: SubmissionContext,
+        prepare_sqe: F,
+    ) -> CommandFuture<impl FnOnce(&mut SysSqeRef)>
     where
-        F: for<'ring, 'tmp> FnOnce(&'tmp mut SysSqeRef<'ring>)
+        F: for<'ring, 'tmp> FnOnce(&'tmp mut SysSqeRef<'ring>),
     {
         let prepare_sqe_wrapper = move |sqe: &mut SysSqeRef| {
             #[cfg(target_os = "redox")]
@@ -1255,8 +1290,7 @@ impl Handle {
                 sqe.base(ctx.sync().redox_sqe_flags(), ctx.priority(), (-1i64) as u64);
             }
             #[cfg(target_os = "linux")]
-            {
-            }
+            {}
 
             prepare_sqe(sqe)
         };
@@ -1444,11 +1478,7 @@ impl Handle {
 
         let secondary_instances = reactor.secondary_instances.upgradable_read();
 
-        let state_opt = match secondary_instances
-            .instances
-            .get(ring_id.inner)
-            .unwrap()
-        {
+        let state_opt = match secondary_instances.instances.get(ring_id.inner).unwrap() {
             SecondaryInstanceWrapper::ConsumerInstance(_) => {
                 panic!("calling producer_sqes on a consumer instance")
             }
@@ -1570,7 +1600,9 @@ impl Handle {
             OpenFrom::CurrentDirectory => None,
         };
 
-        let reference = path.as_generic_slice(ring.is_primary()).ok_or(Error::new(EFAULT))?;
+        let reference = path
+            .as_generic_slice(ring.is_primary())
+            .ok_or(Error::new(EFAULT))?;
 
         let prepare_fn = |sqe: &mut SysSqeRef| {
             #[cfg(target_os = "redox")]
@@ -1634,14 +1666,7 @@ impl Handle {
     {
         let ring = ring.into();
 
-        self
-            .open_raw_unchecked_inner(
-                ring,
-                ctx,
-                path,
-                info,
-                at,
-            )
+        self.open_raw_unchecked_inner(ring, ctx, path, info, at)
             .await
     }
 
@@ -1664,14 +1689,7 @@ impl Handle {
     {
         let ring = ring.into();
 
-        self
-            .open_raw_unchecked_inner(
-                ring,
-                ctx,
-                path,
-                info,
-                OpenFrom::CurrentDirectory,
-            )
+        self.open_raw_unchecked_inner(ring, ctx, path, info, OpenFrom::CurrentDirectory)
             .await
     }
 
@@ -1702,16 +1720,8 @@ impl Handle {
         #[cfg(target_os = "linux")]
         nul_check((&*path_buf).borrow_guarded());
 
-        let result = unsafe {
-            self.open_raw_unchecked_inner(
-                ring,
-                ctx,
-                &*path_buf,
-                info,
-                at,
-            )
-        }
-        .await;
+        let result =
+            unsafe { self.open_raw_unchecked_inner(ring, ctx, &*path_buf, info, at) }.await;
         (result, ManuallyDrop::into_inner(path_buf))
     }
 
@@ -1727,7 +1737,8 @@ impl Handle {
     where
         B: Guarded<Target = [u8]> + AsOffsetLen,
     {
-        self.open_at(ring.into(), ctx, path_buf, info, OpenFrom::CurrentDirectory).await
+        self.open_at(ring.into(), ctx, path_buf, info, OpenFrom::CurrentDirectory)
+            .await
     }
 
     /// Close a file descriptor, optionally flushing it if necessary. This will only complete when
@@ -1839,24 +1850,24 @@ impl Handle {
         let ring = ring.into();
         let fd64 = u64::try_from(fd).map_err(|_| Error::new(EBADF))?;
 
-        log::info!("READ_UNCHECKED ring {:?} ctx {:?} fd64 {} buf at {:?} len {}, flags {:?}", ring, ctx, fd64, buf.as_ptr(), buf.len(), flags);
+        log::info!(
+            "READ_UNCHECKED ring {:?} ctx {:?} fd64 {} buf at {:?} len {}, flags {:?}",
+            ring,
+            ctx,
+            fd64,
+            buf.as_ptr(),
+            buf.len(),
+            flags
+        );
 
         let buf = buf
             .as_generic_slice_mut(ring.is_primary())
             .ok_or(Error::new(EFAULT))?;
 
         let cqe = self
-            .send_with_ctx(
-                ring,
-                ctx,
-                |sqe: &mut SysSqeRef| {
-                    sqe.sys_read(
-                        fd64,
-                        buf,
-                        flags,
-                    );
-                },
-            )
+            .send_with_ctx(ring, ctx, |sqe: &mut SysSqeRef| {
+                sqe.sys_read(fd64, buf, flags);
+            })
             .await?;
 
         Self::completion_as_rw_io_result(cqe)
@@ -1884,7 +1895,10 @@ impl Handle {
         let ring = ring.into();
         let mut buf = ManuallyDrop::new(buf);
 
-        let result = unsafe { self.read_unchecked(ring, ctx, fd, buf.borrow_guarded_mut(), flags).await };
+        let result = unsafe {
+            self.read_unchecked(ring, ctx, fd, buf.borrow_guarded_mut(), flags)
+                .await
+        };
 
         (result, ManuallyDrop::into_inner(buf))
     }
@@ -1914,13 +1928,9 @@ impl Handle {
         let fd64 = u64::try_from(fd).map_err(|_| Error::new(EBADF))?;
 
         let cqe = self
-            .send_with_ctx(
-                ring,
-                ctx,
-                |sqe: &mut SysSqeRef| {
-                    sqe.sys_readv(fd64, bufs, flags);
-                },
-            )
+            .send_with_ctx(ring, ctx, |sqe: &mut SysSqeRef| {
+                sqe.sys_readv(fd64, bufs, flags);
+            })
             .await?;
 
         Self::completion_as_rw_io_result(cqe)
@@ -1959,28 +1969,19 @@ impl Handle {
             (fd64, data_mut)
         };
 
-        let prepare_fn = |sqe: &mut SysSqeRef| {
-            unsafe {
-                #[cfg(target_os = "redox")]
-                {
-                    sqe.sys_pread(fd64, data_mut, offset, flags);
-                }
-                #[cfg(target_os = "linux")]
-                {
-                    let _ = flags;
-                    sqe.prep_read(fd, data_mut, offset);
-                }
+        let prepare_fn = |sqe: &mut SysSqeRef| unsafe {
+            #[cfg(target_os = "redox")]
+            {
+                sqe.sys_pread(fd64, data_mut, offset, flags);
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let _ = flags;
+                sqe.prep_read(fd, data_mut, offset);
             }
         };
 
-        let cqe = unsafe {
-            self.send_with_ctx(
-                ring,
-                ctx,
-                prepare_fn,
-            )
-            .await?
-        };
+        let cqe = unsafe { self.send_with_ctx(ring, ctx, prepare_fn).await? };
         let bytes_read = Self::completion_as_rw_io_result(cqe)? as usize;
         Ok(bytes_read as usize)
     }
@@ -2006,9 +2007,15 @@ impl Handle {
         let ring = ring.into();
         let mut buf = ManuallyDrop::new(buf);
 
-        let result = unsafe { self.pread_unchecked(ring, ctx, fd, buf.borrow_guarded_mut(), offset, flags).await };
+        let result = unsafe {
+            self.pread_unchecked(ring, ctx, fd, buf.borrow_guarded_mut(), offset, flags)
+                .await
+        };
 
-        (result.map(|bytes_read| bytes_read as usize), ManuallyDrop::into_inner(buf))
+        (
+            result.map(|bytes_read| bytes_read as usize),
+            ManuallyDrop::into_inner(buf),
+        )
     }
 
     /// Read bytes from a specific offset, vectored. Does not change the file offset.
@@ -2049,14 +2056,8 @@ impl Handle {
                 sqe.prep_read_vectored(fd, bufs_unchecked, offset);
             }
         };
-        let cqe = self
-            .send_with_ctx(
-                ring,
-                ctx,
-                prepare_fn,
-            )
-            .await?;
-        
+        let cqe = self.send_with_ctx(ring, ctx, prepare_fn).await?;
+
         let bytes_read = Self::completion_as_rw_io_result(cqe)?;
 
         Ok(bytes_read as usize)
@@ -2090,24 +2091,23 @@ impl Handle {
         let ring = ring.into();
         let fd64 = u64::try_from(fd).map_err(|_| Error::new(EBADF))?;
 
-        log::info!("WRITE_UNCHECKED ring {:?} ctx {:?} fd64 {} len {:?}, flags {:?}", ring, ctx, fd64, buf.len(), flags);
+        log::info!(
+            "WRITE_UNCHECKED ring {:?} ctx {:?} fd64 {} len {:?}, flags {:?}",
+            ring,
+            ctx,
+            fd64,
+            buf.len(),
+            flags
+        );
 
         let buf = buf
             .as_generic_slice(ring.is_primary())
             .ok_or(Error::new(EFAULT))?;
 
         let cqe = self
-            .send_with_ctx(
-                ring,
-                ctx,
-                |sqe: &mut SysSqeRef| {
-                    sqe.sys_write(
-                        fd64,
-                        buf,
-                        flags,
-                    );
-                },
-            )
+            .send_with_ctx(ring, ctx, |sqe: &mut SysSqeRef| {
+                sqe.sys_write(fd64, buf, flags);
+            })
             .await?;
 
         Self::completion_as_rw_io_result(cqe)
@@ -2161,13 +2161,9 @@ impl Handle {
         let fd64 = u64::try_from(fd).map_err(|_| Error::new(EBADF))?;
 
         let cqe = self
-            .send_with_ctx(
-                ring,
-                ctx,
-                |sqe: &mut SysSqeRef| {
-                    sqe.sys_writev(fd64, bufs, flags);
-                },
-            )
+            .send_with_ctx(ring, ctx, |sqe: &mut SysSqeRef| {
+                sqe.sys_writev(fd64, bufs, flags);
+            })
             .await?;
 
         Self::completion_as_rw_io_result(cqe)
@@ -2201,7 +2197,9 @@ impl Handle {
         #[cfg(target_os = "redox")]
         let (fd64, buf) = {
             let fd64 = u64::try_from(fd).map_err(|_| Error::new(EBADF))?;
-            let buf = buf.as_generic_slice(ring.is_primary()).ok_or(Error::new(EFAULT))?;
+            let buf = buf
+                .as_generic_slice(ring.is_primary())
+                .ok_or(Error::new(EFAULT))?;
 
             (fd64, buf)
         };
@@ -2221,14 +2219,7 @@ impl Handle {
             }
         };
 
-        let cqe = {
-            self
-            .send_with_ctx(
-                ring,
-                ctx,
-                prepare_fn,
-            ).await?
-        };
+        let cqe = { self.send_with_ctx(ring, ctx, prepare_fn).await? };
         let bytes_written = Self::completion_as_rw_io_result(cqe)?;
         Ok(bytes_written as usize)
     }
@@ -2258,9 +2249,15 @@ impl Handle {
         let ring = ring.into();
         let buf = ManuallyDrop::new(buf);
 
-        let result = unsafe { self.pwrite_unchecked(ring, ctx, fd, buf.borrow_guarded(), offset, flags).await };
+        let result = unsafe {
+            self.pwrite_unchecked(ring, ctx, fd, buf.borrow_guarded(), offset, flags)
+                .await
+        };
 
-        (result.map(|bytes_written| bytes_written as usize), ManuallyDrop::into_inner(buf))
+        (
+            result.map(|bytes_written| bytes_written as usize),
+            ManuallyDrop::into_inner(buf),
+        )
     }
 
     /// Write bytes to a specific offset, vectored, with an optional set of flags. Does not change
@@ -2308,13 +2305,7 @@ impl Handle {
             }
         };
 
-        let cqe = self
-            .send_with_ctx(
-                ring,
-                ctx,
-                prep_fn,
-            )
-            .await?;
+        let cqe = self.send_with_ctx(ring, ctx, prep_fn).await?;
 
         Self::completion_as_rw_io_result(cqe).map(|bytes_written| bytes_written as usize)
     }
@@ -2345,15 +2336,7 @@ impl Handle {
     where
         P: AsOffsetLen + ?Sized,
     {
-        self
-            .dup_unchecked_inner(
-                ring,
-                ctx,
-                fd,
-                flags,
-                param,
-            )
-            .await
+        self.dup_unchecked_inner(ring, ctx, fd, flags, param).await
     }
     /// "Duplicate" a file descriptor, returning a new one based on the old one.
     ///
@@ -2407,13 +2390,7 @@ impl Handle {
         flags: DupFlags,
     ) -> Result<usize> {
         let (fd, _) = self
-            .dup(
-                id.into(),
-                ctx,
-                fd,
-                flags,
-                Option::<&'static [u8]>::None,
-            )
+            .dup(id.into(), ctx, fd, flags, Option::<&'static [u8]>::None)
             .await?;
         Ok(fd)
     }
@@ -2433,21 +2410,19 @@ impl Handle {
 
         let fd64 = u64::try_from(fd).or(Err(Error::new(EBADF)))?;
 
-        let slice = param.map(|param| {
-            param
-                .as_offset_generic_slice()
-                .ok_or(Error::new(EFAULT))
-        }).transpose()?;
+        let slice = param
+            .map(|param| {
+                param
+                    .as_generic_slice(ring.is_primary())
+                    .ok_or(Error::new(EFAULT))
+            })
+            .transpose()?;
 
         let prepare_fn = move |sqe: &mut SysSqeRef| {
             sqe.sys_dup(fd64, flags, slice);
         };
 
-        let fut = self.send_with_ctx(
-            ring,
-            ctx,
-            prepare_fn,
-        );
+        let fut = self.send_with_ctx(ring, ctx, prepare_fn);
         let cqe = fut.await?;
 
         let res_fd = Error::demux64(cqe.status)?;
@@ -2493,21 +2468,10 @@ impl Handle {
         let addr_hint64 = u64::try_from(addr_hint).or(Err(Error::new(EOPNOTSUPP)))?;
 
         let prep_fn = move |sqe: &mut SysSqeRef| {
-            sqe.sys_mmap(
-                fd64,
-                flags,
-                addr_hint64,
-                len64,
-                offset,
-            );
+            sqe.sys_mmap(fd64, flags, addr_hint64, len64, offset);
         };
 
-        let cqe = self
-            .send_with_ctx(
-                ring,
-                ctx,
-                prep_fn,
-            ).await?;
+        let cqe = self.send_with_ctx(ring, ctx, prep_fn).await?;
 
         let pointer = Error::demux64(cqe.status)?;
         Ok(pointer as *const ())
@@ -2606,20 +2570,12 @@ impl Handle {
                 let mut sockaddr_storage = ManuallyDrop::new(sockaddr_storage);
 
                 let prep_fn = |sqe: &mut SysSqeRef| {
-                    let sockaddr_storage_ref = (&mut *sockaddr_storage)
-                        .borrow_guarded_mut();
+                    let sockaddr_storage_ref = (&mut *sockaddr_storage).borrow_guarded_mut();
 
                     sqe.set_flags(ctx.sync().linux_sqe_flags());
-                    unsafe {
-                        sqe.prep_accept(fd, Some(sockaddr_storage_ref), flags)
-                    }
+                    unsafe { sqe.prep_accept(fd, Some(sockaddr_storage_ref), flags) }
                 };
-                let future = unsafe {
-                    self.send(
-                        ring,
-                        prep_fn,
-                    )
-                };
+                let future = unsafe { self.send(ring, prep_fn) };
                 let cqe = future.await?;
 
                 let fd = Self::completion_as_rw_io_result(cqe)? as SysFd;
@@ -2734,7 +2690,12 @@ trait AsOffsetLenExt: AsOffsetLen + private2::Sealed {
         }
     }
     fn slice(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.addr() as *const u8, self.len().unwrap().try_into().unwrap()) }
+        unsafe {
+            core::slice::from_raw_parts(
+                self.addr() as *const u8,
+                self.len().unwrap().try_into().unwrap(),
+            )
+        }
     }
 }
 trait AsOffsetLenMutExt: AsOffsetLenMut + private2::Sealed {
@@ -2758,7 +2719,12 @@ trait AsOffsetLenMutExt: AsOffsetLenMut + private2::Sealed {
         }
     }
     fn slice_mut(&mut self) -> &mut [u8] {
-        unsafe { core::slice::from_raw_parts_mut(self.addr() as *mut u8, self.len_mut().unwrap().try_into().unwrap()) }
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.addr() as *mut u8,
+                self.len_mut().unwrap().try_into().unwrap(),
+            )
+        }
     }
 }
 impl<T> AsOffsetLenExt for T where T: AsOffsetLen + ?Sized {}
