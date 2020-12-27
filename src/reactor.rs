@@ -1850,16 +1850,6 @@ impl Handle {
         let ring = ring.into();
         let fd64 = u64::try_from(fd).map_err(|_| Error::new(EBADF))?;
 
-        log::info!(
-            "READ_UNCHECKED ring {:?} ctx {:?} fd64 {} buf at {:?} len {}, flags {:?}",
-            ring,
-            ctx,
-            fd64,
-            buf.as_ptr(),
-            buf.len(),
-            flags
-        );
-
         let buf = buf
             .as_generic_slice_mut(ring.is_primary())
             .ok_or(Error::new(EFAULT))?;
@@ -2090,15 +2080,6 @@ impl Handle {
     {
         let ring = ring.into();
         let fd64 = u64::try_from(fd).map_err(|_| Error::new(EBADF))?;
-
-        log::info!(
-            "WRITE_UNCHECKED ring {:?} ctx {:?} fd64 {} len {:?}, flags {:?}",
-            ring,
-            ctx,
-            fd64,
-            buf.len(),
-            flags
-        );
 
         let buf = buf
             .as_generic_slice(ring.is_primary())
