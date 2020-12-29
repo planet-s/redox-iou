@@ -78,8 +78,8 @@ pub struct ReactorId {
 
 static LAST_REACTOR_ID: AtomicUsize = AtomicUsize::new(0);
 
-/// A reactor driven by one primary `io_uring` and zero or more secondary `io_uring`s. May or may
-/// not be integrated into `Executor`
+/// A reactor driven by primary `io_uring`s and zero or more secondary `io_uring`s. May or may not
+/// be integrated into `Executor`
 #[derive(Debug)]
 pub struct Reactor {
     pub(crate) id: ReactorId,
@@ -90,16 +90,15 @@ pub struct Reactor {
     //
     // For Redox, when using secondary instances, these primary instances should be kernel-attached
     // instances, that can monitor secondary instances (typically userspace-to-userspace rings).
-    // When only a single instance is used, then this instance is free to also be a
+    // When no secondary instances are used, then these instances are free to also be a
     // userspace-to-userspace ring.
     pub(crate) main_instances: Vec<ConsumerInstanceWrapper>,
 
     // The secondary instances, which are typically userspace-to-userspace, for schemes I/O or IPC.
     // These are not blocked on using the `SYS_ENTER_IORING` syscall; instead, they use
-    // RegisterEvents.
-    // on the main instance (which __must__ be attached to the kernel for secondary instances to
-    // exist whatsoever), and then pops the entries of that ring separately, precisely like with
-    // the primary ring.
+    // RegisterEvents on the main instance (which __must__ be attached to the kernel for secondary
+    // instances to exist whatsoever), and then pops the entries of that ring separately, precisely
+    // like with the primary ring.
     #[cfg(target_os = "redox")]
     pub(crate) secondary_instances: RwLock<SecondaryInstancesWrapper>,
 
@@ -156,49 +155,25 @@ pub(crate) struct ProducerInstanceWrapper {
 }
 #[cfg(target_os = "redox")]
 #[derive(Debug)]
-pub(crate) enum SecondaryInstanceWrapper {
-    // Since this is a secondary instance, a userspace-to-userspace consumer.
-    ConsumerInstance(ConsumerInstanceWrapper),
-
-    // Either a kernel-to-userspace producer, or a userspace-to-userspace producer.
-    ProducerInstance(ProducerInstanceWrapper),
-}
-
-#[cfg(target_os = "redox")]
-impl SecondaryInstanceWrapper {
-    pub(crate) fn as_consumer_instance(&self) -> Option<&ConsumerInstanceWrapper> {
-        match self {
-            Self::ConsumerInstance(ref instance) => Some(instance),
-
-            #[cfg(target_os = "redox")]
-            Self::ProducerInstance(_) => None,
-        }
-    }
-    #[cfg(target_os = "redox")]
-    pub(crate) fn as_producer_instance(&self) -> Option<&ProducerInstanceWrapper> {
-        match self {
-            Self::ConsumerInstance(_) => None,
-            Self::ProducerInstance(ref instance) => Some(instance),
-        }
-    }
-}
-
-#[cfg(target_os = "redox")]
-#[derive(Debug)]
 pub(crate) struct SecondaryInstancesWrapper {
-    pub(crate) instances: Vec<SecondaryInstanceWrapper>,
+    pub(crate) consumer_instances: Vec<ConsumerInstanceWrapper>,
+    pub(crate) producer_instances: Vec<ProducerInstanceWrapper>,
     // maps file descriptor to index within the instances
-    fds_backref: BTreeMap<usize, usize>,
+    fds_backref: BTreeMap<usize, (usize, BackrefTy)>,
+}
+#[cfg(target_os = "redox")]
+#[derive(Clone, Copy, Debug)]
+enum BackrefTy {
+    Consumer,
+    Producer,
 }
 
 /// An ID that can uniquely identify the reactor that uses a ring, as well as the ring within that
 /// reactor itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RingId {
-    pub(crate) reactor: ReactorId,
-    // 0 means main instance, a number above zero is the index of the secondary instance in the
-    // vec, plus 1.
-    pub(crate) inner: usize,
+    pub(crate) reactor_id: ReactorId,
+    pub(crate) index: usize,
     pub(crate) ty: RingTy,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,30 +187,30 @@ pub(crate) enum RingTy {
 /// A ring ID that is guaranteed to be the primary ring of a reactor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrimaryRingId {
-    pub(crate) reactor: ReactorId,
-    pub(crate) inner: usize,
+    pub(crate) reactor_id: ReactorId,
+    pub(crate) index: usize,
 }
 /// A ring ID that is guaranteed to be a secondary ring of a reactor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg(any(doc, target_os = "redox"))]
 #[doc(cfg(target_os = "redox"))]
 pub struct SecondaryRingId {
-    pub(crate) reactor: ReactorId,
-    pub(crate) inner: usize,
+    pub(crate) reactor_id: ReactorId,
+    pub(crate) index: usize,
 }
 /// A ring ID that is guaranteed to be a producer ring of a reactor.
 #[cfg(any(doc, target_os = "redox"))]
 #[doc(cfg(target_os = "redox"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProducerRingId {
-    pub(crate) reactor: ReactorId,
-    pub(crate) inner: usize,
+    pub(crate) reactor_id: ReactorId,
+    pub(crate) index: usize,
 }
 impl PrimaryRingId {
     /// Get the unique reactor ID using this ring.
     #[inline]
-    pub fn reactor(&self) -> ReactorId {
-        self.reactor
+    pub fn reactor_id(&self) -> ReactorId {
+        self.reactor_id
     }
 }
 #[cfg(any(doc, target_os = "redox"))]
@@ -243,8 +218,8 @@ impl PrimaryRingId {
 impl SecondaryRingId {
     /// Get the unique reactor ID using this ring.
     #[inline]
-    pub fn reactor(&self) -> ReactorId {
-        self.reactor
+    pub fn reactor_id(&self) -> ReactorId {
+        self.reactor_id
     }
 }
 #[cfg(any(doc, target_os = "redox"))]
@@ -252,15 +227,15 @@ impl SecondaryRingId {
 impl ProducerRingId {
     /// Get the unique reactor ID using this ring.
     #[inline]
-    pub fn reactor(&self) -> ReactorId {
-        self.reactor
+    pub fn reactor_id(&self) -> ReactorId {
+        self.reactor_id
     }
 }
 impl RingId {
     /// Get an ID that can uniquely identify the reactor that uses this ring.
     #[inline]
     pub fn reactor(&self) -> ReactorId {
-        self.reactor
+        self.reactor_id
     }
     /// Check whether the ring is the primary ring.
     #[inline]
@@ -288,8 +263,8 @@ impl RingId {
     pub fn try_into_primary(&self) -> Option<PrimaryRingId> {
         if self.is_primary() {
             Some(PrimaryRingId {
-                reactor: self.reactor,
-                inner: self.inner,
+                reactor_id: self.reactor_id,
+                index: self.index,
             })
         } else {
             None
@@ -302,8 +277,8 @@ impl RingId {
     pub fn try_into_secondary(&self) -> Option<SecondaryRingId> {
         if self.is_secondary() {
             Some(SecondaryRingId {
-                reactor: self.reactor,
-                inner: self.inner,
+                reactor_id: self.reactor_id,
+                index: self.index,
             })
         } else {
             None
@@ -316,8 +291,8 @@ impl RingId {
     pub fn try_into_producer(&self) -> Option<ProducerRingId> {
         if self.is_producer() {
             Some(ProducerRingId {
-                reactor: self.reactor,
-                inner: self.inner,
+                reactor_id: self.reactor_id,
+                index: self.index,
             })
         } else {
             None
@@ -328,7 +303,7 @@ impl RingId {
 impl PartialEq<RingId> for PrimaryRingId {
     #[inline]
     fn eq(&self, other: &RingId) -> bool {
-        self.reactor == other.reactor && self.inner == other.inner && other.ty == RingTy::Primary
+        self.reactor_id == other.reactor_id && self.index == other.index && other.ty == RingTy::Primary
     }
 }
 impl PartialEq<PrimaryRingId> for RingId {
@@ -342,7 +317,7 @@ impl PartialEq<PrimaryRingId> for RingId {
 impl PartialEq<RingId> for SecondaryRingId {
     #[inline]
     fn eq(&self, other: &RingId) -> bool {
-        self.reactor == other.reactor && self.inner == other.inner && other.ty == RingTy::Secondary
+        self.reactor_id == other.reactor_id && self.index == other.index && other.ty == RingTy::Secondary
     }
 }
 #[cfg(any(doc, target_os = "redox"))]
@@ -358,7 +333,7 @@ impl PartialEq<SecondaryRingId> for RingId {
 impl PartialEq<RingId> for ProducerRingId {
     #[inline]
     fn eq(&self, other: &RingId) -> bool {
-        self.reactor == other.reactor && self.inner == other.inner && other.ty == RingTy::Producer
+        self.reactor_id == other.reactor_id && self.index == other.index && other.ty == RingTy::Producer
     }
 }
 #[cfg(any(doc, target_os = "redox"))]
@@ -373,8 +348,8 @@ impl From<PrimaryRingId> for RingId {
     #[inline]
     fn from(primary: PrimaryRingId) -> Self {
         Self {
-            reactor: primary.reactor,
-            inner: primary.inner,
+            reactor_id: primary.reactor_id,
+            index: primary.index,
             ty: RingTy::Primary,
         }
     }
@@ -385,8 +360,8 @@ impl From<SecondaryRingId> for RingId {
     #[inline]
     fn from(secondary: SecondaryRingId) -> Self {
         Self {
-            reactor: secondary.reactor,
-            inner: secondary.inner,
+            reactor_id: secondary.reactor_id,
+            index: secondary.index,
             ty: RingTy::Secondary,
         }
     }
@@ -397,8 +372,8 @@ impl From<ProducerRingId> for RingId {
     #[inline]
     fn from(secondary: ProducerRingId) -> Self {
         Self {
-            reactor: secondary.reactor,
-            inner: secondary.inner,
+            reactor_id: secondary.reactor_id,
+            index: secondary.index,
             ty: RingTy::Producer,
         }
     }
@@ -415,18 +390,18 @@ impl From<RingId> for RingIdKind {
     fn from(id: RingId) -> Self {
         match id.ty {
             RingTy::Primary => RingIdKind::Primary(PrimaryRingId {
-                reactor: id.reactor,
-                inner: id.inner,
+                reactor_id: id.reactor_id,
+                index: id.index,
             }),
             #[cfg(target_os = "redox")]
             RingTy::Secondary => RingIdKind::Secondary(SecondaryRingId {
-                reactor: id.reactor,
-                inner: id.inner,
+                reactor_id: id.reactor_id,
+                index: id.index,
             }),
             #[cfg(target_os = "redox")]
             RingTy::Producer => RingIdKind::Producer(ProducerRingId {
-                reactor: id.reactor,
-                inner: id.inner,
+                reactor_id: id.reactor_id,
+                index: id.index,
             }),
         }
     }
@@ -591,7 +566,8 @@ impl Reactor {
 
             #[cfg(target_os = "redox")]
             secondary_instances: RwLock::new(SecondaryInstancesWrapper {
-                instances: Vec::new(),
+                consumer_instances: Vec::new(),
+                producer_instances: Vec::new(),
                 fds_backref: BTreeMap::new(),
             }),
 
@@ -631,11 +607,11 @@ impl Reactor {
     /// Retrieve the ring ID of the primary instance, which must be a userspace-to-kernel ring if
     /// there are more than one rings in the reactor.
     pub fn primary_instances(&self) -> impl Iterator<Item = PrimaryRingId> + '_ {
-        let id = self.id();
+        let reactor_id = self.id();
 
-        (0..self.main_instances.len()).map(move |idx| PrimaryRingId {
-            reactor: id,
-            inner: idx,
+        (0..self.main_instances.len()).map(move |index| PrimaryRingId {
+            reactor_id,
+            index,
         })
     }
     /// Obtain a handle to this reactor, capable of creating futures that use it. The handle will
@@ -657,7 +633,7 @@ impl Reactor {
     ) -> Result<SecondaryRingId> {
         let ringfd = instance.ringfd();
         self.add_secondary_instance_generic(
-            SecondaryInstanceWrapper::ConsumerInstance(ConsumerInstanceWrapper {
+            Left(ConsumerInstanceWrapper {
                 consumer_instance: instance,
                 dropped: AtomicBool::new(false),
                 trusted: false, // TODO
@@ -665,21 +641,21 @@ impl Reactor {
             ringfd,
             ctx,
         )
-        .map(|instances_len| SecondaryRingId {
-            inner: instances_len,
-            reactor: self.id,
+        .map(|last_index| SecondaryRingId {
+            index: last_index,
+            reactor_id: self.id,
         })
     }
     #[cfg(target_os = "redox")]
     fn add_secondary_instance_generic(
         &self,
-        instance: SecondaryInstanceWrapper,
+        instance: Either<ConsumerInstanceWrapper, ProducerInstanceWrapper>,
         ringfd: usize,
         ctx: SubmissionContext,
     ) -> Result<usize> {
         let mut guard = self.secondary_instances.write();
 
-        // Tell the kernel to send us speciel event CQEs which indicate that other io_urings have
+        // Tell the kernel to send us special event CQEs which indicate that other io_urings have
         // received additional entries, which is what actually allows secondary instances to make
         // progress.
         {
@@ -712,12 +688,24 @@ impl Reactor {
                 })?;
         }
 
-        let instances_len = guard.instances.len();
+        let (last_index, ty) = match instance {
+            Left(consumer_instance) => {
+                let instances_len = guard.consumer_instances.len();
+                guard.consumer_instances.push(consumer_instance);
 
-        guard.fds_backref.insert(ringfd, instances_len);
-        guard.instances.push(instance);
+                (instances_len, BackrefTy::Consumer)
+            }
+            Right(producer_instance) => {
+                let instances_len = guard.producer_instances.len();
+                guard.producer_instances.push(producer_instance);
 
-        Ok(instances_len)
+                (instances_len, BackrefTy::Producer)
+            }
+        };
+
+        guard.fds_backref.insert(ringfd, (last_index, ty));
+
+        Ok(last_index)
     }
     /// Add a producer instance (the producer of a userspace-to-userspace or kernel-to-userspace
     /// instance). This will use the main ring to register interest in file updates on the file
@@ -732,7 +720,7 @@ impl Reactor {
     ) -> Result<ProducerRingId> {
         let ringfd = instance.ringfd();
         self.add_secondary_instance_generic(
-            SecondaryInstanceWrapper::ProducerInstance(ProducerInstanceWrapper {
+            Right(ProducerInstanceWrapper {
                 producer_instance: instance,
                 dropped: AtomicBool::new(false),
                 stream_state: None,
@@ -740,9 +728,9 @@ impl Reactor {
             ringfd,
             ctx,
         )
-        .map(|instances_len| ProducerRingId {
-            inner: instances_len,
-            reactor: self.id,
+        .map(|last_index| ProducerRingId {
+            index: last_index,
+            reactor_id: self.id,
         })
     }
     /// Retrieve the unique ID of this reactor.
@@ -776,12 +764,12 @@ impl Reactor {
                 .upgrade()
                 .expect("failed to wake up executor: integrated reactor dead");
 
-            let instance = reactor
+            let main_instance = reactor
                 .main_instances
                 .get(index)
                 .expect("index passed to driving_waker shouldn't be invalid");
 
-            if instance.dropped.load(Ordering::Acquire) {
+            if main_instance.dropped.load(Ordering::Acquire) {
                 return;
             }
 
@@ -799,18 +787,22 @@ impl Reactor {
                 // is only true for certain higher-priority processes), there are probably no major
                 // benefits in addition to that.
 
-                let consumer_instance = &reactor.main_instances.get(0).unwrap().consumer_instance;
+                dbg!();
+                let consumer_instance = &main_instance.consumer_instance;
+                dbg!();
 
                 consumer_instance.receiver().read().notify_self_about_push();
+                dbg!();
 
                 // TODO: Only enter for rings that are not polled by the kernel when scheduling.
                 consumer_instance
                     .enter_for_notification()
                     .expect("failed to wake up executor: entering the io_uring failed");
+                dbg!();
             }
             #[cfg(target_os = "linux")]
             {
-                let guard = instance.current_threadid.read();
+                let guard = main_instance.current_threadid.read();
                 // On Linux, we wake up the primary ring by triggering a custom signal that is set
                 // to SIG_IGN, but with the SA_RESTART flag, causing the `io_uring_enter` syscall
                 // to immediately error with EINTR.
@@ -870,9 +862,17 @@ impl Reactor {
 
             let mut receiver_write_guard = instance.consumer_instance.receiver().write();
 
-            for cqe_result in receiver_write_guard.as_64_mut().unwrap().try_iter() {
-                match cqe_result {
-                    Ok(cqe) => self.drive_handle_cqe(primary, instance.trusted, cqe, waker),
+            loop {
+                match receiver_write_guard.as_64_mut().unwrap().try_recv(){
+                    Ok(cqe) => {
+                        // NOTE: The driving wakers that will possibly be called here, must be able
+                        // to acquire a read lock. We therefore downgrade our receiver exclusive
+                        // lock, into an intent lock, and then eventually back.
+                        let receiver_intent_guard = RwLockWriteGuard::downgrade_to_upgradable(receiver_write_guard);
+                        let result = self.drive_handle_cqe(primary, instance.trusted, cqe, waker);
+                        receiver_write_guard = RwLockUpgradableReadGuard::upgrade(receiver_intent_guard);
+                        result
+                    }
                     Err(RingPopError::Empty { .. }) => break,
                     Err(RingPopError::Shutdown) => {
                         instance
@@ -949,8 +949,8 @@ impl Reactor {
 
             let secondary_instances_guard = self.secondary_instances.read();
 
-            let secondary_instance_index = match secondary_instances_guard.fds_backref.get(&fd) {
-                Some(idx) => *idx,
+            let (secondary_instance_index, backref_ty) = match secondary_instances_guard.fds_backref.get(&fd) {
+                Some(pair) => *pair,
                 None => {
                     log::warn!("The fd ({}) meant to describe the instance to drive, was not recognized. Ignoring event.", fd);
                     return;
@@ -960,16 +960,25 @@ impl Reactor {
                 .main_instances
                 .get(0)
                 .expect("expected primary instance to exist");
-            match secondary_instances_guard
-                .instances
-                .get(secondary_instance_index)
-                .expect("fd backref BTreeMap corrupt, contains a file descriptor that was removed")
-            {
-                SecondaryInstanceWrapper::ConsumerInstance(ref instance) => {
+
+            let errmsg = "fd backref BTreeMap corrupt, contains a file descriptor that was removed";
+            match backref_ty {
+                BackrefTy::Consumer => {
+                    let instance = secondary_instances_guard
+                        .consumer_instances
+                        .get(secondary_instance_index)
+                        .expect(errmsg);
+
                     self.drive(instance, waker, false, false)
                         .expect("failed to drive consumer instance");
+
                 }
-                SecondaryInstanceWrapper::ProducerInstance(ref instance) => {
+                BackrefTy::Producer => {
+                    let instance = secondary_instances_guard
+                        .producer_instances
+                        .get(secondary_instance_index)
+                        .expect(errmsg);
+
                     self.drive_producer_instance(primary_instance, &instance)
                         .expect("failed to drive producer instance");
                 }
@@ -1016,7 +1025,10 @@ impl Reactor {
                             .try_recv()
                         {
                             Ok(sqe) => sqe,
-                            Err(RingPopError::Empty { .. }) => break,
+                            Err(RingPopError::Empty { .. }) => {
+                                log::debug!("Ring was empty");
+                                break;
+                            }
                             Err(RingPopError::Shutdown) => {
                                 log::debug!("Secondary producer ring dropped");
                                 instance
@@ -1030,10 +1042,13 @@ impl Reactor {
                                 return Err(Error::new(EIO));
                             }
                         };
-                        log::trace!("Secondary producer SQE: {:?}", sqe);
+                        log::debug!("Secondary producer SQE: {:?}", sqe);
                         deque.push_back(sqe);
+                        log::debug!("pushed");
                         if let Some(future_waker) = future_waker.take() {
+                            log::debug!("will awake");
                             future_waker.wake();
+                            log::debug!("awoke");
                         }
                         log::debug!("New driving state: {:?}", &*state_guard);
                     } else {
@@ -1112,7 +1127,7 @@ impl Reactor {
     pub(crate) fn consumer_instance(
         &self,
         ring: impl Into<RingId>,
-    ) -> Option<Either<&ConsumerInstance, MappedRwLockReadGuard<ConsumerInstance>>> {
+    ) -> Either<&ConsumerInstance, MappedRwLockReadGuard<ConsumerInstance>> {
         let ring = ring.into();
 
         if ring.reactor() != self.id() {
@@ -1122,19 +1137,20 @@ impl Reactor {
                 self.id()
             );
         }
+        #[cfg(target_os = "redox")]
+        assert_ne!(ring.ty, RingTy::Producer);
 
         if ring.is_primary() {
-            Some(Left(&self.main_instances[ring.inner].consumer_instance))
+            Left(&self.main_instances[ring.index].consumer_instance)
         } else {
             #[cfg(target_os = "redox")]
             {
-                RwLockReadGuard::try_map(self.secondary_instances.read(), |instances| {
-                    instances.instances[ring.inner - 1]
-                        .as_consumer_instance()
-                        .map(|i| &i.consumer_instance)
-                })
-                .ok()
-                .map(Right)
+                Right(RwLockReadGuard::map(self.secondary_instances.read(), |instances| {
+                    &instances.consumer_instances
+                        .get(ring.index)
+                        .expect("invalid secondary consumer ring ID")
+                        .consumer_instance
+                }))
             }
             #[cfg(not(target_os = "redox"))]
             unreachable!();
@@ -1310,10 +1326,10 @@ impl Handle {
             .upgrade()
             .expect("failed to initiate new command: reactor is dead");
 
-        assert_eq!(ring.reactor, reactor.id());
+        assert_eq!(ring.reactor_id, reactor.id());
 
         #[cfg(target_os = "redox")]
-        let trusted = ring.is_primary() && reactor.main_instances[ring.inner].trusted;
+        let trusted = ring.is_primary() && reactor.main_instances[ring.index].trusted;
 
         #[cfg(target_os = "linux")]
         let trusted = true;
@@ -1418,20 +1434,14 @@ impl Handle {
             .upgrade()
             .expect("failed to send producer CQE: reactor is dead");
 
-        assert_eq!(reactor.id(), instance.reactor);
+        assert_eq!(reactor.id(), instance.reactor_id());
 
         let guard = reactor.secondary_instances.read();
 
-        let producer_instance = match guard
-            .instances
-            .get(instance.inner)
-            .expect("invalid SecondaryRingId: non-existent instance")
-        {
-            SecondaryInstanceWrapper::ProducerInstance(ref instance) => instance,
-            SecondaryInstanceWrapper::ConsumerInstance(_) => {
-                panic!("cannot send producer CQE using a consumer instance")
-            }
-        };
+        let producer_instance = guard
+            .producer_instances
+            .get(instance.index)
+            .expect("invalid ProducerRingId: non-existent instance");
 
         let send_result = producer_instance
             .producer_instance
@@ -1474,42 +1484,30 @@ impl Handle {
             .upgrade()
             .expect("failed to send producer CQE: reactor is dead");
 
-        assert_eq!(reactor.id(), ring_id.reactor);
+        assert_eq!(reactor.id(), ring_id.reactor_id());
 
-        let secondary_instances = reactor.secondary_instances.upgradable_read();
+        let mut secondary_instances = reactor.secondary_instances.write();
 
-        let state_opt = match secondary_instances.instances.get(ring_id.inner).unwrap() {
-            SecondaryInstanceWrapper::ConsumerInstance(_) => {
-                panic!("calling producer_sqes on a consumer instance")
-            }
-            SecondaryInstanceWrapper::ProducerInstance(ref instance) => {
-                instance.stream_state.clone()
-            }
-        };
+        let producer_instance = secondary_instances
+            .producer_instances
+            .get_mut(ring_id.index)
+            .expect("ring ID has an invalid index");
+
+
+        let state_opt = producer_instance.stream_state.clone();
         // TODO: Override capacity if the stream state already is present.
 
         let state = match state_opt {
             Some(st) => st,
             None => {
-                let mut secondary_instances =
-                    RwLockUpgradableReadGuard::upgrade(secondary_instances);
-                match secondary_instances
-                    .instances
-                    .get_mut(ring_id.inner)
-                    .unwrap()
-                {
-                    SecondaryInstanceWrapper::ConsumerInstance(_) => unreachable!(),
-                    SecondaryInstanceWrapper::ProducerInstance(ref mut instance) => {
-                        let new_state = Arc::new(Mutex::new(ProducerSqesState::Receiving {
-                            capacity,
-                            deque: VecDeque::with_capacity(capacity),
-                            waker: None,
-                        }));
+                let new_state = Arc::new(Mutex::new(ProducerSqesState::Receiving {
+                    capacity,
+                    deque: VecDeque::with_capacity(capacity),
+                    waker: None,
+                }));
 
-                        instance.stream_state = Some(Arc::clone(&new_state));
-                        new_state
-                    }
-                }
+                producer_instance.stream_state = Some(Arc::clone(&new_state));
+                new_state
             }
         };
 

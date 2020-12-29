@@ -114,25 +114,19 @@ impl Handle {
 
         let ringfd = {
             let secondary_instances = reactor.secondary_instances.read();
-            let instance = secondary_instances
-                .instances
-                .get(inner_idx)
-                .expect("invalid secondary ring id");
 
             if producer {
-                instance
-                    .as_producer_instance()
-                    .expect(
-                        "ring id represents consumer instance, but expected a producer instance",
-                    )
+                secondary_instances
+                    .producer_instances
+                    .get(inner_idx)
+                    .expect("invalid secondary ring id")
                     .producer_instance
                     .ringfd()
             } else {
-                instance
-                    .as_consumer_instance()
-                    .expect(
-                        "ring id represents producer instance, but expected a consumer instance",
-                    )
+                secondary_instances
+                    .consumer_instances
+                    .get(inner_idx)
+                    .expect("invalid secondary ring id")
                     .consumer_instance
                     .ringfd()
             }
@@ -169,8 +163,8 @@ impl Handle {
     ) -> Result<pool::BufferPool<I, BufferPoolHandle, ()>> {
         let pool = self
             .create_buffer_pool_inner(
-                secondary_instance.inner,
-                secondary_instance.reactor.inner,
+                secondary_instance.index,
+                secondary_instance.reactor_id.inner,
                 true,
             )
             .await?;
@@ -191,8 +185,8 @@ impl Handle {
     ) -> Result<pool::BufferPool<I, BufferPoolHandle, E>> {
         let pool = self
             .create_buffer_pool_inner(
-                secondary_instance.inner,
-                secondary_instance.reactor.inner,
+                secondary_instance.index,
+                secondary_instance.reactor_id.inner,
                 false,
             )
             .await?;
