@@ -30,6 +30,7 @@ libc = "0.2"
 #iou = "0.3"
 iou = { git = "https://github.com/4lDO2/iou", branch = "cqe-debug" }
 uring-sys = "0.7.4"
+uapi = "0.2"
 
 [dev-dependencies]
 env_logger = "0.7"

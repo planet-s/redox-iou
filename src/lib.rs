@@ -14,7 +14,8 @@
     option_expect_none,
     vec_into_raw_parts
 )]
-#![cfg_attr(test, feature(slice_fill))]
+// TODO: Once Redox starts using a newer compiler version, remove this.
+#![cfg_attr(all(test, target_os = "redox"), feature(slice_fill))]
 // TODO: This lint was probably introduced before const fns even existed, and is completely useless
 // here since it's marked as "perf" while it can reduce performance in some scenarios (for debug
 // builds, that is. release builds will likely optimize this away nevertheless).

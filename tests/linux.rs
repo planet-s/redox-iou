@@ -9,7 +9,7 @@ use redox_iou::executor::Executor;
 use redox_iou::reactor::{OpenInfo, ReactorBuilder, SubmissionContext, SubmissionSync};
 
 #[cfg(target_os = "linux")]
-use redox_iou::linux::ConsumerInstance;
+use redox_iou::linux::{ConsumerInstance, ReadFlags};
 
 #[cfg(target_os = "linux")]
 #[test]
@@ -50,7 +50,7 @@ fn basic_file_io() -> Result<(), Box<dyn Error + 'static>> {
                 fd,
                 guarded_buffer,
                 0,
-                (),
+                ReadFlags::empty(),
             )
             .await;
         let bytes_read = bytes_read_result?;

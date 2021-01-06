@@ -28,8 +28,10 @@ use syscall::error::{
 };
 use syscall::flag::{EventFlags, MapFlags};
 use syscall::io_uring::v1::operation::{
-    CloseFlags, DupFlags, OpenFlags, ReadFlags, RegisterEventsFlags, WriteFlags,
+    CloseFlags, DupFlags, OpenFlags, RegisterEventsFlags,
 };
+#[cfg(target_os = "redox")]
+use syscall::io_uring::v1::operation::{ReadFlags, WriteFlags};
 use syscall::io_uring::v1::{
     BrokenRing, CqEntry64, IoUringCqeFlags, IoUringSqeFlags, Priority, RingPopError, RingPushError,
     SqEntry64, StandardOpcode,
@@ -61,11 +63,17 @@ use crate::redox::instance::{ConsumerGenericSender, ConsumerInstance};
 #[cfg(any(doc, target_os = "redox"))]
 use crate::redox::instance::ProducerInstance;
 
+#[cfg(target_os = "linux")]
+use crate::linux::{ReadFlags, WriteFlags};
+
 // TODO: Fix ConsumerInstance conflict.
 #[cfg(any(doc, target_os = "linux"))]
 use crate::linux::ConsumerInstance;
 
 use crate::memory::{Guarded, GuardedMut};
+
+#[cfg(target_os = "linux")]
+const OFFSET_TREAT_AS_POSITIONED: u64 = (-1_i64) as u64;
 
 /// A unique ID that every reactor gets upon initialization.
 ///
@@ -460,14 +468,14 @@ pub type SysIoVec = libc::iovec;
 pub type SysWriteFlags = WriteFlags;
 /// The system type for pwritev2 flags.
 #[cfg(target_os = "linux")]
-pub type SysWriteFlags = ();
+pub type SysWriteFlags = WriteFlags;
 
-/// The system type for pread2 flags.
+/// The system type for preadv2 flags.
 #[cfg(target_os = "redox")]
 pub type SysReadFlags = ReadFlags;
-/// The system type for pread2 flags.
+/// The system type for preadv2 flags.
 #[cfg(target_os = "linux")]
-pub type SysReadFlags = ();
+pub type SysReadFlags = ReadFlags;
 
 /// The system type for close flags.
 #[cfg(target_os = "redox")]
@@ -1834,9 +1842,6 @@ impl Handle {
     /// not reclaimed until the command is either complete or cancelled.
     ///
     /// [`read`]: #method.read
-    // TODO: Linux?
-    #[cfg(any(doc, target_os = "redox"))]
-    #[doc(cfg(target_os = "redox"))]
     pub async unsafe fn read_unchecked(
         &self,
         ring: impl Into<RingId>,
@@ -1844,17 +1849,31 @@ impl Handle {
         fd: SysFd,
         buf: &mut [u8],
         flags: ReadFlags,
-    ) -> Result<usize> {
+    ) -> Result<SysRetval> {
         let ring = ring.into();
-        let fd64 = u64::try_from(fd).map_err(|_| Error::new(EBADF))?;
 
-        let buf = buf
-            .as_generic_slice_mut(ring.is_primary())
-            .ok_or(Error::new(EFAULT))?;
+        #[cfg(target_os = "redox")]
+        let (buf, fd64) = {
+            let buf = buf
+                .as_generic_slice_mut(ring.is_primary())
+                .ok_or(Error::new(EFAULT))?;
+
+            let fd64 = u64::try_from(fd).map_err(|_| Error::new(EBADF))?;
+
+            (buf, fd64)
+        };
 
         let cqe = self
             .send_with_ctx(ring, ctx, |sqe: &mut SysSqeRef| {
-                sqe.sys_read(fd64, buf, flags);
+                #[cfg(target_os = "redox")]
+                {
+                    sqe.sys_read(fd64, buf, flags);
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    sqe.prep_read(fd, buf, OFFSET_TREAT_AS_POSITIONED);
+                    sqe.raw_mut().cmd_flags = uring_sys::cmd_flags { rw_flags: flags.bits() as _ };
+                }
             })
             .await?;
 
@@ -1865,17 +1884,14 @@ impl Handle {
     /// This is the safe variant of [`read_unchecked`].
     ///
     /// [`read_unchecked`]: #method.read_unchecked
-    // TODO: Linux?
-    #[cfg(any(doc, target_os = "redox"))]
-    #[doc(cfg(target_os = "redox"))]
     pub async fn read<B>(
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
-        fd: usize,
+        fd: SysFd,
         buf: B,
         flags: ReadFlags,
-    ) -> (Result<usize>, B)
+    ) -> (Result<SysRetval>, B)
     where
         // TODO: Uninitialized memory and `ioslice`.
         B: GuardedMut<Target = [u8]> + AsOffsetLen,
@@ -1900,24 +1916,36 @@ impl Handle {
     /// The caller must ensure that the buffers outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
     // TODO: safe wrapper
-    // TODO: Linux?
-    #[cfg(any(doc, target_os = "redox"))]
-    #[doc(cfg(target_os = "reodx"))]
     pub async unsafe fn readv_unchecked(
         &self,
         ring: impl Into<RingId>,
         ctx: SubmissionContext,
-        fd: usize,
-        bufs: &[IoVec],
+        fd: SysFd,
+        bufs: &mut [SysIoVec],
         flags: ReadFlags,
-    ) -> Result<usize> {
+    ) -> Result<SysRetval> {
         let ring = ring.into();
 
+        #[cfg(target_os = "redox")]
         let fd64 = u64::try_from(fd).map_err(|_| Error::new(EBADF))?;
 
         let cqe = self
             .send_with_ctx(ring, ctx, |sqe: &mut SysSqeRef| {
-                sqe.sys_readv(fd64, bufs, flags);
+                #[cfg(target_os = "redox")]
+                {
+                    sqe.sys_readv(fd64, bufs, flags);
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let bufs_unchecked = {
+                        core::slice::from_raw_parts_mut(
+                            bufs.as_mut_ptr() as *mut std::io::IoSliceMut,
+                            bufs.len(),
+                        )
+                    };
+                    sqe.prep_read_vectored(fd, bufs_unchecked, OFFSET_TREAT_AS_POSITIONED);
+                    sqe.raw_mut().cmd_flags = uring_sys::cmd_flags { rw_flags: flags.bits() as _ };
+                }
             })
             .await?;
 
@@ -1957,7 +1985,7 @@ impl Handle {
             (fd64, data_mut)
         };
 
-        let prepare_fn = |sqe: &mut SysSqeRef| unsafe {
+        let prepare_fn = |sqe: &mut SysSqeRef| {
             #[cfg(target_os = "redox")]
             {
                 sqe.sys_pread(fd64, data_mut, offset, flags);
@@ -1966,10 +1994,11 @@ impl Handle {
             {
                 let _ = flags;
                 sqe.prep_read(fd, data_mut, offset);
+                sqe.raw_mut().cmd_flags = uring_sys::cmd_flags { rw_flags: flags.bits() as _ };
             }
         };
 
-        let cqe = unsafe { self.send_with_ctx(ring, ctx, prepare_fn).await? };
+        let cqe = self.send_with_ctx(ring, ctx, prepare_fn).await?;
         let bytes_read = Self::completion_as_rw_io_result(cqe)? as usize;
         Ok(bytes_read as usize)
     }
@@ -2042,6 +2071,16 @@ impl Handle {
                     )
                 };
                 sqe.prep_read_vectored(fd, bufs_unchecked, offset);
+
+                // NOTE: Linux does indeed seem to support these flags, since it uses rw_flags from
+                // sqe directly, to call kiocb_set_rw_flags, which AIO also calls, as well as the
+                // regular vfs_read (which in turn is called by the actual read(2) syscall,
+                // although only preadv2 and pwritev2 allow the _user_ to set these). And, those
+                // flags having the prefix RWF_, for instance RWF_HIPRI, should be settable.
+                //
+                // However, they are not yet incorporated into liburing, for some reason, so we'll
+                // need to set these manually.
+                sqe.raw_mut().cmd_flags = uring_sys::cmd_flags { rw_flags: flags.bits() as _ };
             }
         };
         let cqe = self.send_with_ctx(ring, ctx, prepare_fn).await?;
@@ -2195,6 +2234,7 @@ impl Handle {
             {
                 let _ = flags;
                 sqe.prep_write(fd, buf, offset);
+                sqe.raw_mut().cmd_flags = uring_sys::cmd_flags { rw_flags: flags.bits() as _ };
             }
         };
 
@@ -2268,7 +2308,6 @@ impl Handle {
             }
             #[cfg(target_os = "linux")]
             {
-                let _ = flags;
                 // TODO: Use the `ioslice` crate for safe casts. Otherwise, it will suffice
                 // to simply cast the slice unsafely, by reinterpreting its type. They must
                 // be valid since this is unsafe.
@@ -2279,8 +2318,8 @@ impl Handle {
                     )
                 };
 
-                // TODO: flags
                 sqe.prep_write_vectored(fd as SysFd, bufs_unchecked, offset);
+                sqe.raw_mut().cmd_flags = uring_sys::cmd_flags { rw_flags: flags.bits() as _ };
             }
         };
 
