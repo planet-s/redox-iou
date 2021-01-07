@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::convert::TryInto;
 use std::future::Future;
 use std::pin::Pin;
@@ -7,16 +6,24 @@ use std::sync::{Arc, Weak};
 use std::{fmt, task};
 
 use syscall::error::{Error, Result};
-use syscall::error::{ECANCELED, EFAULT, EIO, ESHUTDOWN};
+use syscall::error::{ECANCELED, EFAULT};
 use syscall::flag::EventFlags;
-use syscall::io_uring::{CqEntry64, IoUringCqeFlags, RingPushError, SqEntry64};
 
 use either::*;
-use futures_core::Stream;
 use parking_lot::Mutex;
 
 #[cfg(target_os = "redox")]
-use crate::redox::instance::ConsumerInstance;
+use {
+    crate::redox::instance::ConsumerInstance,
+    syscall::io_uring::{IoUringCqeFlags, RingPushError},
+    syscall::error::{EIO, ESHUTDOWN},
+};
+#[cfg(any(doc, target_os = "redox"))]
+use {
+    std::collections::VecDeque,
+    futures_core::Stream,
+    syscall::io_uring::SqEntry64,
+};
 
 #[cfg(target_os = "linux")]
 use crate::linux::ConsumerInstance;
@@ -115,7 +122,7 @@ fn try_submit(
 
     prepare(&mut sqe);
 
-    let sqe = match user_data {
+    match user_data {
         Left(state_weak) => match (Weak::into_raw(state_weak) as usize).try_into() {
             Ok(ptr64) => {
                 #[cfg(target_os = "redox")]
@@ -127,8 +134,6 @@ fn try_submit(
                 unsafe {
                     sqe.set_user_data(ptr64)
                 }
-
-                sqe
             }
             Err(_) => return task::Poll::Ready(Error::new(EFAULT)),
         },
@@ -142,8 +147,6 @@ fn try_submit(
             unsafe {
                 sqe.set_user_data(tag)
             }
-
-            sqe
         }
     };
 
@@ -170,7 +173,7 @@ fn try_submit(
             }
             task::Poll::Pending
         }
-        Err(RingPushError::Full(sqe)) => {
+        Err(RingPushError::Full(_)) => {
             state.inner = StateInner::Submitting(cx.waker().clone());
             log::debug!("io_uring submission queue full");
             task::Poll::Pending
@@ -186,8 +189,6 @@ fn try_submit(
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = sqe;
-
         if is_stream {
             todo!();
         //state.inner = StateInner::ReceivingMulti(VecDeque::new(), cx.waker().clone());

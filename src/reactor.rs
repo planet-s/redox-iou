@@ -10,65 +10,76 @@
 /// a previously full ring has had entries popped from it. Other threads can also wake up the
 /// reactor, and hence the executor in case the reactor is integrated, by incrementing the epoch
 /// count of the main ring, followed by a `SYS_ENTER_IORING` syscall.
-use std::collections::{BTreeMap, VecDeque};
+
+use std::collections::BTreeMap;
 use std::convert::{TryFrom, TryInto};
-use std::mem::{ManuallyDrop, MaybeUninit};
-use std::num::NonZeroUsize;
+use std::mem::ManuallyDrop;
 use std::sync::atomic::{self, AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::{ops, task};
 
-#[cfg(target_os = "linux")]
-use std::ptr::NonNull;
-
 use syscall::data::IoVec;
-use syscall::error::{Error, Result};
-use syscall::error::{
-    E2BIG, EADDRINUSE, EBADF, ECANCELED, EFAULT, EINVAL, EIO, EOPNOTSUPP, EOVERFLOW,
-};
-use syscall::flag::{EventFlags, MapFlags};
-use syscall::io_uring::v1::operation::{
-    CloseFlags, DupFlags, OpenFlags, RegisterEventsFlags,
-};
+use syscall::error::{Error, Result, EOVERFLOW};
 #[cfg(target_os = "redox")]
-use syscall::io_uring::v1::operation::{ReadFlags, WriteFlags};
-use syscall::io_uring::v1::{
-    BrokenRing, CqEntry64, IoUringCqeFlags, IoUringSqeFlags, Priority, RingPopError, RingPushError,
-    SqEntry64, StandardOpcode,
+use {
+    syscall::{
+        error::{
+            E2BIG, EBADF, ECANCELED, EFAULT, EINVAL, EIO, EOPNOTSUPP,
+        },
+        io_uring::{
+            v1::{
+                operation::{
+                    ReadFlags, WriteFlags, OpenFlags, RegisterEventsFlags,
+                },
+                BrokenRing, IoUringCqeFlags, RingPopError, SqEntry64, StandardOpcode,
+            },
+            IoUringEnterFlags,
+        },
+    },
+    crate::{
+        redox::instance::ConsumerInstance,
+        future::ProducerSqesState,
+    },
+    parking_lot::{
+         RwLockUpgradableReadGuard, RwLockWriteGuard,
+    }
 };
-use syscall::io_uring::{GenericSlice, GenericSliceMut, IoUringEnterFlags};
-
-use crossbeam_queue::ArrayQueue;
-use either::*;
-use parking_lot::{
-    MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard,
-    RwLockWriteGuard,
-};
-
 #[cfg(any(doc, target_os = "redox"))]
-use crate::future::ProducerSqes;
-use crate::future::{
-    AtomicTag, CommandFuture, CommandFutureInner, CommandFutureRepr, FdEvents, FdEventsInitial,
-    State, StateInner, Tag,
+use {
+    std::collections::VecDeque,
+    crate::{
+        redox::instance::ProducerInstance,
+        future::{FdEventsInitial, ProducerSqes},
+    },
+    syscall::{
+        flag::{EventFlags, MapFlags},
+        io_uring::v1::{
+            IoUringSqeFlags, RingPushError, CqEntry64,
+            operation::{CloseFlags, DupFlags},
+        },
+    },
 };
-
-#[cfg(target_os = "redox")]
-use crate::future::ProducerSqesState;
-
-use crate::executor::Runqueue;
-
-#[cfg(any(target_os = "redox"))]
-use crate::redox::instance::{ConsumerGenericSender, ConsumerInstance};
-
-#[cfg(any(doc, target_os = "redox"))]
-use crate::redox::instance::ProducerInstance;
-
 #[cfg(target_os = "linux")]
 use crate::linux::{ReadFlags, WriteFlags};
 
 // TODO: Fix ConsumerInstance conflict.
 #[cfg(any(doc, target_os = "linux"))]
 use crate::linux::ConsumerInstance;
+
+use syscall::io_uring::v1::Priority;
+use syscall::io_uring::{GenericSlice, GenericSliceMut};
+
+use crossbeam_queue::ArrayQueue;
+use either::*;
+use parking_lot::{
+    MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard,};
+
+use crate::future::{
+    AtomicTag, CommandFuture, CommandFutureInner, CommandFutureRepr, FdEvents, State, StateInner,
+    Tag,
+};
+
+use crate::executor::Runqueue;
 
 use crate::memory::{Guarded, GuardedMut};
 
@@ -1302,6 +1313,7 @@ impl Handle {
     pub unsafe fn send_with_ctx<F>(
         &self,
         ring: impl Into<RingId>,
+        #[cfg_attr(target_os = "linux", allow(unused_variables))]
         ctx: SubmissionContext,
         prepare_sqe: F,
     ) -> CommandFuture<impl FnOnce(&mut SysSqeRef)>
@@ -1601,34 +1613,40 @@ impl Handle {
     {
         let ring = ring.into();
         #[cfg(target_os = "redox")]
-        let at_fd64 = match at {
-            OpenFrom::At(fd) => Some(u64::try_from(fd)?),
-            OpenFrom::CurrentDirectory => None,
+        let (at_fd64, path) = {
+            let at_fd64 = match at {
+                OpenFrom::At(fd) => Some(u64::try_from(fd)?),
+                OpenFrom::CurrentDirectory => None,
+            };
+            let path = path
+                .as_generic_slice(ring.is_primary())
+                .ok_or(Error::new(EFAULT))?;
+
+            (at_fd64, path)
         };
 
-        let reference = path
-            .as_generic_slice(ring.is_primary())
-            .ok_or(Error::new(EFAULT))?;
 
         let prepare_fn = |sqe: &mut SysSqeRef| {
             #[cfg(target_os = "redox")]
             {
                 if let Some(fd64) = at_fd64 {
-                    sqe.sys_openat(fd64, reference, info.inner.0);
+                    sqe.sys_openat(fd64, path, info.inner.0);
                 } else {
-                    sqe.sys_open(reference, info.inner.0);
+                    sqe.sys_open(path, info.inner.0);
                 }
             }
             #[cfg(target_os = "linux")]
             {
+
                 let (flags, mode) = info.inner;
 
+                // TODO: Workaround AsOffsetLen on Linux
                 let slice = std::slice::from_raw_parts(
-                    reference.offset() as usize as *const u8,
-                    reference.len() as usize,
+                    path.addr() as *const u8,
+                    path.len().unwrap() as usize,
                 );
 
-                #[cfg(debug_assertions)]
+
                 nul_check(slice);
 
                 let cstr = std::ffi::CStr::from_bytes_with_nul_unchecked(slice);
@@ -2381,7 +2399,7 @@ impl Handle {
     where
         G: Guarded<Target = [u8]> + AsOffsetLen,
     {
-        let mut param = param.map(ManuallyDrop::new);
+        let param = param.map(ManuallyDrop::new);
         let fd = unsafe {
             self.dup_unchecked_inner(id, ctx, fd, flags, param.as_deref())
                 .await?

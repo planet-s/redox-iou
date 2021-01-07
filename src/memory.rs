@@ -1,29 +1,38 @@
-use std::convert::{TryFrom, TryInto};
-use std::ptr::NonNull;
-use std::sync::Arc;
-use std::{mem, slice};
+use std::convert::TryInto;
 
-use syscall::data::Map as Mmap;
+#[cfg(target_os = "redox")]
+use {
+    std::{
+        ptr::NonNull, mem, slice,
+    },
+    syscall::{
+        data::Map as Mmap,
+        error::{ENOMEM, EOVERFLOW},
+        io_uring::v1::{
+            operation::{CloseFlags, DupFlags},
+            PoolFdEntry,
+        },
+    },
+};
+
+#[cfg(any(doc, target_os = "redox"))]
+use {
+    std::convert::TryFrom,
+    syscall::{
+        flag::MapFlags,
+        io_uring::v1:: Priority,
+    },
+    crate::reactor::{SubmissionContext, SubmissionSync, ProducerRingId, SecondaryRingId},
+};
+
 use syscall::error::{Error, Result};
-use syscall::error::{EFAULT, ENOMEM, EOVERFLOW};
-use syscall::flag::MapFlags;
-use syscall::io_uring::v1::operation::{CloseFlags, DupFlags};
-use syscall::io_uring::v1::{PoolFdEntry, Priority};
-
-use parking_lot::Mutex;
+use syscall::error::EFAULT;
 
 pub use guard_trait::{Guarded, GuardedMut};
 
 pub use redox_buffer_pool as pool;
 
-use crate::future::{
-    CommandFuture, CommandFutureRepr, State as CommandFutureState,
-    StateInner as CommandFutureStateInner,
-};
-use crate::reactor::{Handle, SubmissionContext, SubmissionSync};
-
-#[cfg(any(doc, target_os = "redox"))]
-use crate::reactor::{ProducerRingId, SecondaryRingId};
+use crate::reactor::Handle;
 
 /// A buffer pool, with the default options for use by userspace-to-userspace rings.
 pub type BufferPool<I = u32, H = BufferPoolHandle, E = ()> = pool::BufferPool<I, H, E>;
@@ -71,7 +80,8 @@ impl BufferPoolHandle {
     /// Destroy every mmap allocation that has been used by the buffer pool. This is safe because
     /// the handle can only be moved out when all guarded slices have been released.
     // TODO: Make sure this really is the case.
-    #[cfg(target_os = "redox")]
+    #[cfg(any(doc, target_os = "redox"))]
+    #[doc(cfg(target_os = "redox"))]
     pub async fn destroy_all(self) -> Result<()> {
         match self.reactor {
             Some(ref h) => unsafe {
@@ -299,7 +309,8 @@ pub async fn import<I: pool::Integer + TryFrom<u64> + TryInto<usize>>(
 }
 
 // TODO: This should also exist on Linux.
-#[cfg(target_os = "redox")]
+#[cfg(any(doc, target_os = "redox"))]
+#[doc(cfg(target_os = "redox"))]
 unsafe fn expand_blocking<I: TryInto<usize>>(
     fd: usize,
     offset: I,

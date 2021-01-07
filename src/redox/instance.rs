@@ -1,12 +1,11 @@
 mod consumer_instance {
     use std::{mem, slice};
 
-    use either::*;
     use parking_lot::RwLock;
 
     use syscall::data::Map;
     use syscall::error::{Error, Result};
-    use syscall::error::{EINVAL, EIO};
+    use syscall::error::EINVAL;
     use syscall::flag::MapFlags;
     use syscall::flag::{O_CLOEXEC, O_CREAT, O_RDWR};
 
@@ -834,7 +833,6 @@ pub use consumer_instance::{
 };
 
 mod producer_instance {
-    use either::*;
     use parking_lot::RwLock;
 
     use syscall::io_uring::v1::{CqEntry32, CqEntry64, Ring, SqEntry32, SqEntry64};
