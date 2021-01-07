@@ -67,7 +67,7 @@ bitflags::bitflags! {
         /// offset is -1, the file offset is also updated. (`RWF_APPEND`)
         ///
         /// (Note that `preadv2` acts as regular `readv` if the offset is -1, which this flag
-        /// overrides in that it pre-seeks to the end of the file.) 
+        /// overrides in that it pre-seeks to the end of the file.)
         const APPEND = uapi::c::RWF_APPEND;
     }
 }

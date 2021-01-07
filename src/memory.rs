@@ -2,9 +2,7 @@ use std::convert::TryInto;
 
 #[cfg(target_os = "redox")]
 use {
-    std::{
-        ptr::NonNull, mem, slice,
-    },
+    std::{mem, ptr::NonNull, slice},
     syscall::{
         data::Map as Mmap,
         error::{ENOMEM, EOVERFLOW},
@@ -17,16 +15,13 @@ use {
 
 #[cfg(any(doc, target_os = "redox"))]
 use {
+    crate::reactor::{ProducerRingId, SecondaryRingId, SubmissionContext, SubmissionSync},
     std::convert::TryFrom,
-    syscall::{
-        flag::MapFlags,
-        io_uring::v1:: Priority,
-    },
-    crate::reactor::{SubmissionContext, SubmissionSync, ProducerRingId, SecondaryRingId},
+    syscall::{flag::MapFlags, io_uring::v1::Priority},
 };
 
-use syscall::error::{Error, Result};
 use syscall::error::EFAULT;
+use syscall::error::{Error, Result};
 
 pub use guard_trait::{Guarded, GuardedMut};
 

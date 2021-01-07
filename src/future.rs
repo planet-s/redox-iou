@@ -15,15 +15,11 @@ use parking_lot::Mutex;
 #[cfg(target_os = "redox")]
 use {
     crate::redox::instance::ConsumerInstance,
-    syscall::io_uring::{IoUringCqeFlags, RingPushError},
     syscall::error::{EIO, ESHUTDOWN},
+    syscall::io_uring::{IoUringCqeFlags, RingPushError},
 };
 #[cfg(any(doc, target_os = "redox"))]
-use {
-    std::collections::VecDeque,
-    futures_core::Stream,
-    syscall::io_uring::SqEntry64,
-};
+use {futures_core::Stream, std::collections::VecDeque, syscall::io_uring::SqEntry64};
 
 #[cfg(target_os = "linux")]
 use crate::linux::ConsumerInstance;

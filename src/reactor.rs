@@ -10,7 +10,6 @@
 /// a previously full ring has had entries popped from it. Other threads can also wake up the
 /// reactor, and hence the executor in case the reactor is integrated, by incrementing the epoch
 /// count of the main ring, followed by a `SYS_ENTER_IORING` syscall.
-
 use std::collections::BTreeMap;
 use std::convert::{TryFrom, TryInto};
 use std::mem::ManuallyDrop;
@@ -18,49 +17,40 @@ use std::sync::atomic::{self, AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::{ops, task};
 
+#[cfg(target_os = "linux")]
+use crate::linux::{ReadFlags, WriteFlags};
 use syscall::data::IoVec;
 use syscall::error::{Error, Result, EOVERFLOW};
 #[cfg(target_os = "redox")]
 use {
+    crate::{future::ProducerSqesState, redox::instance::ConsumerInstance},
+    parking_lot::{RwLockUpgradableReadGuard, RwLockWriteGuard},
     syscall::{
-        error::{
-            E2BIG, EBADF, ECANCELED, EFAULT, EINVAL, EIO, EOPNOTSUPP,
-        },
+        error::{E2BIG, EBADF, ECANCELED, EFAULT, EINVAL, EIO, EOPNOTSUPP},
         io_uring::{
             v1::{
-                operation::{
-                    ReadFlags, WriteFlags, OpenFlags, RegisterEventsFlags,
-                },
+                operation::{OpenFlags, ReadFlags, RegisterEventsFlags, WriteFlags},
                 BrokenRing, IoUringCqeFlags, RingPopError, SqEntry64, StandardOpcode,
             },
             IoUringEnterFlags,
         },
     },
-    crate::{
-        redox::instance::ConsumerInstance,
-        future::ProducerSqesState,
-    },
-    parking_lot::{
-         RwLockUpgradableReadGuard, RwLockWriteGuard,
-    }
 };
 #[cfg(any(doc, target_os = "redox"))]
 use {
-    std::collections::VecDeque,
     crate::{
-        redox::instance::ProducerInstance,
         future::{FdEventsInitial, ProducerSqes},
+        redox::instance::ProducerInstance,
     },
+    std::collections::VecDeque,
     syscall::{
         flag::{EventFlags, MapFlags},
         io_uring::v1::{
-            IoUringSqeFlags, RingPushError, CqEntry64,
             operation::{CloseFlags, DupFlags},
+            CqEntry64, IoUringSqeFlags, RingPushError,
         },
     },
 };
-#[cfg(target_os = "linux")]
-use crate::linux::{ReadFlags, WriteFlags};
 
 // TODO: Fix ConsumerInstance conflict.
 #[cfg(any(doc, target_os = "linux"))]
@@ -71,8 +61,7 @@ use syscall::io_uring::{GenericSlice, GenericSliceMut};
 
 use crossbeam_queue::ArrayQueue;
 use either::*;
-use parking_lot::{
-    MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard,};
+use parking_lot::{MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard};
 
 use crate::future::{
     AtomicTag, CommandFuture, CommandFutureInner, CommandFutureRepr, FdEvents, State, StateInner,
@@ -322,7 +311,9 @@ impl RingId {
 impl PartialEq<RingId> for PrimaryRingId {
     #[inline]
     fn eq(&self, other: &RingId) -> bool {
-        self.reactor_id == other.reactor_id && self.index == other.index && other.ty == RingTy::Primary
+        self.reactor_id == other.reactor_id
+            && self.index == other.index
+            && other.ty == RingTy::Primary
     }
 }
 impl PartialEq<PrimaryRingId> for RingId {
@@ -336,7 +327,9 @@ impl PartialEq<PrimaryRingId> for RingId {
 impl PartialEq<RingId> for SecondaryRingId {
     #[inline]
     fn eq(&self, other: &RingId) -> bool {
-        self.reactor_id == other.reactor_id && self.index == other.index && other.ty == RingTy::Secondary
+        self.reactor_id == other.reactor_id
+            && self.index == other.index
+            && other.ty == RingTy::Secondary
     }
 }
 #[cfg(any(doc, target_os = "redox"))]
@@ -352,7 +345,9 @@ impl PartialEq<SecondaryRingId> for RingId {
 impl PartialEq<RingId> for ProducerRingId {
     #[inline]
     fn eq(&self, other: &RingId) -> bool {
-        self.reactor_id == other.reactor_id && self.index == other.index && other.ty == RingTy::Producer
+        self.reactor_id == other.reactor_id
+            && self.index == other.index
+            && other.ty == RingTy::Producer
     }
 }
 #[cfg(any(doc, target_os = "redox"))]
@@ -628,10 +623,7 @@ impl Reactor {
     pub fn primary_instances(&self) -> impl Iterator<Item = PrimaryRingId> + '_ {
         let reactor_id = self.id();
 
-        (0..self.main_instances.len()).map(move |index| PrimaryRingId {
-            reactor_id,
-            index,
-        })
+        (0..self.main_instances.len()).map(move |index| PrimaryRingId { reactor_id, index })
     }
     /// Obtain a handle to this reactor, capable of creating futures that use it. The handle will
     /// be weakly owned, and panic on regular operations if this reactor is dropped.
@@ -839,13 +831,7 @@ impl Reactor {
         })
     }
     pub(crate) fn drive_primary(&self, idx: usize, waker: &task::Waker, wait: bool) {
-        match self.drive(&self.main_instances[idx], waker, wait, true) {
-            Ok(()) => (),
-            Err(error) => {
-                log::warn!("Error when driving primary ring: {}", error);
-                return;
-            }
-        }
+        self.drive(&self.main_instances[idx], waker, wait, true)
     }
     fn drive(
         &self,
@@ -853,7 +839,7 @@ impl Reactor {
         waker: &task::Waker,
         wait: bool,
         primary: bool,
-    ) -> Result<()> {
+    ) {
         #[cfg(target_os = "redox")]
         {
             fn warn_about_inconsistency(instance: &ConsumerInstanceWrapper) -> Error {
@@ -882,14 +868,16 @@ impl Reactor {
             let mut receiver_write_guard = instance.consumer_instance.receiver().write();
 
             loop {
-                match receiver_write_guard.as_64_mut().unwrap().try_recv(){
+                match receiver_write_guard.as_64_mut().unwrap().try_recv() {
                     Ok(cqe) => {
                         // NOTE: The driving wakers that will possibly be called here, must be able
                         // to acquire a read lock. We therefore downgrade our receiver exclusive
                         // lock, into an intent lock, and then eventually back.
-                        let receiver_intent_guard = RwLockWriteGuard::downgrade_to_upgradable(receiver_write_guard);
+                        let receiver_intent_guard =
+                            RwLockWriteGuard::downgrade_to_upgradable(receiver_write_guard);
                         let result = self.drive_handle_cqe(primary, instance.trusted, cqe, waker);
-                        receiver_write_guard = RwLockUpgradableReadGuard::upgrade(receiver_intent_guard);
+                        receiver_write_guard =
+                            RwLockUpgradableReadGuard::upgrade(receiver_intent_guard);
                         result
                     }
                     Err(RingPopError::Empty { .. }) => break,
@@ -904,7 +892,6 @@ impl Reactor {
                     }
                 }
             }
-            Ok(())
         }
         #[cfg(target_os = "linux")]
         {
@@ -915,7 +902,7 @@ impl Reactor {
             // TODO: Map error correctly, with Linux error codes.
             match guard.submit_sqes_and_wait(min_complete) {
                 Ok(_) => (),
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return,
                 Err(error) => {
                     log::error!("Failed to pop CQE from CQ: {}", error);
                     todo!("convert error: {}", error);
@@ -925,7 +912,6 @@ impl Reactor {
             for cqe in guard.cqes() {
                 self.drive_handle_cqe(primary, trusted, cqe, waker);
             }
-            Ok(())
         }
     }
     fn drive_handle_cqe(&self, primary: bool, trusted: bool, cqe: SysCqe, waker: &task::Waker) {
@@ -968,7 +954,10 @@ impl Reactor {
 
             let secondary_instances_guard = self.secondary_instances.read();
 
-            let (secondary_instance_index, backref_ty) = match secondary_instances_guard.fds_backref.get(&fd) {
+            let (secondary_instance_index, backref_ty) = match secondary_instances_guard
+                .fds_backref
+                .get(&fd)
+            {
                 Some(pair) => *pair,
                 None => {
                     log::warn!("The fd ({}) meant to describe the instance to drive, was not recognized. Ignoring event.", fd);
@@ -990,7 +979,6 @@ impl Reactor {
 
                     self.drive(instance, waker, false, false)
                         .expect("failed to drive consumer instance");
-
                 }
                 BackrefTy::Producer => {
                     let instance = secondary_instances_guard
@@ -1164,12 +1152,16 @@ impl Reactor {
         } else {
             #[cfg(target_os = "redox")]
             {
-                Right(RwLockReadGuard::map(self.secondary_instances.read(), |instances| {
-                    &instances.consumer_instances
-                        .get(ring.index)
-                        .expect("invalid secondary consumer ring ID")
-                        .consumer_instance
-                }))
+                Right(RwLockReadGuard::map(
+                    self.secondary_instances.read(),
+                    |instances| {
+                        &instances
+                            .consumer_instances
+                            .get(ring.index)
+                            .expect("invalid secondary consumer ring ID")
+                            .consumer_instance
+                    },
+                ))
             }
             #[cfg(not(target_os = "redox"))]
             unreachable!();
@@ -1310,11 +1302,14 @@ impl Handle {
     }
     /// Shorthand for send(), but where the submission context is applied to the preparation
     /// function, before calling the inner.
+    ///
+    /// # Safety
+    ///
+    /// The same safety requirements found in [`send`], all apply here.
     pub unsafe fn send_with_ctx<F>(
         &self,
         ring: impl Into<RingId>,
-        #[cfg_attr(target_os = "linux", allow(unused_variables))]
-        ctx: SubmissionContext,
+        #[cfg_attr(target_os = "linux", allow(unused_variables))] ctx: SubmissionContext,
         prepare_sqe: F,
     ) -> CommandFuture<impl FnOnce(&mut SysSqeRef)>
     where
@@ -1513,7 +1508,6 @@ impl Handle {
             .get_mut(ring_id.index)
             .expect("ring ID has an invalid index");
 
-
         let state_opt = producer_instance.stream_state.clone();
         // TODO: Override capacity if the stream state already is present.
 
@@ -1625,7 +1619,6 @@ impl Handle {
             (at_fd64, path)
         };
 
-
         let prepare_fn = |sqe: &mut SysSqeRef| {
             #[cfg(target_os = "redox")]
             {
@@ -1637,7 +1630,6 @@ impl Handle {
             }
             #[cfg(target_os = "linux")]
             {
-
                 let (flags, mode) = info.inner;
 
                 // TODO: Workaround AsOffsetLen on Linux
@@ -1645,7 +1637,6 @@ impl Handle {
                     path.addr() as *const u8,
                     path.len().unwrap() as usize,
                 );
-
 
                 nul_check(slice);
 
@@ -1890,7 +1881,9 @@ impl Handle {
                 #[cfg(target_os = "linux")]
                 {
                     sqe.prep_read(fd, buf, OFFSET_TREAT_AS_POSITIONED);
-                    sqe.raw_mut().cmd_flags = uring_sys::cmd_flags { rw_flags: flags.bits() as _ };
+                    sqe.raw_mut().cmd_flags = uring_sys::cmd_flags {
+                        rw_flags: flags.bits() as _,
+                    };
                 }
             })
             .await?;
@@ -1962,7 +1955,9 @@ impl Handle {
                         )
                     };
                     sqe.prep_read_vectored(fd, bufs_unchecked, OFFSET_TREAT_AS_POSITIONED);
-                    sqe.raw_mut().cmd_flags = uring_sys::cmd_flags { rw_flags: flags.bits() as _ };
+                    sqe.raw_mut().cmd_flags = uring_sys::cmd_flags {
+                        rw_flags: flags.bits() as _,
+                    };
                 }
             })
             .await?;
@@ -2012,7 +2007,9 @@ impl Handle {
             {
                 let _ = flags;
                 sqe.prep_read(fd, data_mut, offset);
-                sqe.raw_mut().cmd_flags = uring_sys::cmd_flags { rw_flags: flags.bits() as _ };
+                sqe.raw_mut().cmd_flags = uring_sys::cmd_flags {
+                    rw_flags: flags.bits() as _,
+                };
             }
         };
 
@@ -2098,7 +2095,9 @@ impl Handle {
                 //
                 // However, they are not yet incorporated into liburing, for some reason, so we'll
                 // need to set these manually.
-                sqe.raw_mut().cmd_flags = uring_sys::cmd_flags { rw_flags: flags.bits() as _ };
+                sqe.raw_mut().cmd_flags = uring_sys::cmd_flags {
+                    rw_flags: flags.bits() as _,
+                };
             }
         };
         let cqe = self.send_with_ctx(ring, ctx, prepare_fn).await?;
@@ -2252,7 +2251,9 @@ impl Handle {
             {
                 let _ = flags;
                 sqe.prep_write(fd, buf, offset);
-                sqe.raw_mut().cmd_flags = uring_sys::cmd_flags { rw_flags: flags.bits() as _ };
+                sqe.raw_mut().cmd_flags = uring_sys::cmd_flags {
+                    rw_flags: flags.bits() as _,
+                };
             }
         };
 
@@ -2337,7 +2338,9 @@ impl Handle {
                 };
 
                 sqe.prep_write_vectored(fd as SysFd, bufs_unchecked, offset);
-                sqe.raw_mut().cmd_flags = uring_sys::cmd_flags { rw_flags: flags.bits() as _ };
+                sqe.raw_mut().cmd_flags = uring_sys::cmd_flags {
+                    rw_flags: flags.bits() as _,
+                };
             }
         };
 
@@ -2853,6 +2856,18 @@ pub enum OpenFrom {
 
     /// Open relative paths based on a directory at the file descriptor.
     At(SysFd),
+}
+
+impl Default for OpenFrom {
+    fn default() -> Self {
+        Self::CurrentDirectory
+    }
+}
+
+impl Default for OpenInfo {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OpenInfo {

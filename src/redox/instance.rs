@@ -4,8 +4,8 @@ mod consumer_instance {
     use parking_lot::RwLock;
 
     use syscall::data::Map;
-    use syscall::error::{Error, Result};
     use syscall::error::EINVAL;
+    use syscall::error::{Error, Result};
     use syscall::flag::MapFlags;
     use syscall::flag::{O_CLOEXEC, O_CREAT, O_RDWR};
 
