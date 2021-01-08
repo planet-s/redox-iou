@@ -18,7 +18,11 @@ use std::sync::{Arc, Weak};
 use std::{ops, task};
 
 #[cfg(target_os = "linux")]
-use crate::linux::{ReadFlags, WriteFlags};
+use {
+    crate::linux::{ReadFlags, WriteFlags},
+    ioprio::Priority,
+};
+
 use syscall::data::IoVec;
 use syscall::error::{Error, Result, EOVERFLOW};
 #[cfg(target_os = "redox")]
@@ -30,7 +34,7 @@ use {
         io_uring::{
             v1::{
                 operation::{OpenFlags, ReadFlags, RegisterEventsFlags, WriteFlags},
-                BrokenRing, IoUringCqeFlags, RingPopError, SqEntry64, StandardOpcode,
+                BrokenRing, IoUringCqeFlags, Priority, RingPopError, SqEntry64, StandardOpcode,
             },
             IoUringEnterFlags,
         },
@@ -56,7 +60,6 @@ use {
 #[cfg(any(doc, target_os = "linux"))]
 use crate::linux::ConsumerInstance;
 
-use syscall::io_uring::v1::Priority;
 use syscall::io_uring::{GenericSlice, GenericSliceMut};
 
 use crossbeam_queue::ArrayQueue;
@@ -447,6 +450,13 @@ pub type SysCqe = CqEntry64;
 #[cfg(target_os = "linux")]
 /// The Completion Queue Entry type for the current platform.
 pub type SysCqe = iou::CQE;
+
+/// The system type for I/O priorities.
+#[cfg(target_os = "redox")]
+pub type SysPriority = Priority;
+/// The system type for I/O priorities.
+#[cfg(target_os = "linux")]
+pub type SysPriority = Priority;
 
 #[cfg(target_os = "linux")]
 /// The system file descriptor type.
@@ -1206,6 +1216,8 @@ impl SubmissionSync {
     }
     /// Like with [`redox_sqe_flags`], retrieve the necessary flags to achieve the synchronization
     /// needed.
+    ///
+    /// [`redox_sqe_flags`]: Self::redox_sqe_flags
     #[cfg(any(doc, target_os = "linux"))]
     #[doc(cfg(target_os = "linux"))]
     pub fn linux_sqe_flags(self) -> iou::sqe::SubmissionFlags {
@@ -1227,7 +1239,7 @@ impl Default for SubmissionSync {
 /// guard that is set once the actual future gets constructed.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct SubmissionContext {
-    priority: Priority,
+    priority: SysPriority,
     sync: SubmissionSync,
 }
 impl SubmissionContext {
@@ -1237,15 +1249,15 @@ impl SubmissionContext {
         Self::default()
     }
     /// Set the priority of this submission, taking self by value.
-    pub fn with_priority(self, priority: Priority) -> Self {
+    pub fn with_priority(self, priority: SysPriority) -> Self {
         Self { priority, ..self }
     }
     /// Get the priority of this submission.
-    pub const fn priority(&self) -> Priority {
+    pub const fn priority(&self) -> SysPriority {
         self.priority
     }
     /// Set the priority of this submission, by reference.
-    pub fn set_priority(&mut self, priority: Priority) {
+    pub fn set_priority(&mut self, priority: SysPriority) {
         self.priority = priority;
     }
     /// Set the synchronization mode of this submission, taking self by value.
@@ -1306,6 +1318,8 @@ impl Handle {
     /// # Safety
     ///
     /// The same safety requirements found in [`send`], all apply here.
+    ///
+    /// [`send`]: Self::send
     pub unsafe fn send_with_ctx<F>(
         &self,
         ring: impl Into<RingId>,
@@ -1666,7 +1680,7 @@ impl Handle {
     /// It is highly recommended that the regular [`open_at`] call be used instead, which takes
     /// care of guarding the memory until completion.
     ///
-    /// [`open_at`]: #method.open_at
+    /// [`open_at`]: Self::open_at
     pub async unsafe fn open_unchecked_at<B>(
         &self,
         ring: impl Into<RingId>,

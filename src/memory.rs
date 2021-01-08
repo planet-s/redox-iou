@@ -15,9 +15,11 @@ use {
 
 #[cfg(any(doc, target_os = "redox"))]
 use {
-    crate::reactor::{ProducerRingId, SecondaryRingId, SubmissionContext, SubmissionSync},
+    crate::reactor::{
+        ProducerRingId, SecondaryRingId, SubmissionContext, SubmissionSync, SysPriority,
+    },
     std::convert::TryFrom,
-    syscall::{flag::MapFlags, io_uring::v1::Priority},
+    syscall::flag::MapFlags,
 };
 
 use syscall::error::EFAULT;
@@ -164,7 +166,7 @@ impl Handle {
         // TODO: Support passing the primary reactor to do the operation with.
         secondary_instance: ProducerRingId,
         // TODO: SubmissionContext
-        _creation_command_priority: Priority,
+        _creation_command_priority: SysPriority,
     ) -> Result<pool::BufferPool<I, BufferPoolHandle, ()>> {
         let pool = self
             .create_buffer_pool_inner(
@@ -184,7 +186,7 @@ impl Handle {
     pub async fn create_buffer_pool<E: Copy, I: pool::Integer + TryInto<usize> + TryInto<u64>>(
         &self,
         secondary_instance: SecondaryRingId,
-        _creation_command_priority: Priority,
+        _creation_command_priority: SysPriority,
         initial_len: I,
         initial_extra: E,
     ) -> Result<pool::BufferPool<I, BufferPoolHandle, E>> {
