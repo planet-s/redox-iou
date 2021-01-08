@@ -37,4 +37,4 @@ env_logger = "0.7"
 futures = "0.3"
 
 [patch.crates-io]
-iou = { git = "https://github.com/4lDO2/iou", branch = "cqe-debug" }
+iou = { git = "https://github.com/ringbahn/iou", branch = "master" }
