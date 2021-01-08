@@ -1699,8 +1699,9 @@ impl Handle {
             .await
     }
 
-    /// Open a file in a similar way to how [`open_unchecked_at`] works, but without the need to
-    /// specify a file descriptor to initially search from, with `/` being the default.
+    /// Open a file in a similar way to how [`open_unchecked_at`](Self::open_unchecked_at) works,
+    /// but without the need to specify a file descriptor to initially search from, with `/` being
+    /// the default.
     ///
     /// # Safety
     ///
@@ -1730,9 +1731,8 @@ impl Handle {
     /// optional `at` argument can also be specified, which will base the path on an open file
     /// descriptor of a directory, similar to _openat(2)_.
     ///
-    /// [`open_unchecked`]: #method.open_unchecked
-    /// [`Guarded`]: ../memory/struct.Guarded.html
-    /// [`Guardable`]: ../memory/trait.Guardable.html
+    /// [`open_unchecked`]: Self::open_unchecked
+    /// [`Guarded`]: crate::memory::Guarded
     pub async fn open_at<B>(
         &self,
         ring: impl Into<RingId>,
@@ -1754,8 +1754,8 @@ impl Handle {
         (result, ManuallyDrop::into_inner(path_buf))
     }
 
-    /// Open a file in a similar way to how [`open_at`] works, but without specifying a file
-    /// descriptor.
+    /// Open a file in a similar way to how [`open_at`](Self::open_at) works, but without
+    /// specifying a file descriptor.
     pub async fn open<B>(
         &self,
         ring: impl Into<RingId>,
@@ -1831,7 +1831,7 @@ impl Handle {
     ///
     /// Refer to the invariants documented in the [`close`] call.
     ///
-    /// [`close`]: #method.close
+    /// [`close`]: Self::close
     #[cfg(any(doc, target_os = "redox"))]
     #[doc(cfg(target_os = "redox"))]
     pub async unsafe fn close_range(
@@ -1864,7 +1864,7 @@ impl Handle {
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
     ///
-    /// [`read`]: #method.read
+    /// [`read`]: Self::read
     pub async unsafe fn read_unchecked(
         &self,
         ring: impl Into<RingId>,
@@ -1906,9 +1906,7 @@ impl Handle {
     }
     /// Read bytes, returning the number of bytes read, or zero if no more bytes are available.
     ///
-    /// This is the safe variant of [`read_unchecked`].
-    ///
-    /// [`read_unchecked`]: #method.read_unchecked
+    /// This is the safe variant of [`read_unchecked`](Self::read_unchecked).
     pub async fn read<B>(
         &self,
         ring: impl Into<RingId>,
@@ -1981,14 +1979,12 @@ impl Handle {
 
     /// Read bytes from a specific offset. Does not change the file offset.
     ///
-    /// This is the unsafe variant of [`pread`].
+    /// This is the unsafe variant of [`pread`](Self::pread).
     ///
     /// # Safety
     ///
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    ///
-    /// [`pread`]: #method.pread
     pub async unsafe fn pread_unchecked(
         &self,
         ring: impl Into<RingId>,
@@ -2033,9 +2029,7 @@ impl Handle {
     }
     /// Read bytes from a specific offset. Does not change the file offset.
     ///
-    /// This is the safe variant of [`pread_unchecked`].
-    ///
-    /// [`pread_unchecked`]: #method.pread_unchecked
+    /// This is the safe variant of [`pread_unchecked`](Self::pread_unchecked).
     // TODO: Uninitialized buffers.
     // TODO: AsOffsetLenMut.
     pub async fn pread<B>(
@@ -2124,14 +2118,12 @@ impl Handle {
     /// Write bytes. Returns the number of bytes written, or zero if no more bytes could be
     /// written.
     ///
-    /// This is the unsafe variant of the [`write`] method.
+    /// This is the unsafe variant of the [`write`](Self::write) method.
     ///
     /// # Safety
     ///
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    ///
-    /// [`write`]: #method.write
     // TODO: On Linux?
     #[cfg(any(doc, target_os = "redox"))]
     #[doc(cfg(target_os = "redox"))]
@@ -2164,9 +2156,7 @@ impl Handle {
     /// Write bytes. Returns the number of bytes written, or zero if no more bytes could be
     /// written.
     ///
-    /// This is the safe variant of the [`write_unchecked`] method.
-    ///
-    /// [`write_unchecked`]: #method.write_unchecked
+    /// This is the safe variant of the [`write_unchecked`](Self::write_unchecked) method.
     #[cfg(any(doc, target_os = "redox"))]
     #[doc(cfg(target_os = "redox"))]
     pub async fn write<B>(
@@ -2221,14 +2211,12 @@ impl Handle {
     /// Write bytes to a specific offset, with an optional set of flags. Does not change the file
     /// offset.
     ///
-    /// This is the unsafe variant of the [`pwrite`] method.
+    /// This is the unsafe variant of the [`pwrite`](Self::pwrite) method.
     ///
     /// # Safety
     ///
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    ///
-    /// [`pwrite`]: #method.pwrite
     pub async unsafe fn pwrite_unchecked<B>(
         &self,
         ring: impl Into<RingId>,
@@ -2277,14 +2265,12 @@ impl Handle {
     }
     /// Write bytes to a specific offset. Does not change the file offset.
     ///
-    /// This is the safe variant of the [`pwrite_unchecked`] method.
+    /// This is the safe variant of the [`pwrite_unchecked`](Self::pwrite_unchecked) method.
     ///
     /// # Safety
     ///
     /// The caller must ensure that the buffer outlive the future using it, and that the buffer is
     /// not reclaimed until the command is either complete or cancelled.
-    ///
-    /// [`pwrite_unchecked`]: #method.pwrite_unchecked
     pub async fn pwrite<B>(
         &self,
         ring: impl Into<RingId>,
@@ -2401,8 +2387,8 @@ impl Handle {
     ///
     /// This will panic if param is some, and the [`DupFlags::PARAM`] isn't set, or vice versa.
     ///
-    /// [`dup_parameterless`]: #method.dup_parameterless
-    /// [`dup_unchecked`]: #method.dup_unchecked
+    /// [`dup_parameterless`]: Self::dup_parameterless
+    /// [`dup_unchecked`]: Self::dup_unchecked
     #[cfg(any(doc, target_os = "redox"))]
     #[doc(cfg(target_os = "redox"))]
     pub async fn dup<G>(
@@ -2432,7 +2418,7 @@ impl Handle {
     ///
     /// Since this doesn't pass a parameter, it'll panic if the flags contain [`DupFlags::PARAM`].
     ///
-    /// [`dup`]: #method.dup
+    /// [`dup`]: Self::dup
     #[cfg(any(doc, target_os = "redox"))]
     #[doc(cfg(target_os = "redox"))]
     pub async fn dup_parameterless(
@@ -2494,9 +2480,8 @@ impl Handle {
     /// This function is unsafe since it's dealing with the address space of a process, and may
     /// overwrite an existing grant, if [`MAP_FIXED`] is set and [`MAP_FIXED_NOREPLACE`] is not.
     ///
-    /// [`MAP_FIXED`]: ../../syscall/flag/struct.MapFlags.html#associatedconstant.MAP_FIXED
-    /// [`MAP_FIXED_NOREPLACE`]:
-    /// ../../syscall/flag/struct.MapFlags.html#associatedconstant.MAP_FIXED_NOREPLACE
+    /// [`MAP_FIXED`]: ::syscall::flag::MapFlags::MAP_FIXED
+    /// [`MAP_FIXED_NOREPLACE`]: ::syscall::flag::MapFlags::MAP_FIXED_NOREPLACE
     #[allow(clippy::too_many_arguments)]
     #[cfg(any(doc, target_os = "redox"))]
     #[doc(cfg(target_os = "redox"))]
@@ -2543,8 +2528,8 @@ impl Handle {
     /// is shared with another process, that could also lead to data races, however returning a
     /// pointer forwards this invariant to the caller.
     ///
-    /// [`mmap2`]: #method.mmap2
-    /// [`MAP_FIXED`]: ../../syscall/flag/struct.MapFlags.html#associatedconstant.MAP_FIXED
+    /// [`mmap2`]: Self::mmap2
+    /// [`MAP_FIXED`]: ::syscall::flag::MapFlags::MAP_FIXED
     #[cfg(any(doc, target_os = "redox"))]
     #[doc(cfg(target_os = "redox"))]
     pub async unsafe fn mmap(

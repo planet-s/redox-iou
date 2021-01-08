@@ -99,7 +99,7 @@ mod consumer_instance {
         ///
         /// This method will panic if called after the [`create_instance`] method.
         ///
-        /// [`create_instance`]: #method.create_instance
+        /// [`create_instance`]: Self::create_instance
         pub fn with_minor_version(mut self, minor: u8) -> Self {
             self.as_create_stage()
                 .expect("cannot set minor version after kernel io_uring instance is created")
@@ -112,7 +112,7 @@ mod consumer_instance {
         ///
         /// This method will panic if called after the [`create_instance`] method.
         ///
-        /// [`create_instance`]: #method.create_instance
+        /// [`create_instance`]: Self::create_instance
         pub fn with_patch_version(mut self, patch: u8) -> Self {
             self.as_create_stage()
                 .expect("cannot set patch version after kernel io_uring instance is created")
@@ -125,7 +125,7 @@ mod consumer_instance {
         ///
         /// This method will panic if called after the [`create_instance`] method.
         ///
-        /// [`create_instance`]: #method.create_instance
+        /// [`create_instance`]: Self::create_instance
         pub fn with_flags(mut self, flags: IoUringCreateFlags) -> Self {
             self.as_create_stage()
                 .expect("cannot set flags after kernel io_uring instance is created")
@@ -146,7 +146,7 @@ mod consumer_instance {
         /// This method will panic if called after the [`create_instance`] method, or if the count
         /// is not a power of two.
         ///
-        /// [`create_instance`]: #method.create_instance
+        /// [`create_instance`]: Self::create_instance
         pub fn with_submission_entry_count(mut self, sq_entry_count: usize) -> Self {
             assert!(sq_entry_count.is_power_of_two());
             self.as_create_stage()
@@ -161,7 +161,7 @@ mod consumer_instance {
         ///
         /// This method will panic if called after the [`create_instance`] method.
         ///
-        /// [`create_instance`]: #method.create_instance
+        /// [`create_instance`]: Self::create_instance
         pub fn with_recommended_submission_entry_count(self) -> Self {
             self.with_submission_entry_count(256)
         }
@@ -172,7 +172,7 @@ mod consumer_instance {
         ///
         /// This method will panic if called after the [`create_instance`] method.
         ///
-        /// [`create_instance`]: #method.create_instance
+        /// [`create_instance`]: Self::create_instance
         pub fn with_recommended_completion_entry_count(self) -> Self {
             self.with_completion_entry_count(256)
         }
@@ -187,7 +187,7 @@ mod consumer_instance {
         /// This method will panic if called after the [`create_instance`] method, or if the count
         /// is not a power of two.
         ///
-        /// [`create_instance`]: #method.create_instance
+        /// [`create_instance`]: Self::create_instance
         pub fn with_completion_entry_count(mut self, cq_entry_count: usize) -> Self {
             assert!(cq_entry_count.is_power_of_two());
             self.as_create_stage()
@@ -492,7 +492,7 @@ mod consumer_instance {
         }
         /// Attach the ring to a userspace scheme, or the kernel with the scheme name "io_uring:"
         /// (in which case [`attach_to_kernel`] is preferred). If this attaches to a userspace
-        /// scheme, the kernel will RPC into that process, with the [`SYS_RECV_IORING`] scheme
+        /// scheme, the kernel will RPC into that process, with the [`SYS_IORING_RECV`] scheme
         /// handler, creating a userspace-to-userspace ring.
         ///
         /// When this method is complete, the builder transitions from the attaching state into its
@@ -502,8 +502,8 @@ mod consumer_instance {
         ///
         /// This method will panic if the builder is not in the attaching state.
         ///
-        /// [`attach_to_kernel`]: #method.attach_to_kernel
-        /// [`SYS_RECV_IORING`]: ../../syscall/number/constant.SYS_RECV_IORING.html
+        /// [`attach_to_kernel`]: Self::attach_to_kernel
+        /// [`SYS_IORING_RECV`]: ::syscall::number::SYS_IORING_RECV
         pub fn attach<N: AsRef<[u8]>>(self, scheme_name: N) -> Result<Instance> {
             self.attach_inner(scheme_name.as_ref())
         }
@@ -768,7 +768,7 @@ mod consumer_instance {
         /// will not cause the syscall to block (even though it may take some time), but only
         /// notify the waiting context.
         ///
-        /// [`enter`]: #method.enter
+        /// [`enter`]: Self::enter
         #[inline]
         pub fn enter_for_notification(&self) -> Result<usize> {
             self.enter(0, 0, IoUringEnterFlags::ONLY_NOTIFY)
@@ -941,9 +941,9 @@ mod producer_instance {
     }
 
     /// A wrapper type for producer instances, providing convenient management all the way from the
-    /// [`SYS_RECV_IORING`] handler, to deinitialization.
+    /// [`SYS_IORING_RECV`] handler, to deinitialization.
     ///
-    /// [`SYS_RECV_IORING`]: ../../syscall/number/constant.SYS_RECV_IORING.html
+    /// [`SYS_IORING_RECV`]: ::syscall::number::SYS_IORING_RECV
     #[derive(Debug)]
     pub struct Instance {
         sender: RwLock<GenericSender>,
@@ -953,10 +953,10 @@ mod producer_instance {
     }
 
     impl Instance {
-        /// Create a new instance, from the info that was part of the [`SYS_RECV_IORING`] RPC from
+        /// Create a new instance, from the info that was part of the [`SYS_IORING_RECV`] RPC from
         /// the kernel.
         ///
-        /// [`SYS_RECV_IORING`]: ../../syscall/number/constant.SYS_RECV_IORING.html
+        /// [`SYS_IORING_RECV`]: ::syscall::number::SYS_IORING_RECV
         #[cold]
         pub fn new(recv_info: &IoUringRecvInfo) -> Result<Self> {
             if recv_info.version.major != 1 {

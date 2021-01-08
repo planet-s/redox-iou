@@ -1,10 +1,9 @@
 //! `redox-iou`
 //!
-//! This crate provides a library on top of the [raw io_uring
-//! interface](../syscall/io_uring/index.html), with helpers for conveniently sending and receiving
-//! entries from the ring, as opposed to doing this semi-manually, as well as a fully-featured
-//! executor and reactor that can handle the most common syscalls completely asynchronously, like
-//! libraries such as `tokio` and `async-std` do.
+//! This crate provides a library on top of the [raw io_uring interface](::syscall::io_uring), with
+//! helpers for conveniently sending and receiving entries from the ring, as opposed to doing this
+//! semi-manually, as well as a fully-featured executor and reactor that can handle the most common
+//! syscalls completely asynchronously, like libraries such as `tokio` and `async-std` do.
 
 #![feature(
     doc_cfg,
